@@ -37,8 +37,33 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Help => draw_help(f),
         Mode::Dispatch => draw_dispatch(f, app),
         Mode::Confirm => draw_confirm(f, app),
+        Mode::Errors => draw_errors(f, app),
         _ => {}
     }
+}
+
+fn draw_errors(f: &mut Frame, app: &App) {
+    let area = centered(70, 60, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Red))
+        .title(Span::styled(
+            format!(" Load errors ({}) ", app.errors.len()),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let lines: Vec<Line> = app
+        .errors
+        .iter()
+        .map(|e| Line::from(Span::raw(format!(" • {e}"))))
+        .collect();
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: true }),
+        inner.inner(Margin::new(0, 0)),
+    );
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
@@ -77,6 +102,12 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         right.push(Span::styled(
             format!("  scanning {}/{} repos ", app.repos_done, app.repos_total),
             Style::default().fg(Color::Yellow),
+        ));
+    }
+    if !app.errors.is_empty() {
+        right.push(Span::styled(
+            format!(" ⚠ {} (E) ", app.errors.len()),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     }
     if let Some(rl) = &app.rate {
@@ -414,6 +445,7 @@ fn draw_help(f: &mut Frame) {
         help_row("c", "cancel the selected run"),
         help_row("x / X", "re-run failed jobs / re-run all"),
         help_row("r / F5", "refresh now (auto-refresh is on)"),
+        help_row("E", "show repos that failed to load"),
         Line::raw(""),
         hl("Logs view"),
         help_row("j / k", "move cursor"),

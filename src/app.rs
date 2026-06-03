@@ -94,6 +94,7 @@ pub enum Mode {
     Logs,
     Dispatch,
     Confirm,
+    Errors,
 }
 
 pub enum PendingAction {
@@ -166,6 +167,8 @@ pub struct DispatchState {
     pub wf_state: ListState,
     pub stage: DispatchStage,
     pub git_ref: String,
+    /// The ref the current inputs were fetched at (to detect a changed ref).
+    pub fetched_ref: String,
     /// Selected workflow (set when entering the form stage).
     pub workflow_id: u64,
     pub workflow_path: String,
@@ -555,6 +558,7 @@ impl App {
                 self.repos_total = n;
                 self.repos_done = 0;
                 self.loading = true;
+                self.errors.clear(); // errors reflect the latest sweep only
             }
             DataMsg::Runs { repo, runs } => {
                 self.repos_done += 1;
@@ -752,6 +756,7 @@ impl App {
             Mode::Logs => self.key_logs(key),
             Mode::Dispatch => self.key_dispatch(key),
             Mode::Confirm => self.key_confirm(key),
+            Mode::Errors => self.mode = Mode::Normal, // any key closes
         }
     }
 
@@ -781,6 +786,13 @@ impl App {
             KeyCode::Char(']') => self.cycle_filter(1),
             KeyCode::Char('/') => self.mode = Mode::Search,
             KeyCode::Char('r') | KeyCode::F(5) => self.force_refresh = true,
+            KeyCode::Char('E') => {
+                if self.errors.is_empty() {
+                    self.set_status("No load errors", false);
+                } else {
+                    self.mode = Mode::Errors;
+                }
+            }
             KeyCode::Char('?') => self.mode = Mode::Help,
             // Enter / l: drill from runs into jobs, or open the focused job's logs.
             KeyCode::Enter | KeyCode::Char('l') => match self.focus {
@@ -986,6 +998,7 @@ impl App {
                         d.dispatchable = true;
                         d.fields.clear();
                         d.field_idx = 0;
+                        d.fetched_ref = git_ref.clone();
                         self.pending.push(Command::FetchWorkflowInputs {
                             repo,
                             path: wf.path.clone(),
@@ -1004,8 +1017,31 @@ impl App {
             self.submit_dispatch();
             return;
         }
+        let left_ref;
+        {
+            let Some(d) = &mut self.dispatch else { return };
+            let count = d.field_count();
+            let old = d.field_idx;
+            Self::dispatch_form_edit(key, d, count);
+            // Moved off the ref field after changing it → reload inputs for that ref.
+            left_ref = old == 0 && d.field_idx != 0 && d.git_ref != d.fetched_ref;
+        }
+        if left_ref {
+            self.refetch_dispatch_inputs();
+        }
+    }
+
+    fn refetch_dispatch_inputs(&mut self) {
         let Some(d) = &mut self.dispatch else { return };
-        let count = d.field_count();
+        d.loaded = false;
+        d.fields.clear();
+        d.field_idx = 0;
+        d.fetched_ref = d.git_ref.clone();
+        let (repo, path, git_ref) = (d.repo.clone(), d.workflow_path.clone(), d.git_ref.clone());
+        self.pending.push(Command::FetchWorkflowInputs { repo, path, git_ref });
+    }
+
+    fn dispatch_form_edit(key: KeyEvent, d: &mut DispatchState, count: usize) {
         match key.code {
             KeyCode::Esc => d.stage = DispatchStage::SelectWorkflow,
             KeyCode::Tab | KeyCode::Down => d.field_idx = (d.field_idx + 1) % count,
@@ -1235,6 +1271,7 @@ impl App {
             wf_state: ListState::default(),
             stage: DispatchStage::SelectWorkflow,
             git_ref: default_branch,
+            fetched_ref: String::new(),
             workflow_id: 0,
             workflow_path: String::new(),
             fields: Vec::new(),
