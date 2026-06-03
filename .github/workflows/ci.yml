@@ -1,0 +1,67 @@
+name: CI
+
+# A lightweight workflow that exists purely to give actui something to render:
+# multiple jobs, a matrix, sequential steps, and a manual trigger for re-runs.
+# It does NOT run the real cargo test suite.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      fail:
+        description: "Force the 'flaky' job to fail (to test failure rendering)"
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        run: echo "Pretending to checkout the repo"
+      - name: Compile
+        run: |
+          echo "Compiling actui..."
+          sleep 2
+          echo "Done."
+
+  check:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Format
+        run: echo "rustfmt --check (simulated)"
+      - name: Clippy
+        run: |
+          echo "Running clippy (simulated)"
+          sleep 1
+
+  test-matrix:
+    name: Test (${{ matrix.os }})
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [linux, macos, windows]
+    steps:
+      - name: Run tests on ${{ matrix.os }}
+        run: |
+          echo "Simulating tests for ${{ matrix.os }}"
+          sleep 2
+          echo "All green."
+
+  flaky:
+    name: Flaky job
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Maybe fail
+        run: |
+          if [ "${{ inputs.fail }}" = "true" ]; then
+            echo "Failing on purpose so you can see a red run in actui."
+            exit 1
+          fi
+          echo "Passed this time."
