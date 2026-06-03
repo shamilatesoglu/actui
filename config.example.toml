@@ -1,0 +1,18 @@
+# Copy to ~/.config/actui/config.toml (Windows: %APPDATA%\actui\config.toml)
+# All fields are optional; shown values are the defaults.
+
+# broad sweep of ALL watched repos (catches new/finished runs)
+refresh_secs        = 60
+# focused poll of just the SELECTED run's jobs, while it's still running
+active_refresh_secs = 15
+runs_per_repo       = 15  # recent runs pulled per repo
+concurrency         = 3   # repos fetched in parallel (kept low to avoid bursts)
+max_repos           = 60  # cap, from most-recently-pushed repos (0 = no cap)
+skip_archived       = true # ignore archived repos
+
+# Only watch repos whose full_name contains one of these substrings.
+# Empty = every repo you own or are an org member of.
+include = []            # e.g. ["nodos-dev/", "shamilatesoglu/actui"]
+
+# Always drop repos whose full_name contains one of these substrings.
+exclude = []
