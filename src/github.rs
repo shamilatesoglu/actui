@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, ETAG, IF_NONE_MATCH, USER_AGENT};
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -58,6 +58,8 @@ pub fn resolve_token() -> Result<String> {
 #[derive(Clone)]
 pub struct Github {
     client: Client,
+    /// Bearer token, re-resolvable if it expires mid-session (applied per request).
+    token: Arc<Mutex<String>>,
     /// Per-key ETag cache for conditional requests.
     etags: Arc<Mutex<HashMap<String, String>>>,
     /// Last assembled repo list, returned when `/user/repos` is unchanged.
@@ -69,11 +71,9 @@ pub struct Github {
 
 impl Github {
     pub fn new(token: &str) -> Result<Self> {
+        // Auth is applied per request (see `send`) so the token can be refreshed
+        // mid-session; only the static headers live on the client.
         let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {token}"))?,
-        );
         headers.insert(ACCEPT, HeaderValue::from_static("application/vnd.github+json"));
         headers.insert(
             "X-GitHub-Api-Version",
@@ -86,11 +86,78 @@ impl Github {
             .build()?;
         Ok(Self {
             client,
+            token: Arc::new(Mutex::new(token.to_string())),
             etags: Arc::new(Mutex::new(HashMap::new())),
             repos_cache: Arc::new(Mutex::new(Vec::new())),
             poll_interval: Arc::new(AtomicU64::new(0)),
             rate_state: Arc::new(Mutex::new(RateState::default())),
         })
+    }
+
+    /// Send a request with shared rate-limit accounting: refuses while backing
+    /// off, attaches the current token, records `X-RateLimit-*`/`X-Poll-Interval`
+    /// headers, transparently re-resolves the token once on `401`, and converts a
+    /// primary/secondary rate limit into a back-off + error.
+    async fn send(&self, req: RequestBuilder) -> Result<Response> {
+        if let Some(d) = self.pause_remaining() {
+            return Err(anyhow!("backing off; retry in {}s", d.as_secs()));
+        }
+        let retry = req.try_clone();
+        let resp = self.send_authed(req).await?;
+        // Token may have expired — re-resolve once and replay the request.
+        if resp.status() == StatusCode::UNAUTHORIZED {
+            if let Some(retry) = retry {
+                if self.refresh_token().await {
+                    let resp = self.send_authed(retry).await?;
+                    self.account(&resp)?;
+                    return Ok(resp);
+                }
+            }
+        }
+        self.account(&resp)?;
+        Ok(resp)
+    }
+
+    /// Attach the current bearer token and send.
+    async fn send_authed(&self, req: RequestBuilder) -> Result<Response> {
+        let token = self.token.lock().unwrap().clone();
+        Ok(req.header(AUTHORIZATION, format!("Bearer {token}")).send().await?)
+    }
+
+    /// Re-resolve the token (e.g. after `gh` refreshed it). Returns true on change.
+    async fn refresh_token(&self) -> bool {
+        match tokio::task::spawn_blocking(resolve_token).await {
+            Ok(Ok(tok)) => {
+                *self.token.lock().unwrap() = tok;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Record rate headers and honor poll-interval; back off and error on a limit.
+    fn account(&self, resp: &Response) -> Result<()> {
+        self.record_rate(resp.headers());
+        if let Some(secs) = resp
+            .headers()
+            .get("x-poll-interval")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            self.poll_interval.fetch_max(secs, Ordering::Relaxed);
+        }
+        let status = resp.status();
+        if status == StatusCode::FORBIDDEN || status == StatusCode::TOO_MANY_REQUESTS {
+            let h = resp.headers();
+            let remaining_zero =
+                h.get("x-ratelimit-remaining").and_then(|v| v.to_str().ok()) == Some("0");
+            let has_retry = h.contains_key("retry-after");
+            if status == StatusCode::TOO_MANY_REQUESTS || remaining_zero || has_retry {
+                self.note_rate_limited(h);
+                return Err(anyhow!("rate limited; backing off"));
+            }
+        }
+        Ok(())
     }
 
     /// Authenticated user login.
@@ -100,9 +167,7 @@ impl Github {
             login: String,
         }
         let u: U = self
-            .client
-            .get(format!("{API}/user"))
-            .send()
+            .send(self.client.get(format!("{API}/user")))
             .await?
             .error_for_status()?
             .json()
@@ -178,38 +243,19 @@ impl Github {
         if let Some(tag) = prev {
             req = req.header(IF_NONE_MATCH, tag);
         }
-        let resp = req.send().await?;
-        self.record_rate(resp.headers());
-
-        if let Some(secs) = resp
-            .headers()
-            .get("x-poll-interval")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            self.poll_interval.fetch_max(secs, Ordering::Relaxed);
-        }
-
-        let status = resp.status();
-        if status == StatusCode::NOT_MODIFIED {
+        // `send` records rate/poll-interval headers and backs off on a limit.
+        let resp = self.send(req).await?;
+        if resp.status() == StatusCode::NOT_MODIFIED {
             return Ok(Cond::NotModified);
-        }
-        // Primary (403 + remaining 0) or secondary (403/429 + Retry-After) limit.
-        if status == StatusCode::FORBIDDEN || status == StatusCode::TOO_MANY_REQUESTS {
-            let h = resp.headers();
-            let remaining_zero = h
-                .get("x-ratelimit-remaining")
-                .and_then(|v| v.to_str().ok())
-                == Some("0");
-            let has_retry = h.contains_key("retry-after");
-            if status == StatusCode::TOO_MANY_REQUESTS || remaining_zero || has_retry {
-                self.note_rate_limited(h);
-                return Err(anyhow!("rate limited; backing off"));
-            }
         }
         let resp = resp.error_for_status()?;
         if let Some(tag) = resp.headers().get(ETAG).and_then(|v| v.to_str().ok()) {
-            self.etags.lock().unwrap().insert(key.to_string(), tag.to_string());
+            let mut etags = self.etags.lock().unwrap();
+            // Bound the cache: per-run job ETags accumulate over a long session.
+            if etags.len() > 2000 {
+                etags.retain(|k, _| !k.starts_with("jobs:"));
+            }
+            etags.insert(key.to_string(), tag.to_string());
         }
         Ok(Cond::Modified(resp.json::<T>().await?))
     }
@@ -240,15 +286,18 @@ impl Github {
         let mut repos = first;
         if repos.len() == 100 {
             for page in 2..=10u32 {
-                let batch: Vec<Repo> = self
-                    .client
-                    .get(format!("{API}/user/repos"))
-                    .query(&q(page))
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .json()
-                    .await?;
+                // A failing later page shouldn't discard the repos we already have.
+                let batch: Vec<Repo> = match self
+                    .send(self.client.get(format!("{API}/user/repos")).query(&q(page)))
+                    .await
+                    .and_then(|r| r.error_for_status().map_err(Into::into))
+                {
+                    Ok(r) => match r.json().await {
+                        Ok(b) => b,
+                        Err(_) => break,
+                    },
+                    Err(_) => break,
+                };
                 let n = batch.len();
                 repos.extend(batch);
                 if n < 100 {
@@ -296,10 +345,11 @@ impl Github {
             workflows: Vec<Workflow>,
         }
         let resp: Resp = self
-            .client
-            .get(format!("{API}/repos/{full_name}/actions/workflows"))
-            .query(&[("per_page", "100")])
-            .send()
+            .send(
+                self.client
+                    .get(format!("{API}/repos/{full_name}/actions/workflows"))
+                    .query(&[("per_page", "100")]),
+            )
             .await?
             .error_for_status()?
             .json()
@@ -321,15 +371,16 @@ impl Github {
             inputs: HashMap<String, String>,
         }
         let resp = self
-            .client
-            .post(format!(
-                "{API}/repos/{full_name}/actions/workflows/{workflow_id}/dispatches"
-            ))
-            .json(&Body {
-                r#ref: git_ref.to_string(),
-                inputs,
-            })
-            .send()
+            .send(
+                self.client
+                    .post(format!(
+                        "{API}/repos/{full_name}/actions/workflows/{workflow_id}/dispatches"
+                    ))
+                    .json(&Body {
+                        r#ref: git_ref.to_string(),
+                        inputs,
+                    }),
+            )
             .await?;
         check(resp).await
     }
@@ -348,10 +399,11 @@ impl Github {
             encoding: String,
         }
         let c: Contents = self
-            .client
-            .get(format!("{API}/repos/{full_name}/contents/{path}"))
-            .query(&[("ref", git_ref)])
-            .send()
+            .send(
+                self.client
+                    .get(format!("{API}/repos/{full_name}/contents/{path}"))
+                    .query(&[("ref", git_ref)]),
+            )
             .await?
             .error_for_status()?
             .json()
@@ -370,39 +422,78 @@ impl Github {
 
     pub async fn cancel(&self, full_name: &str, run_id: u64) -> Result<()> {
         let resp = self
-            .client
-            .post(format!("{API}/repos/{full_name}/actions/runs/{run_id}/cancel"))
-            .send()
+            .send(self.client.post(format!("{API}/repos/{full_name}/actions/runs/{run_id}/cancel")))
             .await?;
         check(resp).await
     }
 
     pub async fn rerun(&self, full_name: &str, run_id: u64) -> Result<()> {
         let resp = self
-            .client
-            .post(format!("{API}/repos/{full_name}/actions/runs/{run_id}/rerun"))
-            .send()
+            .send(self.client.post(format!("{API}/repos/{full_name}/actions/runs/{run_id}/rerun")))
             .await?;
         check(resp).await
     }
 
     pub async fn rerun_failed(&self, full_name: &str, run_id: u64) -> Result<()> {
         let resp = self
-            .client
-            .post(format!(
+            .send(self.client.post(format!(
                 "{API}/repos/{full_name}/actions/runs/{run_id}/rerun-failed-jobs"
-            ))
-            .send()
+            )))
             .await?;
         check(resp).await
+    }
+
+    /// Re-run a single job (and any jobs that depend on it).
+    pub async fn rerun_job(&self, full_name: &str, job_id: u64) -> Result<()> {
+        let resp = self
+            .send(self.client.post(format!("{API}/repos/{full_name}/actions/jobs/{job_id}/rerun")))
+            .await?;
+        check(resp).await
+    }
+
+    /// Approve a run waiting for approval (e.g. a first-time contributor's PR).
+    pub async fn approve(&self, full_name: &str, run_id: u64) -> Result<()> {
+        let resp = self
+            .send(self.client.post(format!("{API}/repos/{full_name}/actions/runs/{run_id}/approve")))
+            .await?;
+        check(resp).await
+    }
+
+    /// Artifacts produced by a run.
+    pub async fn list_artifacts(&self, full_name: &str, run_id: u64) -> Result<Vec<Artifact>> {
+        #[derive(Deserialize)]
+        struct Resp {
+            artifacts: Vec<Artifact>,
+        }
+        let resp: Resp = self
+            .send(
+                self.client
+                    .get(format!("{API}/repos/{full_name}/actions/runs/{run_id}/artifacts"))
+                    .query(&[("per_page", "100")]),
+            )
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(resp.artifacts)
+    }
+
+    /// Download an artifact's zip (follows the redirect to the blob).
+    pub async fn download_artifact(&self, full_name: &str, artifact_id: u64) -> Result<Vec<u8>> {
+        let resp = self
+            .send(
+                self.client
+                    .get(format!("{API}/repos/{full_name}/actions/artifacts/{artifact_id}/zip")),
+            )
+            .await?
+            .error_for_status()?;
+        Ok(resp.bytes().await?.to_vec())
     }
 
     /// Plain-text logs for a single job (follows the redirect to the log blob).
     pub async fn job_logs(&self, full_name: &str, job_id: u64) -> Result<String> {
         let resp = self
-            .client
-            .get(format!("{API}/repos/{full_name}/actions/jobs/{job_id}/logs"))
-            .send()
+            .send(self.client.get(format!("{API}/repos/{full_name}/actions/jobs/{job_id}/logs")))
             .await?
             .error_for_status()?;
         Ok(resp.text().await?)
@@ -420,9 +511,7 @@ impl Github {
             core: RateLimit,
         }
         let resp: Resp = self
-            .client
-            .get(format!("{API}/rate_limit"))
-            .send()
+            .send(self.client.get(format!("{API}/rate_limit")))
             .await?
             .error_for_status()?
             .json()
@@ -643,6 +732,16 @@ pub struct Workflow {
 pub struct RateLimit {
     pub limit: u32,
     pub remaining: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Artifact {
+    pub id: u64,
+    pub name: String,
+    #[serde(default)]
+    pub size_in_bytes: u64,
+    #[serde(default)]
+    pub expired: bool,
 }
 
 /// Run lifecycle, normalized from status + conclusion.

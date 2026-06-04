@@ -38,8 +38,58 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Dispatch => draw_dispatch(f, app),
         Mode::Confirm => draw_confirm(f, app),
         Mode::Errors => draw_errors(f, app),
+        Mode::Artifacts => draw_artifacts(f, app),
         _ => {}
     }
+}
+
+fn draw_artifacts(f: &mut Frame, app: &App) {
+    let Some(av) = &app.artifacts else { return };
+    let area = centered(60, 60, f.area());
+    f.render_widget(Clear, area);
+    let block = popup_block(&format!(" Artifacts · {} ", av.repo));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if !av.loaded {
+        f.render_widget(
+            Paragraph::new("Loading artifacts…").style(Style::default().fg(DIM)),
+            inner,
+        );
+        return;
+    }
+    if av.items.is_empty() {
+        f.render_widget(
+            Paragraph::new("No artifacts for this run.").style(Style::default().fg(DIM)),
+            inner,
+        );
+        return;
+    }
+
+    let items: Vec<ListItem> = av
+        .items
+        .iter()
+        .map(|a| {
+            let (note, c) = if a.expired {
+                (" (expired)".to_string(), Color::Red)
+            } else {
+                (format!("  {}", fmt_bytes(a.size_in_bytes)), DIM)
+            };
+            ListItem::new(Line::from(vec![
+                Span::raw(a.name.clone()),
+                Span::styled(note, Style::default().fg(c)),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .highlight_style(Style::default().bg(BG_SEL).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▌")
+        .block(Block::default().title(Span::styled(
+            " ⏎ download (.zip) · j/k move · Esc close ",
+            Style::default().fg(DIM),
+        )));
+    let mut state = av.state.clone();
+    f.render_stateful_widget(list, inner, &mut state);
 }
 
 fn draw_errors(f: &mut Frame, app: &App) {
@@ -399,12 +449,12 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let hint = match (app.mode == Mode::Logs, app.focus) {
-        (true, _) => " j/k move · ⏎ fold · e/f expand/fold all · / search · n/N next/prev · Esc close",
+        (true, _) => " j/k move · ←/→ scroll · ⏎ fold · e/f all · / search · n/N · s save · Esc close",
         (false, Focus::Runs) => {
-            " j/k move · ⏎/l jobs · 1-5 filter · / search · o open · d dispatch · c cancel · x/X rerun · r refresh · ? help · q quit"
+            " j/k move · ⏎/l jobs · / search · o open · d dispatch · c cancel · x/X rerun · a approve · A artifacts · ? help · q quit"
         }
         (false, Focus::Jobs) => {
-            " j/k job · ⏎/l logs · ←/Esc back · o open run · r refresh · ? help · q quit"
+            " j/k job · ⏎/l logs · R rerun job · A artifacts · ←/Esc back · o open · ? help · q quit"
         }
     };
     f.render_widget(
@@ -439,20 +489,25 @@ fn draw_help(f: &mut Frame) {
         help_row("/", "fuzzy search (repo, workflow, branch)"),
         Line::raw(""),
         hl("Actions"),
-        help_row("Enter / l", "view logs of selected job (l works anywhere)"),
+        help_row("Enter / l / L", "view logs of selected job (L works anywhere)"),
         help_row("o", "open run in browser"),
         help_row("d", "dispatch a workflow (workflow_dispatch)"),
         help_row("c", "cancel the selected run"),
         help_row("x / X", "re-run failed jobs / re-run all"),
+        help_row("R", "re-run the selected job"),
+        help_row("a", "approve a run awaiting approval"),
+        help_row("A", "browse / download run artifacts"),
         help_row("r / F5", "refresh now (auto-refresh is on)"),
         help_row("E", "show repos that failed to load"),
         Line::raw(""),
         hl("Logs view"),
         help_row("j / k", "move cursor"),
+        help_row("← / →", "scroll horizontally"),
         help_row("Enter / Space", "fold / unfold step at cursor (shows duration)"),
         help_row("e / f", "expand all / fold all steps"),
         help_row("/", "search logs (auto-expands folded hits)"),
         help_row("n / N", "next / previous match"),
+        help_row("s", "save the log to a file"),
         Line::raw(""),
         help_row("?", "toggle this help"),
         help_row("q / Ctrl-C", "quit"),
@@ -538,7 +593,8 @@ fn draw_logs_pane(f: &mut Frame, app: &App, area: Rect) {
             Line::from(spans)
         })
         .collect();
-    f.render_widget(Paragraph::new(text), body);
+    // Horizontal scroll for lines wider than the pane (Left/Right adjust it).
+    f.render_widget(Paragraph::new(text).scroll((0, lv.hscroll)), body);
 
     let by = Rect { x: inner.x, y: inner.y + inner.height - 1, width: inner.width, height: 1 };
     if lv.searching {
@@ -562,7 +618,8 @@ fn draw_logs_pane(f: &mut Frame, app: &App, area: Rect) {
             String::new()
         };
         let folds = if lv.has_groups() { " · ⏎ fold · e/f all" } else { "" };
-        let bar = format!(" {pos}/{shown} · j/k{folds} · / search{search} · Esc close ");
+        let hs = if lv.hscroll > 0 { format!(" · →{}", lv.hscroll) } else { String::new() };
+        let bar = format!(" {pos}/{shown} · j/k{folds} · / search{search} · s save{hs} · Esc close ");
         f.render_widget(
             Paragraph::new(Span::styled(bar, Style::default().fg(DIM))).alignment(Alignment::Right),
             by,
@@ -939,6 +996,18 @@ fn fmt_secs(secs: f64) -> String {
         format!("{secs:.1}s")
     } else {
         fmt_dur(secs as i64)
+    }
+}
+
+fn fmt_bytes(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    match n {
+        0..=999 => format!("{n} B"),
+        _ if n < MB => format!("{:.0} KB", n as f64 / KB as f64),
+        _ if n < GB => format!("{:.1} MB", n as f64 / MB as f64),
+        _ => format!("{:.1} GB", n as f64 / GB as f64),
     }
 }
 

@@ -1,0 +1,96 @@
+name: Test Workflow
+
+# A lightweight workflow that exists purely to give actui something to render:
+# multiple jobs, a matrix, sequential steps, and a manual trigger for re-runs.
+# It does NOT run the real cargo test suite — every step just sleeps/echoes.
+#
+# Durations are configurable via workflow_dispatch inputs so you can produce
+# short or long-running runs on demand. The defaults are deliberately a bit
+# slow so runs stay "in progress" long enough to watch live in actui.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      build_seconds:
+        description: "How long the Build job's compile step sleeps"
+        type: string
+        default: "30"
+      check_seconds:
+        description: "How long the Lint & Format job sleeps"
+        type: string
+        default: "20"
+      test_seconds:
+        description: "How long EACH matrix test job sleeps"
+        type: string
+        default: "45"
+      flaky_seconds:
+        description: "How long the Flaky job sleeps before its verdict"
+        type: string
+        default: "25"
+      fail:
+        description: "Force the 'flaky' job to fail (to test failure rendering)"
+        type: boolean
+        default: false
+
+# Defaults applied when triggered by push/PR (where inputs are unavailable).
+env:
+  BUILD_SECONDS: ${{ inputs.build_seconds || '30' }}
+  CHECK_SECONDS: ${{ inputs.check_seconds || '20' }}
+  TEST_SECONDS: ${{ inputs.test_seconds || '45' }}
+  FLAKY_SECONDS: ${{ inputs.flaky_seconds || '25' }}
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        run: echo "Pretending to checkout the repo"
+      - name: Compile
+        run: |
+          echo "Compiling actui... (${BUILD_SECONDS}s)"
+          sleep "$BUILD_SECONDS"
+          echo "Done."
+
+  check:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Format
+        run: echo "rustfmt --check (simulated)"
+      - name: Clippy
+        run: |
+          echo "Running clippy (simulated, ${CHECK_SECONDS}s)"
+          sleep "$CHECK_SECONDS"
+
+  test-matrix:
+    name: Test (${{ matrix.os }})
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [linux, macos, windows]
+    steps:
+      - name: Run tests on ${{ matrix.os }}
+        run: |
+          echo "Simulating tests for ${{ matrix.os }} (${TEST_SECONDS}s)"
+          sleep "$TEST_SECONDS"
+          echo "All green."
+
+  flaky:
+    name: Flaky job
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Maybe fail
+        run: |
+          echo "Working... (${FLAKY_SECONDS}s)"
+          sleep "$FLAKY_SECONDS"
+          if [ "${{ inputs.fail }}" = "true" ]; then
+            echo "Failing on purpose so you can see a red run in actui."
+            exit 1
+          fi
+          echo "Passed this time."

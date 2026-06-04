@@ -14,7 +14,7 @@ A fast, beautiful terminal UI for viewing and managing **GitHub Actions** across
                                             ││ ▌✔ build        1m12s      │
                                             ││  ✔ test         48s        │
 ╰────────────────────────────────────────╯╰───────────────────────────╯
- j/k move · [/] job · Tab filter · / search · ⏎/o open · l logs · d dispatch · c cancel · x/X rerun · r refresh · ? help · q quit
+ j/k move · Tab focus · / search · ⏎/o open · l logs · d dispatch · c cancel · x/X rerun · A artifacts · r refresh · ? help · q quit
 ```
 
 ## Features
@@ -32,10 +32,13 @@ A fast, beautiful terminal UI for viewing and managing **GitHub Actions** across
 - **Manage runs** without the browser:
   - `d` — trigger a `workflow_dispatch`: pick the workflow, then fill a **typed form** built from the workflow's declared inputs (text fields, boolean toggles, choice pickers — defaults pre-filled, required fields marked)
   - `c` — cancel a running run
-  - `x` / `X` — re-run failed jobs / re-run all jobs
+  - `x` / `X` — re-run failed jobs / re-run all jobs; `R` — re-run just the selected job
+  - `a` — approve a run that's waiting for approval
+  - `A` — browse a run's **artifacts** and download one as a `.zip`
   - `o` — open the run on github.com
+- **Resilient API client** — every request (polls *and* mutations) shares one rate-limit budget and back-off window, honors `Retry-After`/`X-RateLimit-Reset`, and **re-resolves an expired token** automatically mid-session. Repo pagination is fault-tolerant: a failing later page keeps the repos already fetched instead of dropping everything.
 - **Fully automatic, thrifty refresh** — no refresh key, and deliberately frugal with requests:
-  - **Two-tier polling** — a slow *broad sweep* of all repos (`refresh_secs`) catches new/finished runs; only the **selected run's jobs** poll on the fast cadence (`active_refresh_secs`), and only while that run is still running. Idle = almost no traffic.
+  - **Two-tier polling** — a slow *broad sweep* of all repos (`refresh_secs`) catches new/finished runs; the jobs of **every active run** (bounded) poll on the fast cadence (`active_refresh_secs`), and only while something is still running. Idle = almost no traffic.
   - **Conditional requests (ETags)** — every poll sends `If-None-Match`; unchanged resources return `304 Not Modified`, which **doesn't count against the rate limit**.
   - **Automatic back-off** — on a primary or secondary rate limit (`403`/`429`), all polling pauses until `Retry-After`/`X-RateLimit-Reset` clears, shown in the header (`rate-limited · resuming in 42s`). It also eases off when remaining quota is low.
   - Rate-limit numbers come from response headers (no extra `/rate_limit` request), and concurrency is kept low (default 3) to avoid request bursts.
@@ -92,11 +95,17 @@ exclude = []            # e.g. ["fork-of-"]
 | `Enter` / `l` / `→` | drill Runs → Jobs, or open a job's logs |
 | `h` / `←` / `Esc` | back to Runs |
 | `1`–`5`, `[` / `]` | status filter |
-| `/` | fuzzy search runs |
+| `/` | fuzzy search runs (repo, workflow, branch) |
 | `o` | open run in browser |
+| `L` | open the selected job's logs (works anywhere) |
 | `d` | dispatch a workflow |
 | `c` | cancel run |
-| `x` / `X` | re-run failed / all |
+| `x` / `X` | re-run failed / all jobs |
+| `R` | re-run the selected job |
+| `a` | approve a run awaiting approval |
+| `A` | browse / download run artifacts |
+| `r` / `F5` | refresh now |
+| `E` | show repos that failed to load |
 | `?` | help · `q` / `Ctrl-C` quit |
 
 **Logs viewer**
@@ -104,12 +113,14 @@ exclude = []            # e.g. ["fork-of-"]
 | Key | Action |
 |-----|--------|
 | `j` / `k`, `g` / `G` | move cursor |
+| `←` / `→` | scroll horizontally |
 | `Enter` / `Space` | fold / unfold group |
 | `e` / `f` | expand all / fold all |
 | `/`, `n` / `N` | search, next / prev match |
+| `s` | save the log to a file |
 | `Esc` / `q` | close logs |
 
-Refreshing is automatic — there is no refresh key.
+Auto-refresh is always on; `r` / `F5` force an immediate sweep.
 
 ## License
 

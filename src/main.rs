@@ -111,7 +111,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, gh: Github, cfg: Config) -
                     last_broad = std::time::Instant::now();
                     last_focused = std::time::Instant::now(); // broad already covers jobs
                 } else if !blocked
-                    && app.selected_run_active()
+                    && app.any_run_active()
                     && last_focused.elapsed() >= focused_iv.max(floor)
                 {
                     app.queue_focused_refresh();
@@ -163,7 +163,7 @@ fn dispatch_commands(app: &mut App, gh: &Github, cfg: &Config, tx: &UnboundedSen
                             } else {
                                 text
                             };
-                            let _ = tx.send(DataMsg::Logs { title, text });
+                            let _ = tx.send(DataMsg::Logs { job_id, title, text });
                         }
                         Err(e) => {
                             let _ = tx.send(DataMsg::Error(format!("logs: {e}")));
@@ -244,6 +244,55 @@ fn dispatch_commands(app: &mut App, gh: &Github, cfg: &Config, tx: &UnboundedSen
                         Err(e) => { let _ = tx.send(DataMsg::Error(format!("rerun-failed: {e}"))); }
                     }
                 });
+            }
+            Command::RerunJob { repo, job_id } => {
+                let (gh, tx) = (gh.clone(), tx.clone());
+                tokio::spawn(async move {
+                    match gh.rerun_job(&repo, job_id).await {
+                        Ok(()) => { let _ = tx.send(DataMsg::Action("Re-run (job) requested".into())); }
+                        Err(e) => { let _ = tx.send(DataMsg::Error(format!("rerun-job: {e}"))); }
+                    }
+                });
+            }
+            Command::Approve { repo, run_id } => {
+                let (gh, tx) = (gh.clone(), tx.clone());
+                tokio::spawn(async move {
+                    match gh.approve(&repo, run_id).await {
+                        Ok(()) => { let _ = tx.send(DataMsg::Action("Run approved".into())); }
+                        Err(e) => { let _ = tx.send(DataMsg::Error(format!("approve: {e}"))); }
+                    }
+                });
+            }
+            Command::FetchArtifacts { repo, run_id } => {
+                let (gh, tx) = (gh.clone(), tx.clone());
+                tokio::spawn(async move {
+                    match gh.list_artifacts(&repo, run_id).await {
+                        Ok(artifacts) => { let _ = tx.send(DataMsg::Artifacts { run_id, artifacts }); }
+                        Err(e) => { let _ = tx.send(DataMsg::Error(format!("artifacts: {e}"))); }
+                    }
+                });
+            }
+            Command::DownloadArtifact { repo, artifact_id, name } => {
+                let (gh, tx) = (gh.clone(), tx.clone());
+                tokio::spawn(async move {
+                    match gh.download_artifact(&repo, artifact_id).await {
+                        Ok(bytes) => {
+                            let file = format!("{name}.zip");
+                            match std::fs::write(&file, &bytes) {
+                                Ok(()) => { let _ = tx.send(DataMsg::Action(format!("Saved {file}"))); }
+                                Err(e) => { let _ = tx.send(DataMsg::Error(format!("writing {file}: {e}"))); }
+                            }
+                        }
+                        Err(e) => { let _ = tx.send(DataMsg::Error(format!("download: {e}"))); }
+                    }
+                });
+            }
+            Command::SaveLogs { name, content } => {
+                let tx = tx.clone();
+                match std::fs::write(&name, content) {
+                    Ok(()) => { let _ = tx.send(DataMsg::Action(format!("Saved {name}"))); }
+                    Err(e) => { let _ = tx.send(DataMsg::Error(format!("writing {name}: {e}"))); }
+                }
             }
             Command::OpenUrl(url) => {
                 let _ = open::that_detached(&url);

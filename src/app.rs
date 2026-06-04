@@ -1,12 +1,17 @@
 //! Application state, input handling, and the command/event protocol that
 //! connects the synchronous UI loop to the async GitHub workers.
 
-use crate::github::{Job, RateLimit, Run, RunState, Step, WfInput, WfInputKind, Workflow};
+use crate::github::{Artifact, Job, RateLimit, Run, RunState, Step, WfInput, WfInputKind, Workflow};
 use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::{ListState, TableState};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
+
+/// Most active runs polled per fast tick (keeps request bursts small).
+const MAX_ACTIVE_POLL: usize = 8;
+/// Cap on cached job-log blobs so a long session doesn't grow without bound.
+const MAX_LOG_CACHE: usize = 40;
 
 /// How long a transient status message stays on screen.
 const STATUS_TTL: Duration = Duration::from_secs(4);
@@ -20,9 +25,10 @@ pub enum DataMsg {
     RunsUnchanged,
     RepoError { repo: String, err: String },
     Jobs { run_id: u64, jobs: Vec<Job> },
-    Logs { title: String, text: String },
+    Logs { job_id: u64, title: String, text: String },
     Workflows { repo: String, workflows: Vec<Workflow> },
     WorkflowInputs { repo: String, dispatchable: bool, inputs: Vec<WfInput> },
+    Artifacts { run_id: u64, artifacts: Vec<Artifact> },
     Action(String),
     Error(String),
     RefreshDone,
@@ -35,10 +41,15 @@ pub enum Command {
     FetchLogs { repo: String, job_id: u64, title: String },
     FetchWorkflows { repo: String },
     FetchWorkflowInputs { repo: String, path: String, git_ref: String },
+    FetchArtifacts { repo: String, run_id: u64 },
+    DownloadArtifact { repo: String, artifact_id: u64, name: String },
     Dispatch { repo: String, workflow_id: u64, git_ref: String, inputs: HashMap<String, String> },
     Cancel { repo: String, run_id: u64 },
     Rerun { repo: String, run_id: u64 },
     RerunFailed { repo: String, run_id: u64 },
+    RerunJob { repo: String, job_id: u64 },
+    Approve { repo: String, run_id: u64 },
+    SaveLogs { name: String, content: String },
     OpenUrl(String),
 }
 
@@ -95,12 +106,15 @@ pub enum Mode {
     Dispatch,
     Confirm,
     Errors,
+    Artifacts,
 }
 
 pub enum PendingAction {
     Cancel { repo: String, run_id: u64, label: String },
     Rerun { repo: String, run_id: u64, label: String },
     RerunFailed { repo: String, run_id: u64, label: String },
+    RerunJob { repo: String, job_id: u64, label: String },
+    Approve { repo: String, run_id: u64, label: String },
 }
 
 impl PendingAction {
@@ -109,8 +123,19 @@ impl PendingAction {
             PendingAction::Cancel { label, .. } => format!("Cancel run?  {label}"),
             PendingAction::Rerun { label, .. } => format!("Re-run all jobs?  {label}"),
             PendingAction::RerunFailed { label, .. } => format!("Re-run failed jobs?  {label}"),
+            PendingAction::RerunJob { label, .. } => format!("Re-run job?  {label}"),
+            PendingAction::Approve { label, .. } => format!("Approve run?  {label}"),
         }
     }
+}
+
+/// Browser over a run's artifacts (open with `A`).
+pub struct ArtifactsView {
+    pub repo: String,
+    pub run_id: u64,
+    pub items: Vec<Artifact>,
+    pub state: ListState,
+    pub loaded: bool,
 }
 
 pub enum DispatchStage {
@@ -213,6 +238,8 @@ pub struct LogsView {
     pub visible: Vec<usize>,
     /// Cursor position within `visible`.
     pub cursor: usize,
+    /// Horizontal scroll offset (columns), for lines wider than the pane.
+    pub hscroll: u16,
     /// In-log search.
     pub search: String,
     pub searching: bool,
@@ -308,6 +335,7 @@ impl LogsView {
             groups,
             visible: Vec::new(),
             cursor: 0,
+            hscroll: 0,
             search: String::new(),
             searching: false,
             matches: Vec::new(),
@@ -485,8 +513,11 @@ pub struct App {
 
     pub dispatch: Option<DispatchState>,
     pub logs: Option<LogsView>,
+    /// Completed-job logs cached by job id, so re-opening doesn't re-download.
+    pub logs_cache: HashMap<u64, String>,
     /// Live step view for a still-running job (mutually exclusive with `logs`).
     pub steps_view: Option<StepsView>,
+    pub artifacts: Option<ArtifactsView>,
     pub pending_action: Option<PendingAction>,
 
     /// Set by the refresh key; consumed by the main loop.
@@ -521,7 +552,9 @@ impl App {
             should_quit: false,
             dispatch: None,
             logs: None,
+            logs_cache: HashMap::new(),
             steps_view: None,
+            artifacts: None,
             pending_action: None,
             force_refresh: false,
             pending: Vec::new(),
@@ -606,11 +639,26 @@ impl App {
                     }
                 }
             }
-            DataMsg::Logs { title, text } => {
+            DataMsg::Logs { job_id, title, text } => {
+                if self.logs_cache.len() >= MAX_LOG_CACHE {
+                    self.logs_cache.clear();
+                }
+                self.logs_cache.insert(job_id, text.clone());
                 self.logs = Some(LogsView::new(title, &text));
                 self.steps_view = None; // text replaces the live step view
                 self.mode = Mode::Logs;
                 self.status_msg = None; // clear the "Fetching logs…" notice
+            }
+            DataMsg::Artifacts { run_id, artifacts } => {
+                if let Some(av) = &mut self.artifacts {
+                    if av.run_id == run_id {
+                        av.items = artifacts;
+                        av.loaded = true;
+                        if av.state.selected().is_none() && !av.items.is_empty() {
+                            av.state.select(Some(0));
+                        }
+                    }
+                }
             }
             DataMsg::Workflows { repo, workflows } => {
                 if let Some(d) = &mut self.dispatch {
@@ -641,6 +689,10 @@ impl App {
     fn finish_refresh(&mut self) {
         self.loading = false;
         self.last_refresh = Some(Utc::now());
+        // Drop cached jobs for runs that fell out of the latest sweep so the
+        // cache can't grow without bound over a long session.
+        let live: HashSet<u64> = self.runs.iter().map(|r| r.id).collect();
+        self.jobs_cache.retain(|id, _| live.contains(id));
         self.recompute_view();
     }
 
@@ -660,10 +712,10 @@ impl App {
                 if q.is_empty() {
                     return true;
                 }
-                r.repository.full_name.to_lowercase().contains(&q)
-                    || r.title().to_lowercase().contains(&q)
-                    || r.workflow_name().to_lowercase().contains(&q)
-                    || r.head_branch.as_deref().unwrap_or("").to_lowercase().contains(&q)
+                fuzzy(&r.repository.full_name, &q)
+                    || fuzzy(r.title(), &q)
+                    || fuzzy(r.workflow_name(), &q)
+                    || fuzzy(r.head_branch.as_deref().unwrap_or(""), &q)
             })
             .map(|(i, _)| i)
             .collect();
@@ -757,6 +809,7 @@ impl App {
             Mode::Dispatch => self.key_dispatch(key),
             Mode::Confirm => self.key_confirm(key),
             Mode::Errors => self.mode = Mode::Normal, // any key closes
+            Mode::Artifacts => self.key_artifacts(key),
         }
     }
 
@@ -809,6 +862,9 @@ impl App {
             KeyCode::Char('c') => self.confirm_cancel(),
             KeyCode::Char('x') => self.confirm_rerun(false),
             KeyCode::Char('X') => self.confirm_rerun(true),
+            KeyCode::Char('R') => self.confirm_rerun_job(),
+            KeyCode::Char('a') => self.confirm_approve(),
+            KeyCode::Char('A') => self.open_artifacts(),
             KeyCode::Char('d') => self.open_dispatch(),
             _ => {}
         }
@@ -957,6 +1013,9 @@ impl App {
             KeyCode::PageUp => lv.move_cursor(-20),
             KeyCode::Char('g') | KeyCode::Home => lv.cursor_to(true),
             KeyCode::Char('G') | KeyCode::End => lv.cursor_to(false),
+            // Horizontal scroll for lines wider than the pane.
+            KeyCode::Left => lv.hscroll = lv.hscroll.saturating_sub(8),
+            KeyCode::Right => lv.hscroll = (lv.hscroll + 8).min(2000),
             // Folding.
             KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Tab => lv.toggle_fold(),
             KeyCode::Char('e') => lv.set_all_collapsed(false), // expand all
@@ -970,6 +1029,59 @@ impl App {
             }
             KeyCode::Char('n') => lv.next_match(1),
             KeyCode::Char('N') => lv.next_match(-1),
+            // Save the raw log to a file in the working directory.
+            KeyCode::Char('s') => self.save_current_logs(),
+            _ => {}
+        }
+    }
+
+    /// Queue a save of the open log to a file named after its title.
+    fn save_current_logs(&mut self) {
+        let Some(lv) = &self.logs else { return };
+        let content = lv.lines.join("\n");
+        let safe: String = lv
+            .title
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '_' })
+            .collect();
+        let name = format!("{}.log", safe.trim_matches('_'));
+        self.pending.push(Command::SaveLogs { name, content });
+    }
+
+    fn key_artifacts(&mut self, key: KeyEvent) {
+        let Some(av) = &mut self.artifacts else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.artifacts = None;
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Char('j') | KeyCode::Down => list_move(&mut av.state, av.items.len(), 1),
+            KeyCode::Char('k') | KeyCode::Up => list_move(&mut av.state, av.items.len(), -1),
+            KeyCode::Char('g') | KeyCode::Home => {
+                if !av.items.is_empty() {
+                    av.state.select(Some(0));
+                }
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                if !av.items.is_empty() {
+                    av.state.select(Some(av.items.len() - 1));
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(a) = av.state.selected().and_then(|i| av.items.get(i)) {
+                    if a.expired {
+                        self.set_status("Artifact has expired", true);
+                    } else {
+                        let (repo, artifact_id, name) = (av.repo.clone(), a.id, a.name.clone());
+                        self.set_status(format!("Downloading {name}…"), false);
+                        self.pending
+                            .push(Command::DownloadArtifact { repo, artifact_id, name });
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1107,6 +1219,12 @@ impl App {
                         PendingAction::RerunFailed { repo, run_id, .. } => {
                             self.pending.push(Command::RerunFailed { repo, run_id })
                         }
+                        PendingAction::RerunJob { repo, job_id, .. } => {
+                            self.pending.push(Command::RerunJob { repo, job_id })
+                        }
+                        PendingAction::Approve { repo, run_id, .. } => {
+                            self.pending.push(Command::Approve { repo, run_id })
+                        }
                     }
                 }
                 self.mode = Mode::Normal;
@@ -1150,14 +1268,6 @@ impl App {
         self.recompute_view();
     }
 
-    /// True when the *selected* run is still queued/in progress — the only case
-    /// where polling its jobs on the fast cadence is worthwhile.
-    pub fn selected_run_active(&self) -> bool {
-        self.selected_run()
-            .map(|r| matches!(r.state(), RunState::Running | RunState::Queued))
-            .unwrap_or(false)
-    }
-
     /// Broad sweep: re-list every watched repo's runs, plus the selected run's
     /// jobs. Runs on the slow cadence.
     pub fn queue_broad_refresh(&mut self) {
@@ -1168,10 +1278,27 @@ impl App {
         self.queue_selected_jobs();
     }
 
-    /// Focused poll: just the selected run's jobs (one request), for the fast
-    /// cadence while you're watching something run.
+    /// True when any run (not just the selected one) is queued/in progress.
+    pub fn any_run_active(&self) -> bool {
+        self.runs
+            .iter()
+            .any(|r| matches!(r.state(), RunState::Running | RunState::Queued))
+    }
+
+    /// Focused poll for the fast cadence: refresh jobs for the active runs (up
+    /// to `MAX_ACTIVE_POLL`), so every in-flight run stays current — not only the
+    /// selected one. Bounded to keep the request burst small.
     pub fn queue_focused_refresh(&mut self) {
-        self.queue_selected_jobs();
+        let active: Vec<(String, u64)> = self
+            .runs
+            .iter()
+            .filter(|r| matches!(r.state(), RunState::Running | RunState::Queued))
+            .take(MAX_ACTIVE_POLL)
+            .map(|r| (r.repository.full_name.clone(), r.id))
+            .collect();
+        for (repo, run_id) in active {
+            self.pending.push(Command::FetchJobs { repo, run_id });
+        }
     }
 
     fn queue_selected_jobs(&mut self) {
@@ -1204,8 +1331,16 @@ impl App {
             self.status_msg = None;
         } else {
             let title = format!("{repo} — {job_name}");
-            self.set_status("Fetching logs…", false);
-            self.pending.push(Command::FetchLogs { repo, job_id, title });
+            // Serve cached logs instantly; completed-job logs never change.
+            if let Some(text) = self.logs_cache.get(&job_id) {
+                self.logs = Some(LogsView::new(title, text));
+                self.steps_view = None;
+                self.mode = Mode::Logs;
+                self.status_msg = None;
+            } else {
+                self.set_status("Fetching logs…", false);
+                self.pending.push(Command::FetchLogs { repo, job_id, title });
+            }
         }
     }
 
@@ -1256,6 +1391,47 @@ impl App {
             PendingAction::Rerun { repo, run_id, label }
         });
         self.mode = Mode::Confirm;
+    }
+
+    /// Re-run just the selected job (requires a job to be selected).
+    fn confirm_rerun_job(&mut self) {
+        let Some(repo) = self.selected_run().map(|r| r.repository.full_name.clone()) else {
+            return;
+        };
+        let Some((job_id, label)) = self.selected_job().map(|j| (j.id, j.name.clone())) else {
+            self.set_status("Select a job first (Tab to focus Jobs)", true);
+            return;
+        };
+        self.pending_action = Some(PendingAction::RerunJob { repo, job_id, label });
+        self.mode = Mode::Confirm;
+    }
+
+    /// Approve a run that's waiting for approval.
+    fn confirm_approve(&mut self) {
+        let Some(run) = self.selected_run() else { return };
+        self.pending_action = Some(PendingAction::Approve {
+            repo: run.repository.full_name.clone(),
+            run_id: run.id,
+            label: format!("{} #{}", run.workflow_name(), run.run_number),
+        });
+        self.mode = Mode::Confirm;
+    }
+
+    fn open_artifacts(&mut self) {
+        let Some(run) = self.selected_run() else {
+            self.set_status("Select a run first", true);
+            return;
+        };
+        let (repo, run_id) = (run.repository.full_name.clone(), run.id);
+        self.artifacts = Some(ArtifactsView {
+            repo: repo.clone(),
+            run_id,
+            items: Vec::new(),
+            state: ListState::default(),
+            loaded: false,
+        });
+        self.mode = Mode::Artifacts;
+        self.pending.push(Command::FetchArtifacts { repo, run_id });
     }
 
     fn open_dispatch(&mut self) {
@@ -1327,6 +1503,16 @@ impl App {
         self.mode = Mode::Normal;
         self.set_status("Dispatching workflow…", false);
     }
+}
+
+/// Case-insensitive subsequence match: every char of `needle` (already
+/// lowercased) appears in `haystack`, in order. Empty needle always matches.
+fn fuzzy(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let mut chars = haystack.chars().flat_map(char::to_lowercase);
+    needle.chars().all(|nc| chars.any(|hc| hc == nc))
 }
 
 fn list_move(state: &mut ListState, len: usize, delta: i32) {
@@ -1428,6 +1614,15 @@ mod tests {
         lv.update_search();
         assert!(lv.matches.is_empty());
         assert!(lv.match_idx.is_none());
+    }
+
+    #[test]
+    fn fuzzy_subsequence_matching() {
+        assert!(fuzzy("org/api-server", "apisrv")); // chars in order, gaps ok
+        assert!(fuzzy("Deploy", "dep")); // case-insensitive
+        assert!(fuzzy("anything", "")); // empty needle matches
+        assert!(!fuzzy("api", "apii")); // needle longer / not a subsequence
+        assert!(!fuzzy("build", "lib")); // out of order
     }
 
     #[test]
