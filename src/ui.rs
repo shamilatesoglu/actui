@@ -1,7 +1,7 @@
 //! All rendering. `draw` is called every frame with the current `App`.
 
-use crate::app::{App, DispatchStage, Filter, Focus, Mode};
-use crate::github::{Job, RunState, Step};
+use crate::app::{App, DispatchStage, Filter, Focus, Mode, RefKind};
+use crate::github::{Job, Run, RunState, Step};
 use ansi_to_tui::IntoText;
 use chrono::{DateTime, Utc};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
@@ -14,8 +14,65 @@ use ratatui::Frame;
 
 const ACCENT: Color = Color::Rgb(137, 180, 250);
 const DIM: Color = Color::Rgb(127, 132, 156);
-const BG_SEL: Color = Color::Rgb(49, 50, 68);
+const BG_SEL: Color = Color::Rgb(49, 50, 68); // selection background (focused pane)
+const BG_SEL_DIM: Color = Color::Rgb(40, 41, 56); // selection background (unfocused pane)
+const PALE: Color = Color::Rgb(166, 173, 200); // unfocused selected text
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Row/list selection highlight: bright when focused, dim when not.
+fn select_style(focused: bool) -> Style {
+    if focused {
+        Style::default().bg(BG_SEL).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(PALE).bg(BG_SEL_DIM)
+    }
+}
+
+/// Background fill that makes a popup read as a distinct window over the UI.
+const POPUP_BG: Color = Color::Rgb(30, 31, 48);
+
+/// A pane's title: a highlighted (inverted) tab when focused, plain dim when not.
+fn pane_title(title: &str, focused: bool) -> Span<'static> {
+    if focused {
+        Span::styled(
+            format!(" {title} "),
+            Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(format!(" {title} "), Style::default().fg(DIM).add_modifier(Modifier::BOLD))
+    }
+}
+
+/// A bordered pane: rounded border (accent when focused, dim when not) with a
+/// highlighted title tab. Returns the inner content Rect.
+fn pane(f: &mut Frame, area: Rect, title: &str, focused: bool) -> Rect {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(if focused { ACCENT } else { DIM }))
+        .title(pane_title(title, focused));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    inner
+}
+
+/// A bordered popup window: rounded border + filled background so it stands out,
+/// with a bold title. Returns the inner content Rect.
+fn popup(f: &mut Frame, area: Rect, title: &str, accent: Color) -> Rect {
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(accent))
+        .style(Style::default().bg(POPUP_BG))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    inner
+}
 
 pub fn draw(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
@@ -39,6 +96,8 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Confirm => draw_confirm(f, app),
         Mode::Errors => draw_errors(f, app),
         Mode::Artifacts => draw_artifacts(f, app),
+        Mode::Approval => draw_approval(f, app),
+        Mode::RefPicker => draw_ref_picker(f, app),
         _ => {}
     }
 }
@@ -46,10 +105,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 fn draw_artifacts(f: &mut Frame, app: &App) {
     let Some(av) = &app.artifacts else { return };
     let area = centered(60, 60, f.area());
-    f.render_widget(Clear, area);
-    let block = popup_block(&format!(" Artifacts · {} ", av.repo));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = popup(f, area, &format!("Artifacts · {}", av.repo), ACCENT);
 
     if !av.loaded {
         f.render_widget(
@@ -92,28 +148,150 @@ fn draw_artifacts(f: &mut Frame, app: &App) {
     f.render_stateful_widget(list, inner, &mut state);
 }
 
+fn draw_approval(f: &mut Frame, app: &App) {
+    let Some(av) = &app.approval else { return };
+    let area = centered(64, 60, f.area());
+    let inner = popup(f, area, &format!("Review deployment · {}", av.repo), Color::Yellow);
+
+    if !av.loaded {
+        f.render_widget(
+            Paragraph::new("Loading pending deployments…").style(Style::default().fg(DIM)),
+            inner,
+        );
+        return;
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1), Constraint::Length(1)])
+        .split(inner);
+
+    let items: Vec<ListItem> = av
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let approvable = p.current_user_can_approve;
+            let checked = av.selected.contains(&i);
+            let (mark, mark_c) = if !approvable {
+                ("[-]", DIM)
+            } else if checked {
+                ("[x]", Color::Green)
+            } else {
+                ("[ ]", DIM)
+            };
+            let mut spans = vec![
+                Span::styled(format!("{mark} "), Style::default().fg(mark_c)),
+                Span::raw(p.environment.name.clone()),
+            ];
+            if !approvable {
+                spans.push(Span::styled("  — no review access", Style::default().fg(Color::Red)));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let list = List::new(items)
+        .highlight_style(select_style(true))
+        .highlight_symbol("▌");
+    let mut state = av.state.clone();
+    f.render_stateful_widget(list, rows[0], &mut state);
+
+    // Comment line (editable with `c`).
+    let comment = if av.comment.is_empty() && !av.editing_comment {
+        Line::from(Span::styled(" comment: (press c to add)", Style::default().fg(DIM)))
+    } else {
+        let mut s = vec![
+            Span::styled(" comment: ", Style::default().fg(DIM)),
+            Span::raw(av.comment.clone()),
+        ];
+        if av.editing_comment {
+            s.push(Span::styled("▏", Style::default().fg(Color::Yellow)));
+        }
+        Line::from(s)
+    };
+    f.render_widget(Paragraph::new(comment), rows[1]);
+
+    let hint = if av.editing_comment {
+        " typing comment… · Enter/Esc done "
+    } else {
+        " Space toggle · ⏎/y approve · x reject · c comment · Esc cancel "
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(hint, Style::default().fg(DIM))).alignment(Alignment::Right),
+        rows[2],
+    );
+}
+
+fn draw_ref_picker(f: &mut Frame, app: &App) {
+    let Some(rp) = &app.ref_picker else { return };
+    let area = centered(50, 70, f.area());
+    let inner = popup(f, area, &format!("Pick ref · {}", rp.repo), ACCENT);
+
+    if !rp.loaded {
+        f.render_widget(
+            Paragraph::new("Loading branches & tags…").style(Style::default().fg(DIM)),
+            inner,
+        );
+        return;
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)])
+        .split(inner);
+
+    // Filter prompt.
+    let filt = Line::from(vec![
+        Span::styled(" /", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::raw(rp.filter.clone()),
+        Span::styled("▏", Style::default().fg(ACCENT)),
+        Span::styled(
+            format!("  {} match{}", rp.view.len(), if rp.view.len() == 1 { "" } else { "es" }),
+            Style::default().fg(DIM),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(filt), rows[0]);
+
+    let items: Vec<ListItem> = rp
+        .view
+        .iter()
+        .filter_map(|&i| rp.items.get(i))
+        .map(|r| {
+            let (tag, c) = match r.kind {
+                RefKind::Branch => ("br ", ACCENT),
+                RefKind::Tag => ("tag", Color::Magenta),
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{tag} "), Style::default().fg(c)),
+                Span::raw(r.name.clone()),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .highlight_style(select_style(true))
+        .highlight_symbol("▌");
+    let mut state = rp.state.clone();
+    f.render_stateful_widget(list, rows[1], &mut state);
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            " type to filter · ↑/↓ move · ⏎ select · Esc cancel ",
+            Style::default().fg(DIM),
+        ))
+        .alignment(Alignment::Right),
+        rows[2],
+    );
+}
+
 fn draw_errors(f: &mut Frame, app: &App) {
     let area = centered(70, 60, f.area());
-    f.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Red))
-        .title(Span::styled(
-            format!(" Load errors ({}) ", app.errors.len()),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = popup(f, area, &format!("Load errors ({})", app.errors.len()), Color::Red);
     let lines: Vec<Line> = app
         .errors
         .iter()
         .map(|e| Line::from(Span::raw(format!(" • {e}"))))
         .collect();
-    f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: true }),
-        inner.inner(Margin::new(0, 0)),
-    );
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
@@ -257,11 +435,7 @@ fn draw_body(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_table(f: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::Runs;
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(if focused { ACCENT } else { DIM }))
-        .title(Span::styled(" Runs ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+    let content = pane(f, area, "Runs", focused);
 
     if app.view.is_empty() {
         let msg = if app.loading {
@@ -273,9 +447,8 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
         };
         let p = Paragraph::new(msg)
             .style(Style::default().fg(DIM))
-            .alignment(Alignment::Center)
-            .block(block);
-        f.render_widget(p, area);
+            .alignment(Alignment::Center);
+        f.render_widget(p, content);
         return;
     }
 
@@ -286,6 +459,7 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
         Cell::from("Branch"),
         Cell::from("Event"),
         Cell::from("Actor"),
+        Cell::from("Dur"),
         Cell::from("Age"),
     ])
     .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
@@ -296,53 +470,47 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
         Row::new(vec![
             Cell::from(Span::styled(icon, Style::default().fg(color))),
             Cell::from(short_repo(&r.repository.full_name)),
-            Cell::from(truncate(r.workflow_name(), 22)),
-            Cell::from(truncate(r.head_branch.as_deref().unwrap_or("-"), 18)),
-            Cell::from(truncate(&r.event, 11)),
+            // Workflow name with a dim run number, so #NNN is scannable inline.
+            Cell::from(Line::from(vec![
+                Span::raw(truncate(r.workflow_name(), 15)),
+                Span::styled(format!("  #{}", r.run_number), Style::default().fg(DIM)),
+            ])),
+            Cell::from(truncate(r.head_branch.as_deref().unwrap_or("-"), 16)),
+            Cell::from(event_label(&r.event)),
             Cell::from(truncate(
                 r.actor.as_ref().map(|a| a.login.as_str()).unwrap_or("-"),
-                14,
+                12,
             )),
+            Cell::from(run_dur(r)).style(Style::default().fg(DIM)),
             Cell::from(fmt_age(r.updated_at)).style(Style::default().fg(DIM)),
         ])
     });
 
     let widths = [
         Constraint::Length(2),
-        Constraint::Min(16),
-        Constraint::Length(22),
-        Constraint::Length(18),
-        Constraint::Length(11),
-        Constraint::Length(14),
-        Constraint::Length(7),
+        Constraint::Min(14),
+        Constraint::Length(23),
+        Constraint::Length(16),
+        Constraint::Length(8),
+        Constraint::Length(12),
+        Constraint::Length(8),
+        Constraint::Length(6),
     ];
 
-    // Only the focused pane highlights its selection; the other shows none
-    // (dimming a single row reads as "disabled").
-    let hl = if focused {
-        Style::default().bg(BG_SEL).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    };
+    // Both panes show their selection; the unfocused one dims it (lazyactions).
+    let hl = select_style(focused);
     let table = Table::new(rows, widths)
         .header(header)
-        .block(block)
         .row_highlight_style(hl)
         .highlight_symbol(if focused { "▌" } else { " " });
 
     let mut state = app.table_state.clone();
-    f.render_stateful_widget(table, area, &mut state);
+    f.render_stateful_widget(table, content, &mut state);
 }
 
 fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::Jobs;
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(if focused { ACCENT } else { DIM }))
-        .title(Span::styled(" Detail ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = pane(f, area, "Detail", focused);
 
     let Some(run) = app.selected_run() else {
         f.render_widget(
@@ -358,12 +526,22 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
         .split(inner);
 
     let (icon, color) = state_glyph(run.state());
+    // Held-for-approval runs read as "queued"; call it out so `a` makes sense.
+    let (label, label_color) = if run.needs_approval() {
+        ("awaiting approval", Color::Yellow)
+    } else {
+        (state_label(run.state()), color)
+    };
+    let mut first = vec![
+        Span::styled(format!("{icon} "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(label, Style::default().fg(label_color).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  #{}", run.run_number), Style::default().fg(DIM)),
+    ];
+    if run.needs_approval() {
+        first.push(Span::styled("  · press a", Style::default().fg(DIM)));
+    }
     let mut info = vec![
-        Line::from(vec![
-            Span::styled(format!("{icon} "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
-            Span::styled(state_label(run.state()), Style::default().fg(color).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("  #{}", run.run_number), Style::default().fg(DIM)),
-        ]),
+        Line::from(first),
         kv("repo", &run.repository.full_name),
         kv("flow", run.workflow_name()),
         kv("title", run.title()),
@@ -380,11 +558,12 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_jobs(f: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::Jobs;
+    // Divider rule between the run info and the jobs list within the Detail pane.
     let title = if focused { " Jobs · ⏎ logs " } else { " Jobs " };
     let block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(if focused { ACCENT } else { DIM }))
-        .title(Span::styled(title, Style::default().fg(ACCENT)));
+        .title(pane_title(title.trim(), focused));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -409,13 +588,8 @@ fn draw_jobs(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let hl = if focused {
-        Style::default().bg(BG_SEL).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    };
     let list = List::new(items)
-        .highlight_style(hl)
+        .highlight_style(select_style(focused))
         .highlight_symbol(if focused { "▌" } else { " " });
     let mut state = app.jobs_state.clone();
     f.render_stateful_widget(list, inner, &mut state);
@@ -448,13 +622,19 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(Paragraph::new(Span::styled(hint, Style::default().fg(DIM))), area);
         return;
     }
-    let hint = match (app.mode == Mode::Logs, app.focus) {
-        (true, _) => " j/k move · ←/→ scroll · ⏎ fold · e/f all · / search · n/N · s save · Esc close",
+    let hint: String = match (app.mode == Mode::Logs, app.focus) {
+        (true, _) => " j/k move · ←/→ scroll · ⏎ fold · e/f all · / search · n/N · s save · Esc close".into(),
         (false, Focus::Runs) => {
-            " j/k move · ⏎/l jobs · / search · o open · d dispatch · c cancel · x/X rerun · a approve · A artifacts · ? help · q quit"
+            // Only advertise `a approve` when the selected run is actually held.
+            let approve = if app.selected_run().is_some_and(|r| r.needs_approval()) {
+                " · a approve"
+            } else {
+                ""
+            };
+            format!(" j/k move · ⏎/l jobs · / search · o open · d dispatch · c cancel · x/X rerun{approve} · A artifacts · ? help · q quit")
         }
         (false, Focus::Jobs) => {
-            " j/k job · ⏎/l logs · R rerun job · A artifacts · ←/Esc back · o open · ? help · q quit"
+            " j/k job · ⏎/l logs · R rerun job · A artifacts · ←/Esc back · o open · ? help · q quit".into()
         }
     };
     f.render_widget(
@@ -467,15 +647,12 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_help(f: &mut Frame) {
     let area = centered(60, 70, f.area());
-    f.render_widget(Clear, area);
-    let block = popup_block(" Help ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = popup(f, area, "Help", ACCENT);
     let body = Text::from(vec![
         hl("Panes  (two-pane: Runs ⟷ Jobs)"),
         help_row("Tab", "switch focus between Runs and Jobs"),
         help_row("→ / l", "focus Jobs (drill into selected run)"),
-        help_row("← / h / Esc", "focus Runs"),
+        help_row("← / h / Bksp / Esc", "focus Runs (Bksp/Esc go back anywhere)"),
         help_row("Enter", "Runs: drill to jobs · Jobs: view logs"),
         Line::raw(""),
         hl("Navigation  (acts on the focused pane)"),
@@ -490,15 +667,20 @@ fn draw_help(f: &mut Frame) {
         Line::raw(""),
         hl("Actions"),
         help_row("Enter / l / L", "view logs of selected job (L works anywhere)"),
-        help_row("o", "open run in browser"),
+        help_row("o", "open in browser (focused job's page, else the run)"),
         help_row("d", "dispatch a workflow (workflow_dispatch)"),
         help_row("c", "cancel the selected run"),
         help_row("x / X", "re-run failed jobs / re-run all"),
         help_row("R", "re-run the selected job"),
-        help_row("a", "approve a run awaiting approval"),
+        help_row("a", "approve a held run (fork-PR or environment deployment)"),
+        help_row("  ↳ env review", "Space pick env · c comment · ⏎ approve · x reject"),
+        help_row("  ↳ dispatch ref", "Space / → on the ref field to pick a branch or tag"),
         help_row("A", "browse / download run artifacts"),
         help_row("r / F5", "refresh now (auto-refresh is on)"),
         help_row("E", "show repos that failed to load"),
+        Line::raw(""),
+        hl("Notifications"),
+        help_row("(auto)", "bell + desktop toast when a watched run finishes"),
         Line::raw(""),
         hl("Logs view"),
         help_row("j / k", "move cursor"),
@@ -517,16 +699,8 @@ fn draw_help(f: &mut Frame) {
 
 fn draw_logs_pane(f: &mut Frame, app: &App, area: Rect) {
     let Some(lv) = &app.logs else { return };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(ACCENT))
-        .title(Span::styled(
-            format!(" Logs · {} ", truncate(&lv.title, area.width.saturating_sub(12) as usize)),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let title = format!("Logs · {}", truncate(&lv.title, area.width.saturating_sub(10) as usize));
+    let inner = pane(f, area, &title, true);
 
     // Reserve the last row for a status indicator.
     let body = Rect { height: inner.height.saturating_sub(1), ..inner };
@@ -631,16 +805,8 @@ fn draw_logs_pane(f: &mut Frame, app: &App, area: Rect) {
 fn draw_steps_pane(f: &mut Frame, app: &App, area: Rect) {
     let Some(sv) = &app.steps_view else { return };
     let steps = app.steps_view_steps();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(ACCENT))
-        .title(Span::styled(
-            format!(" Live steps · {} ", truncate(&sv.job_name, area.width.saturating_sub(16) as usize)),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let title = format!("Live steps · {}", truncate(&sv.job_name, area.width.saturating_sub(14) as usize));
+    let inner = pane(f, area, &title, true);
 
     let body = Rect { height: inner.height.saturating_sub(1), ..inner };
     if steps.is_empty() {
@@ -742,10 +908,7 @@ fn highlight_match(raw: &str, query: &str) -> Line<'static> {
 fn draw_dispatch(f: &mut Frame, app: &App) {
     let Some(d) = &app.dispatch else { return };
     let area = centered(70, 70, f.area());
-    f.render_widget(Clear, area);
-    let block = popup_block(&format!(" Dispatch · {} ", d.repo));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = popup(f, area, &format!("Dispatch · {}", d.repo), ACCENT);
 
     match d.stage {
         DispatchStage::SelectWorkflow => {
@@ -815,8 +978,16 @@ fn draw_dispatch_form(f: &mut Frame, d: &crate::app::DispatchState, area: Rect) 
     ];
 
     // Field 0: ref.
-    lines.push(Line::from(Span::styled("ref (branch / tag / sha)", Style::default().fg(DIM))));
-    lines.push(Line::from(Span::styled(format!(" {} ", d.git_ref), val_style(d.field_idx == 0))));
+    let ref_focused = d.field_idx == 0;
+    let mut ref_label = vec![Span::styled("ref (branch / tag / sha)", Style::default().fg(DIM))];
+    if ref_focused {
+        ref_label.push(Span::styled("  — Space/→ to pick", Style::default().fg(ACCENT)));
+    }
+    lines.push(Line::from(ref_label));
+    lines.push(Line::from(vec![
+        Span::styled(format!(" {} ", d.git_ref), val_style(ref_focused)),
+        Span::styled(" ▾", Style::default().fg(if ref_focused { ACCENT } else { DIM })),
+    ]));
     lines.push(Line::raw(""));
 
     if !d.dispatchable {
@@ -877,14 +1048,7 @@ fn draw_dispatch_form(f: &mut Frame, d: &crate::app::DispatchState, area: Rect) 
 fn draw_confirm(f: &mut Frame, app: &App) {
     let Some(a) = &app.pending_action else { return };
     let area = centered(50, 20, f.area());
-    f.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Yellow))
-        .title(Span::styled(" Confirm ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = popup(f, area, "Confirm", Color::Yellow);
     let body = Text::from(vec![
         Line::raw(""),
         Line::from(a.prompt()).alignment(Alignment::Center),
@@ -899,17 +1063,6 @@ fn draw_confirm(f: &mut Frame, app: &App) {
 }
 
 // -- helpers ----------------------------------------------------------------
-
-fn popup_block(title: &str) -> Block<'static> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(ACCENT))
-        .title(Span::styled(
-            title.to_string(),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ))
-}
 
 fn kv(k: &str, v: &str) -> Line<'static> {
     Line::from(vec![
@@ -1009,6 +1162,34 @@ fn fmt_bytes(n: u64) -> String {
         _ if n < GB => format!("{:.1} MB", n as f64 / MB as f64),
         _ => format!("{:.1} GB", n as f64 / GB as f64),
     }
+}
+
+/// Total wall-clock of a run: live-ticking while active, final once done.
+fn run_dur(r: &Run) -> String {
+    let start = r.run_started_at.unwrap_or(r.created_at);
+    match r.state() {
+        RunState::Running | RunState::Queued => {
+            format!("{}…", fmt_dur((Utc::now() - start).num_seconds().max(0)))
+        }
+        _ => fmt_dur((r.updated_at - start).num_seconds().max(0)),
+    }
+}
+
+/// Compact label for a run's trigger event (fits the narrow Event column).
+fn event_label(e: &str) -> String {
+    match e {
+        "push" => "push",
+        "pull_request" | "pull_request_target" => "PR",
+        "workflow_dispatch" => "manual",
+        "schedule" => "cron",
+        "release" => "release",
+        "workflow_run" => "wf-run",
+        "repository_dispatch" => "repo",
+        "merge_group" => "merge",
+        "deployment" | "deployment_status" => "deploy",
+        other => return truncate(other, 8),
+    }
+    .to_string()
 }
 
 pub fn fmt_age(ts: DateTime<Utc>) -> String {

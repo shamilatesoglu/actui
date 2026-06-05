@@ -23,6 +23,10 @@ pub struct Config {
     pub include: Vec<String>,
     /// Exclude repos whose full_name contains one of these substrings.
     pub exclude: Vec<String>,
+    /// Post an OS desktop notification when a watched run finishes.
+    pub notify: bool,
+    /// Ring the terminal bell when a watched run finishes.
+    pub bell: bool,
 }
 
 impl Default for Config {
@@ -36,6 +40,8 @@ impl Default for Config {
             skip_archived: true,
             include: Vec::new(),
             exclude: Vec::new(),
+            notify: true,
+            bell: true,
         }
     }
 }

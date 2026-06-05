@@ -1,7 +1,10 @@
 //! Application state, input handling, and the command/event protocol that
 //! connects the synchronous UI loop to the async GitHub workers.
 
-use crate::github::{Artifact, Job, RateLimit, Run, RunState, Step, WfInput, WfInputKind, Workflow};
+use crate::github::{
+    Artifact, Job, PendingDeployment, RateLimit, Run, RunState, Step, WfInput, WfInputKind,
+    Workflow,
+};
 use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::{ListState, TableState};
@@ -29,6 +32,10 @@ pub enum DataMsg {
     Workflows { repo: String, workflows: Vec<Workflow> },
     WorkflowInputs { repo: String, dispatchable: bool, inputs: Vec<WfInput> },
     Artifacts { run_id: u64, artifacts: Vec<Artifact> },
+    /// Environments gating a run's deployment, awaiting review.
+    PendingDeployments { run_id: u64, items: Vec<PendingDeployment> },
+    /// Branches and tags for a repo, for the dispatch ref picker.
+    Refs { repo: String, branches: Vec<String>, tags: Vec<String> },
     Action(String),
     Error(String),
     RefreshDone,
@@ -49,8 +56,19 @@ pub enum Command {
     RerunFailed { repo: String, run_id: u64 },
     RerunJob { repo: String, job_id: u64 },
     Approve { repo: String, run_id: u64 },
+    FetchPendingDeployments { repo: String, run_id: u64 },
+    ReviewDeployments {
+        repo: String,
+        run_id: u64,
+        env_ids: Vec<u64>,
+        approve: bool,
+        comment: String,
+    },
+    FetchRefs { repo: String },
     SaveLogs { name: String, content: String },
     OpenUrl(String),
+    /// A watched run finished — ring the bell / raise a desktop notification.
+    Notify { title: String, body: String, failed: bool },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -107,6 +125,8 @@ pub enum Mode {
     Confirm,
     Errors,
     Artifacts,
+    Approval,
+    RefPicker,
 }
 
 pub enum PendingAction {
@@ -136,6 +156,76 @@ pub struct ArtifactsView {
     pub items: Vec<Artifact>,
     pub state: ListState,
     pub loaded: bool,
+}
+
+/// Review picker for environment deployments gating a run (open with `a`).
+pub struct ApprovalView {
+    pub repo: String,
+    pub run_id: u64,
+    pub items: Vec<PendingDeployment>,
+    /// Indices (into `items`) the user has marked to act on.
+    pub selected: HashSet<usize>,
+    pub state: ListState,
+    pub loaded: bool,
+    /// Optional review comment, and whether we're currently editing it.
+    pub comment: String,
+    pub editing_comment: bool,
+}
+
+impl ApprovalView {
+    /// Whether the highlighted environment can be approved by this user.
+    fn can_approve(&self, idx: usize) -> bool {
+        self.items.get(idx).is_some_and(|p| p.current_user_can_approve)
+    }
+    /// Environment ids the user selected and is allowed to act on.
+    pub fn chosen_ids(&self) -> Vec<u64> {
+        self.selected
+            .iter()
+            .filter(|&&i| self.can_approve(i))
+            .filter_map(|&i| self.items.get(i).map(|p| p.environment.id))
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RefKind {
+    Branch,
+    Tag,
+}
+
+pub struct RefItem {
+    pub name: String,
+    pub kind: RefKind,
+}
+
+/// Branch/tag picker for the dispatch ref field (open with Space / → on it).
+pub struct RefPicker {
+    pub repo: String,
+    pub items: Vec<RefItem>,
+    /// Indices into `items` after the filter is applied.
+    pub view: Vec<usize>,
+    pub state: ListState,
+    pub filter: String,
+    pub loaded: bool,
+}
+
+impl RefPicker {
+    fn recompute(&mut self) {
+        let q = self.filter.to_lowercase();
+        self.view = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| q.is_empty() || fuzzy(&r.name, &q))
+            .map(|(i, _)| i)
+            .collect();
+        let sel = if self.view.is_empty() { None } else { Some(0) };
+        self.state.select(sel);
+    }
+    pub fn selected_ref(&self) -> Option<&RefItem> {
+        let i = self.state.selected()?;
+        self.items.get(*self.view.get(i)?)
+    }
 }
 
 pub enum DispatchStage {
@@ -518,11 +608,17 @@ pub struct App {
     /// Live step view for a still-running job (mutually exclusive with `logs`).
     pub steps_view: Option<StepsView>,
     pub artifacts: Option<ArtifactsView>,
+    pub approval: Option<ApprovalView>,
+    pub ref_picker: Option<RefPicker>,
     pub pending_action: Option<PendingAction>,
 
     /// Set by the refresh key; consumed by the main loop.
     pub force_refresh: bool,
     pub pending: Vec<Command>,
+
+    /// Last-seen state per run id, to detect active→terminal transitions and
+    /// fire a completion notification. Rebuilt each broad sweep.
+    run_states: HashMap<u64, RunState>,
 }
 
 impl App {
@@ -555,9 +651,12 @@ impl App {
             logs_cache: HashMap::new(),
             steps_view: None,
             artifacts: None,
+            approval: None,
+            ref_picker: None,
             pending_action: None,
             force_refresh: false,
             pending: Vec::new(),
+            run_states: HashMap::new(),
         }
     }
 
@@ -660,6 +759,52 @@ impl App {
                     }
                 }
             }
+            DataMsg::PendingDeployments { run_id, items } => {
+                let Some(av) = &mut self.approval else { return };
+                if av.run_id != run_id {
+                    return;
+                }
+                if items.is_empty() {
+                    // No environment gate — this is a fork-PR approval. Drop the
+                    // picker and fall back to a simple confirm.
+                    let (repo, run_id) = (av.repo.clone(), av.run_id);
+                    self.approval = None;
+                    let label = self
+                        .runs
+                        .iter()
+                        .find(|r| r.id == run_id)
+                        .map(|r| format!("{} #{}", r.workflow_name(), r.run_number))
+                        .unwrap_or_default();
+                    self.pending_action = Some(PendingAction::Approve { repo, run_id, label });
+                    self.mode = Mode::Confirm;
+                    return;
+                }
+                // Pre-select every environment the user is allowed to approve.
+                av.selected = items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| p.current_user_can_approve)
+                    .map(|(i, _)| i)
+                    .collect();
+                let first = items.iter().position(|p| p.current_user_can_approve).unwrap_or(0);
+                av.items = items;
+                av.loaded = true;
+                av.state.select(Some(first));
+            }
+            DataMsg::Refs { repo, branches, tags } => {
+                let Some(rp) = &mut self.ref_picker else { return };
+                if rp.repo != repo {
+                    return;
+                }
+                let mut items: Vec<RefItem> = branches
+                    .into_iter()
+                    .map(|name| RefItem { name, kind: RefKind::Branch })
+                    .collect();
+                items.extend(tags.into_iter().map(|name| RefItem { name, kind: RefKind::Tag }));
+                rp.items = items;
+                rp.loaded = true;
+                rp.recompute();
+            }
             DataMsg::Workflows { repo, workflows } => {
                 if let Some(d) = &mut self.dispatch {
                     if d.repo == repo {
@@ -693,7 +838,50 @@ impl App {
         // cache can't grow without bound over a long session.
         let live: HashSet<u64> = self.runs.iter().map(|r| r.id).collect();
         self.jobs_cache.retain(|id, _| live.contains(id));
+        self.detect_run_completions();
         self.recompute_view();
+    }
+
+    /// Compare each run's state to the previous sweep; for runs that went from
+    /// queued/running to a terminal state, queue a completion notification.
+    /// `run_states` is then rebuilt from the current runs (so it self-prunes).
+    fn detect_run_completions(&mut self) {
+        let mut finished: Vec<(String, RunState)> = Vec::new();
+        for r in &self.runs {
+            let now = r.state();
+            let was_active = matches!(
+                self.run_states.get(&r.id),
+                Some(RunState::Running | RunState::Queued)
+            );
+            let terminal = matches!(
+                now,
+                RunState::Success | RunState::Failure | RunState::Cancelled
+            );
+            if was_active && terminal {
+                let label = format!(
+                    "{} · {} #{}",
+                    r.repository.full_name,
+                    r.workflow_name(),
+                    r.run_number
+                );
+                finished.push((label, now));
+            }
+        }
+        self.run_states = self.runs.iter().map(|r| (r.id, r.state())).collect();
+
+        for (label, state) in finished {
+            let (word, failed) = match state {
+                RunState::Success => ("succeeded", false),
+                RunState::Failure => ("failed", true),
+                _ => ("cancelled", true),
+            };
+            self.pending.push(Command::Notify {
+                title: format!("actui — run {word}"),
+                body: label.clone(),
+                failed,
+            });
+            self.set_status(format!("{label} {word}"), failed);
+        }
     }
 
     fn resort(&mut self) {
@@ -810,6 +998,8 @@ impl App {
             Mode::Confirm => self.key_confirm(key),
             Mode::Errors => self.mode = Mode::Normal, // any key closes
             Mode::Artifacts => self.key_artifacts(key),
+            Mode::Approval => self.key_approval(key),
+            Mode::RefPicker => self.key_ref_picker(key),
         }
     }
 
@@ -828,7 +1018,9 @@ impl App {
             KeyCode::Tab => self.toggle_focus(),
             KeyCode::BackTab => self.toggle_focus(),
             KeyCode::Right => self.focus_jobs(),
-            KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => self.focus = Focus::Runs,
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace | KeyCode::Esc => {
+                self.focus = Focus::Runs
+            }
             // Filters.
             KeyCode::Char('1') => self.set_filter(Filter::All),
             KeyCode::Char('2') => self.set_filter(Filter::Running),
@@ -852,11 +1044,7 @@ impl App {
                 Focus::Runs => self.focus_jobs(),
                 Focus::Jobs => self.open_logs(),
             },
-            KeyCode::Char('o') => {
-                if let Some(run) = self.selected_run() {
-                    self.pending.push(Command::OpenUrl(run.html_url.clone()));
-                }
-            }
+            KeyCode::Char('o') => self.open_in_browser(),
             // Always-available: open the selected job's logs regardless of focus.
             KeyCode::Char('L') => self.open_logs(),
             KeyCode::Char('c') => self.confirm_cancel(),
@@ -943,7 +1131,7 @@ impl App {
         if self.steps_view.is_some() {
             let n = self.steps_view_steps().len();
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace | KeyCode::Left => {
                     self.steps_view = None;
                     self.mode = Mode::Normal;
                 }
@@ -1003,7 +1191,8 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
+            // Backspace closes too; Left stays bound to horizontal scroll.
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => {
                 self.logs = None;
                 self.mode = Mode::Normal;
             }
@@ -1054,7 +1243,7 @@ impl App {
             return;
         };
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace | KeyCode::Left => {
                 self.artifacts = None;
                 self.mode = Mode::Normal;
             }
@@ -1093,7 +1282,7 @@ impl App {
         };
         match d.stage {
             DispatchStage::SelectWorkflow => match key.code {
-                KeyCode::Esc => {
+                KeyCode::Esc | KeyCode::Backspace | KeyCode::Left => {
                     self.dispatch = None;
                     self.mode = Mode::Normal;
                 }
@@ -1128,6 +1317,13 @@ impl App {
         if key.code == KeyCode::Enter {
             self.submit_dispatch();
             return;
+        }
+        // On the ref field, Space or → opens the branch/tag picker.
+        if let Some(d) = &self.dispatch {
+            if d.field_idx == 0 && matches!(key.code, KeyCode::Char(' ') | KeyCode::Right) {
+                self.open_ref_picker();
+                return;
+            }
         }
         let left_ref;
         {
@@ -1229,7 +1425,7 @@ impl App {
                 }
                 self.mode = Mode::Normal;
             }
-            KeyCode::Char('n') | KeyCode::Esc => {
+            KeyCode::Char('n') | KeyCode::Esc | KeyCode::Backspace => {
                 self.pending_action = None;
                 self.mode = Mode::Normal;
             }
@@ -1307,6 +1503,28 @@ impl App {
                 repo: run.repository.full_name.clone(),
                 run_id: run.id,
             });
+        }
+    }
+
+    /// Open github.com for the current selection: the focused job's page when the
+    /// Jobs pane holds focus and a job is selected, otherwise the run's page.
+    fn open_in_browser(&mut self) {
+        let url = if self.focus == Focus::Jobs {
+            match (self.selected_run(), self.selected_job()) {
+                (Some(run), Some(job)) => Some(if job.html_url.is_empty() {
+                    format!("{}/job/{}", run.html_url, job.id)
+                } else {
+                    job.html_url.clone()
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        // Fall back to the run page (also when no job is selected).
+        let url = url.or_else(|| self.selected_run().map(|r| r.html_url.clone()));
+        if let Some(url) = url {
+            self.pending.push(Command::OpenUrl(url));
         }
     }
 
@@ -1406,15 +1624,196 @@ impl App {
         self.mode = Mode::Confirm;
     }
 
-    /// Approve a run that's waiting for approval.
+    /// Approve a run that's held for approval. Only runs actually awaiting
+    /// approval offer this. We fetch the run's pending deployments: if any
+    /// environment gates it, open the review picker; if not, it's a fork-PR
+    /// approval and we fall back to a simple confirm (handled when the empty
+    /// list arrives).
     fn confirm_approve(&mut self) {
         let Some(run) = self.selected_run() else { return };
-        self.pending_action = Some(PendingAction::Approve {
-            repo: run.repository.full_name.clone(),
-            run_id: run.id,
-            label: format!("{} #{}", run.workflow_name(), run.run_number),
+        if !run.needs_approval() {
+            self.set_status("Run is not awaiting approval", true);
+            return;
+        }
+        let (repo, run_id) = (run.repository.full_name.clone(), run.id);
+        self.approval = Some(ApprovalView {
+            repo: repo.clone(),
+            run_id,
+            items: Vec::new(),
+            selected: HashSet::new(),
+            state: ListState::default(),
+            loaded: false,
+            comment: String::new(),
+            editing_comment: false,
         });
-        self.mode = Mode::Confirm;
+        self.mode = Mode::Approval;
+        self.pending.push(Command::FetchPendingDeployments { repo, run_id });
+    }
+
+    fn key_approval(&mut self, key: KeyEvent) {
+        // Comment edit sub-mode: keystrokes edit the review comment.
+        if self.approval.as_ref().is_some_and(|a| a.editing_comment) {
+            let av = self.approval.as_mut().unwrap();
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => av.editing_comment = false,
+                KeyCode::Backspace => {
+                    av.comment.pop();
+                }
+                KeyCode::Char(c) => av.comment.push(c),
+                _ => {}
+            }
+            return;
+        }
+        let loaded = self.approval.as_ref().is_some_and(|a| a.loaded);
+        match key.code {
+            KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('q') => {
+                self.approval = None;
+                self.mode = Mode::Normal;
+            }
+            _ if !loaded => {}
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(av) = &mut self.approval {
+                    list_move(&mut av.state, av.items.len(), 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(av) = &mut self.approval {
+                    list_move(&mut av.state, av.items.len(), -1);
+                }
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                if let Some(av) = &mut self.approval {
+                    if !av.items.is_empty() {
+                        av.state.select(Some(0));
+                    }
+                }
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                if let Some(av) = &mut self.approval {
+                    if !av.items.is_empty() {
+                        av.state.select(Some(av.items.len() - 1));
+                    }
+                }
+            }
+            // Toggle the highlighted environment (only if the user can approve it).
+            KeyCode::Char(' ') => {
+                let mut denied = false;
+                if let Some(av) = &mut self.approval {
+                    if let Some(i) = av.state.selected() {
+                        if av.can_approve(i) {
+                            if !av.selected.remove(&i) {
+                                av.selected.insert(i);
+                            }
+                        } else {
+                            denied = true;
+                        }
+                    }
+                }
+                if denied {
+                    self.set_status("You can't review that environment", true);
+                }
+            }
+            KeyCode::Char('c') => {
+                if let Some(av) = &mut self.approval {
+                    av.editing_comment = true;
+                }
+            }
+            // Approve / reject the selected environments.
+            KeyCode::Enter | KeyCode::Char('y') => self.submit_review(true),
+            KeyCode::Char('x') | KeyCode::Char('r') | KeyCode::Char('R') => self.submit_review(false),
+            _ => {}
+        }
+    }
+
+    /// Submit the chosen environments for approval (or rejection).
+    fn submit_review(&mut self, approve: bool) {
+        let Some(av) = &self.approval else { return };
+        let env_ids = av.chosen_ids();
+        if env_ids.is_empty() {
+            self.set_status("Select at least one environment you can review", true);
+            return;
+        }
+        let (repo, run_id, comment) = (av.repo.clone(), av.run_id, av.comment.clone());
+        self.pending.push(Command::ReviewDeployments { repo, run_id, env_ids, approve, comment });
+        self.approval = None;
+        self.mode = Mode::Normal;
+        self.set_status(
+            if approve { "Approving deployment…" } else { "Rejecting deployment…" },
+            false,
+        );
+    }
+
+    /// Open the branch/tag picker for the dispatch ref field.
+    fn open_ref_picker(&mut self) {
+        let Some(d) = &self.dispatch else { return };
+        let repo = d.repo.clone();
+        self.ref_picker = Some(RefPicker {
+            repo: repo.clone(),
+            items: Vec::new(),
+            view: Vec::new(),
+            state: ListState::default(),
+            filter: String::new(),
+            loaded: false,
+        });
+        self.mode = Mode::RefPicker;
+        self.pending.push(Command::FetchRefs { repo });
+    }
+
+    fn key_ref_picker(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.ref_picker = None;
+                self.mode = Mode::Dispatch;
+            }
+            KeyCode::Down => {
+                if let Some(rp) = &mut self.ref_picker {
+                    list_move(&mut rp.state, rp.view.len(), 1);
+                }
+            }
+            KeyCode::Up => {
+                if let Some(rp) = &mut self.ref_picker {
+                    list_move(&mut rp.state, rp.view.len(), -1);
+                }
+            }
+            KeyCode::Enter => {
+                let picked = self
+                    .ref_picker
+                    .as_ref()
+                    .and_then(|rp| rp.selected_ref().map(|r| r.name.clone()));
+                self.ref_picker = None;
+                self.mode = Mode::Dispatch;
+                if let Some(name) = picked {
+                    // Setting a new ref means the workflow's inputs may differ.
+                    let changed = match &mut self.dispatch {
+                        Some(d) => {
+                            d.git_ref = name;
+                            d.git_ref != d.fetched_ref
+                        }
+                        None => false,
+                    };
+                    if changed {
+                        self.refetch_dispatch_inputs();
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                let empty = self.ref_picker.as_ref().map(|rp| rp.filter.is_empty()).unwrap_or(true);
+                if empty {
+                    self.ref_picker = None;
+                    self.mode = Mode::Dispatch;
+                } else if let Some(rp) = &mut self.ref_picker {
+                    rp.filter.pop();
+                    rp.recompute();
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(rp) = &mut self.ref_picker {
+                    rp.filter.push(c);
+                    rp.recompute();
+                }
+            }
+            _ => {}
+        }
     }
 
     fn open_artifacts(&mut self) {
@@ -1614,6 +2013,112 @@ mod tests {
         lv.update_search();
         assert!(lv.matches.is_empty());
         assert!(lv.match_idx.is_none());
+    }
+
+    fn run_with(id: u64, status: &str, conclusion: Option<&str>) -> Run {
+        Run {
+            id,
+            name: Some("CI".into()),
+            display_title: "fix".into(),
+            head_branch: Some("main".into()),
+            run_number: 7,
+            event: "push".into(),
+            status: status.into(),
+            conclusion: conclusion.map(|c| c.into()),
+            html_url: "http://x".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            run_started_at: None,
+            actor: None,
+            repository: crate::github::RunRepo { full_name: "org/api".into() },
+        }
+    }
+
+    #[test]
+    fn notifies_only_on_active_to_terminal_transition() {
+        let mut app = App::new();
+        // First sweep: run is in progress — establishes the baseline, no notify.
+        app.runs = vec![run_with(1, "in_progress", None)];
+        app.detect_run_completions();
+        assert!(app.pending.is_empty(), "no notification on first sighting");
+
+        // Second sweep: same run now succeeded → one completion notification.
+        app.runs = vec![run_with(1, "completed", Some("success"))];
+        app.detect_run_completions();
+        assert!(
+            app.pending
+                .iter()
+                .any(|c| matches!(c, Command::Notify { failed: false, .. })),
+            "expected a success notification"
+        );
+
+        // Third sweep: unchanged terminal state → no repeat notification.
+        app.pending.clear();
+        app.detect_run_completions();
+        assert!(app.pending.is_empty(), "terminal state shouldn't re-notify");
+    }
+
+    #[test]
+    fn ref_picker_filters_and_selects() {
+        let mut rp = RefPicker {
+            repo: "o/r".into(),
+            items: vec![
+                RefItem { name: "main".into(), kind: RefKind::Branch },
+                RefItem { name: "release/1.0".into(), kind: RefKind::Branch },
+                RefItem { name: "v1.0.0".into(), kind: RefKind::Tag },
+            ],
+            view: Vec::new(),
+            state: ListState::default(),
+            filter: String::new(),
+            loaded: true,
+        };
+        rp.recompute();
+        assert_eq!(rp.view.len(), 3);
+        assert_eq!(rp.selected_ref().unwrap().name, "main");
+        rp.filter = "rel".into();
+        rp.recompute();
+        assert_eq!(rp.view.len(), 1);
+        assert_eq!(rp.selected_ref().unwrap().name, "release/1.0");
+    }
+
+    #[test]
+    fn approval_chosen_ids_skip_unapprovable() {
+        let env = |id, name: &str, can| PendingDeployment {
+            environment: crate::github::EnvRef { id, name: name.into() },
+            current_user_can_approve: can,
+        };
+        let mut av = ApprovalView {
+            repo: "o/r".into(),
+            run_id: 1,
+            items: vec![env(10, "staging", true), env(20, "prod", false)],
+            selected: HashSet::new(),
+            state: ListState::default(),
+            loaded: true,
+            comment: String::new(),
+            editing_comment: false,
+        };
+        av.selected.insert(0);
+        av.selected.insert(1); // prod, but user can't approve it
+        assert_eq!(av.chosen_ids(), vec![10]);
+    }
+
+    #[test]
+    fn needs_approval_only_for_held_runs() {
+        assert!(run_with(1, "waiting", None).needs_approval()); // env deployment gate
+        assert!(run_with(1, "action_required", None).needs_approval()); // fork PR
+        assert!(run_with(1, "completed", Some("action_required")).needs_approval());
+        assert!(!run_with(1, "queued", None).needs_approval());
+        assert!(!run_with(1, "in_progress", None).needs_approval());
+        assert!(!run_with(1, "completed", Some("success")).needs_approval());
+    }
+
+    #[test]
+    fn no_notification_for_run_already_finished_when_first_seen() {
+        let mut app = App::new();
+        // A run we never watched as active appears already-successful: stay quiet.
+        app.runs = vec![run_with(2, "completed", Some("success"))];
+        app.detect_run_completions();
+        assert!(app.pending.is_empty());
     }
 
     #[test]

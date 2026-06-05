@@ -459,6 +459,90 @@ impl Github {
         check(resp).await
     }
 
+    /// Environments whose deployment is gated, awaiting a required reviewer.
+    pub async fn pending_deployments(
+        &self,
+        full_name: &str,
+        run_id: u64,
+    ) -> Result<Vec<PendingDeployment>> {
+        let resp: Vec<PendingDeployment> = self
+            .send(self.client.get(format!(
+                "{API}/repos/{full_name}/actions/runs/{run_id}/pending_deployments"
+            )))
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(resp)
+    }
+
+    /// Approve (or reject) the gated deployments for the given environment ids.
+    pub async fn review_deployments(
+        &self,
+        full_name: &str,
+        run_id: u64,
+        env_ids: &[u64],
+        state: &str,
+        comment: &str,
+    ) -> Result<()> {
+        #[derive(serde::Serialize)]
+        struct Body<'a> {
+            environment_ids: &'a [u64],
+            state: &'a str,
+            comment: &'a str,
+        }
+        let resp = self
+            .send(
+                self.client
+                    .post(format!(
+                        "{API}/repos/{full_name}/actions/runs/{run_id}/pending_deployments"
+                    ))
+                    .json(&Body { environment_ids: env_ids, state, comment }),
+            )
+            .await?;
+        check(resp).await
+    }
+
+    /// All branch names for a repo (paginated).
+    pub async fn list_branches(&self, full_name: &str) -> Result<Vec<String>> {
+        self.list_named(&format!("repos/{full_name}/branches")).await
+    }
+
+    /// All tag names for a repo (paginated).
+    pub async fn list_tags(&self, full_name: &str) -> Result<Vec<String>> {
+        self.list_named(&format!("repos/{full_name}/tags")).await
+    }
+
+    /// Fetch every page of a `{ name }`-shaped list endpoint (branches/tags),
+    /// up to a sane cap so a huge repo can't spin forever.
+    async fn list_named(&self, sub: &str) -> Result<Vec<String>> {
+        #[derive(Deserialize)]
+        struct Named {
+            name: String,
+        }
+        let mut out = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let batch: Vec<Named> = self
+                .send(
+                    self.client
+                        .get(format!("{API}/{sub}"))
+                        .query(&[("per_page", "100".to_string()), ("page", page.to_string())]),
+                )
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let n = batch.len();
+            out.extend(batch.into_iter().map(|b| b.name));
+            if n < 100 || page >= 10 {
+                break;
+            }
+            page += 1;
+        }
+        Ok(out)
+    }
+
     /// Artifacts produced by a run.
     pub async fn list_artifacts(&self, full_name: &str, run_id: u64) -> Result<Vec<Artifact>> {
         #[derive(Deserialize)]
@@ -691,6 +775,9 @@ pub struct Job {
     pub id: u64,
     pub name: String,
     pub status: String,
+    /// Job page on github.com (may be empty on older API responses).
+    #[serde(default)]
+    pub html_url: String,
     #[serde(default)]
     pub conclusion: Option<String>,
     #[serde(default)]
@@ -734,6 +821,23 @@ pub struct RateLimit {
     pub remaining: u32,
 }
 
+/// One environment awaiting a deployment review for a run.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PendingDeployment {
+    pub environment: EnvRef,
+    /// Whether the authenticated user is allowed to approve this one.
+    #[serde(default)]
+    pub current_user_can_approve: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EnvRef {
+    #[serde(default)]
+    pub id: u64,
+    #[serde(default)]
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Artifact {
     pub id: u64,
@@ -771,6 +875,14 @@ impl Run {
             },
             _ => RunState::Other,
         }
+    }
+
+    /// True when the run is held awaiting approval — either a fork-PR approval
+    /// (`action_required`) or an environment deployment review (`waiting`).
+    pub fn needs_approval(&self) -> bool {
+        matches!(self.status.as_str(), "waiting" | "action_required")
+            || (self.status == "completed"
+                && self.conclusion.as_deref() == Some("action_required"))
     }
 
     pub fn title(&self) -> &str {

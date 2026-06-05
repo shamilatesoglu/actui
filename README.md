@@ -3,24 +3,25 @@
 A fast, beautiful terminal UI for viewing and managing **GitHub Actions** across all the repos and orgs your account can see — without leaving the keyboard or opening a browser tab.
 
 ```
-╭ actui @you  ▶ 3  ◌ 1  ✘ 2  ✔ 44   48 runs ──────────────── api 4982/5000 · updated 12s ╮
+╭ actui @you  ● 3  ○ 1  ● 2  ● 44   48 runs ──────────────── api 4982/5000 · updated 12s ╮
+ Runs › Jobs › Logs
  All  Running  Queued  Failed  Success
-╭ Runs ───────────────────────────────────╮╭ Detail ───────────────────╮
-▌✔ org/api          CI            main  …  ││ ✔ success  #296            │
- ▶ org/web          Deploy        main  …  ││     repo  org/api          │
- ✘ you/dotfiles     lint          main  …  ││     flow  CI               │
- ◌ org/mobile       Release       v1.2  …  ││   branch  main             │
-                                            ││ ── Jobs ──────────────────│
-                                            ││ ▌✔ build        1m12s      │
-                                            ││  ✔ test         48s        │
-╰────────────────────────────────────────╯╰───────────────────────────╯
+╭ Runs ────────────────────────────────────╮╭ Detail ───────────────────╮
+▌● org/api      CI #296   main push 1m12s   ││ ● success  #296            │
+ ● org/web      Deploy#88 main push  42s…   ││     repo  org/api          │
+ ● you/dotfiles lint #5   main PR    18s    ││     flow  CI               │
+ ◌ org/mobile   Release#3 v1.2 manual 3s    ││── Jobs ────────────────────│
+                                             ││▌● build        1m12s       │
+                                             ││ ● test         48s         │
+╰─────────────────────────────────────────╯╰────────────────────────────╯
  j/k move · Tab focus · / search · ⏎/o open · l logs · d dispatch · c cancel · x/X rerun · A artifacts · r refresh · ? help · q quit
 ```
 
 ## Features
 
-- **Aggregated view** of recent workflow runs across the repos you own and your org repos, sorted by latest activity.
-- **Live status** with color-coded states: running, queued, failed, success, cancelled, skipped.
+- **Aggregated view** of recent workflow runs across the repos you own and your org repos, sorted by latest activity. Each row shows the repo, workflow + run number, branch, trigger event, who triggered it, run **duration** (live-ticking while active), and age.
+- **Live status** with color-coded states: running, queued, failed, success, cancelled, skipped. lazyactions-style panes: the focused pane gets an accent border and a highlighted (inverted) title tab; the unfocused pane dims its border and keeps a dimmed selection so you never lose your place. Popups float on a filled background.
+- **Completion notifications** — a terminal bell plus a desktop toast the moment a watched run flips to success/failure/cancelled, so you can leave it running in the background. Configurable (`notify` / `bell`).
 - **Two-pane navigation** (Runs ⟷ Jobs) with a `Runs › Jobs › Logs` breadcrumb; `Tab` moves focus, `j`/`k` move within the focused pane.
 - **Filter** by status (`1`–`5`) and **fuzzy search** (`/`) across repo, workflow, and branch.
 - **Job detail pane** that auto-loads the selected run's jobs with per-job durations.
@@ -30,10 +31,12 @@ A fast, beautiful terminal UI for viewing and managing **GitHub Actions** across
   - **foldable step tree** (`Enter`) — each `##[group]` step folds into a tree node showing its **line count and elapsed time**; error/warning steps auto-expand
   - **in-log search** (`/`, then `n`/`N`) that reveals folded matches
 - **Manage runs** without the browser:
-  - `d` — trigger a `workflow_dispatch`: pick the workflow, then fill a **typed form** built from the workflow's declared inputs (text fields, boolean toggles, choice pickers — defaults pre-filled, required fields marked)
+  - `d` — trigger a `workflow_dispatch`: pick the workflow, then fill a **typed form** built from the workflow's declared inputs (text fields, boolean toggles, choice pickers — defaults pre-filled, required fields marked). On the **ref** field, press `Space`/`→` to open a **branch & tag picker** (fuzzy-filterable) instead of typing the ref by hand.
   - `c` — cancel a running run
   - `x` / `X` — re-run failed jobs / re-run all jobs; `R` — re-run just the selected job
-  - `a` — approve a run that's waiting for approval
+  - `a` — approve a run that's held for approval. actui detects which kind it is and only offers the key when the run is actually awaiting approval:
+    - **fork pull-request** awaiting maintainer approval → a confirm, then approve.
+    - **environment deployment** gated by required reviewers → a **review picker**: select which environments to act on (`Space`), add an optional comment (`c`), then **approve** (`⏎`) or **reject** (`x`). Environments you aren't a reviewer for are shown but locked.
   - `A` — browse a run's **artifacts** and download one as a `.zip`
   - `o` — open the run on github.com
 - **Resilient API client** — every request (polls *and* mutations) shares one rate-limit budget and back-off window, honors `Retry-After`/`X-RateLimit-Reset`, and **re-resolves an expired token** automatically mid-session. Repo pagination is fault-tolerant: a failing later page keeps the repos already fetched instead of dropping everything.
@@ -74,6 +77,8 @@ runs_per_repo       = 15  # recent runs pulled per repo
 concurrency         = 8   # repos fetched in parallel
 max_repos           = 60  # cap, from most-recently-pushed repos (0 = no cap)
 skip_archived       = true
+notify              = true  # desktop notification when a watched run finishes
+bell                = true  # ring the terminal bell when a watched run finishes
 
 # Only watch repos whose full name contains one of these (empty = all):
 include = []            # e.g. ["my-org/", "you/important-repo"]
@@ -93,16 +98,16 @@ exclude = []            # e.g. ["fork-of-"]
 | `g` / `G` | top / bottom |
 | `Tab` | switch focus between Runs and Jobs |
 | `Enter` / `l` / `→` | drill Runs → Jobs, or open a job's logs |
-| `h` / `←` / `Esc` | back to Runs |
+| `h` / `←` / `Backspace` / `Esc` | back to Runs (`Backspace`/`Esc` also close any popup or the logs viewer) |
 | `1`–`5`, `[` / `]` | status filter |
 | `/` | fuzzy search runs (repo, workflow, branch) |
-| `o` | open run in browser |
+| `o` | open in browser — the selected job's page when Jobs is focused, otherwise the run |
 | `L` | open the selected job's logs (works anywhere) |
 | `d` | dispatch a workflow |
 | `c` | cancel run |
 | `x` / `X` | re-run failed / all jobs |
 | `R` | re-run the selected job |
-| `a` | approve a run awaiting approval |
+| `a` | approve a held run (fork-PR approval or environment deployment review) — only when awaiting approval |
 | `A` | browse / download run artifacts |
 | `r` / `F5` | refresh now |
 | `E` | show repos that failed to load |
@@ -118,7 +123,7 @@ exclude = []            # e.g. ["fork-of-"]
 | `e` / `f` | expand all / fold all |
 | `/`, `n` / `N` | search, next / prev match |
 | `s` | save the log to a file |
-| `Esc` / `q` | close logs |
+| `Esc` / `q` / `Backspace` | close logs |
 
 Auto-refresh is always on; `r` / `F5` force an immediate sweep.
 

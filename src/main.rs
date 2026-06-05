@@ -263,6 +263,50 @@ fn dispatch_commands(app: &mut App, gh: &Github, cfg: &Config, tx: &UnboundedSen
                     }
                 });
             }
+            Command::FetchPendingDeployments { repo, run_id } => {
+                let (gh, tx) = (gh.clone(), tx.clone());
+                tokio::spawn(async move {
+                    match gh.pending_deployments(&repo, run_id).await {
+                        Ok(items) => { let _ = tx.send(DataMsg::PendingDeployments { run_id, items }); }
+                        Err(e) => {
+                            // Report, and send an empty set so the UI falls back to
+                            // the fork-PR approval path rather than hanging.
+                            let _ = tx.send(DataMsg::Error(format!("pending deployments: {e}")));
+                            let _ = tx.send(DataMsg::PendingDeployments { run_id, items: vec![] });
+                        }
+                    }
+                });
+            }
+            Command::ReviewDeployments { repo, run_id, env_ids, approve, comment } => {
+                let (gh, tx) = (gh.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let state = if approve { "approved" } else { "rejected" };
+                    match gh.review_deployments(&repo, run_id, &env_ids, state, &comment).await {
+                        Ok(()) => {
+                            let word = if approve { "approved" } else { "rejected" };
+                            let _ = tx.send(DataMsg::Action(format!("Deployment {word}")));
+                        }
+                        Err(e) => { let _ = tx.send(DataMsg::Error(format!("review: {e}"))); }
+                    }
+                });
+            }
+            Command::FetchRefs { repo } => {
+                let (gh, tx) = (gh.clone(), tx.clone());
+                tokio::spawn(async move {
+                    // Branches and tags in parallel; either failing yields an empty
+                    // list so the picker still opens with whatever resolved.
+                    let (branches, tags) =
+                        tokio::join!(gh.list_branches(&repo), gh.list_tags(&repo));
+                    if let Err(e) = &branches {
+                        let _ = tx.send(DataMsg::Error(format!("branches: {e}")));
+                    }
+                    let _ = tx.send(DataMsg::Refs {
+                        repo,
+                        branches: branches.unwrap_or_default(),
+                        tags: tags.unwrap_or_default(),
+                    });
+                });
+            }
             Command::FetchArtifacts { repo, run_id } => {
                 let (gh, tx) = (gh.clone(), tx.clone());
                 tokio::spawn(async move {
@@ -296,6 +340,31 @@ fn dispatch_commands(app: &mut App, gh: &Github, cfg: &Config, tx: &UnboundedSen
             }
             Command::OpenUrl(url) => {
                 let _ = open::that_detached(&url);
+            }
+            Command::Notify { title, body, failed } => {
+                if cfg.bell {
+                    use std::io::Write;
+                    let mut out = std::io::stdout();
+                    let _ = out.write_all(b"\x07");
+                    let _ = out.flush();
+                }
+                if cfg.notify {
+                    // Showing a toast can briefly block; keep it off the UI thread.
+                    tokio::task::spawn_blocking(move || {
+                        use notify_rust::Notification;
+                        let mut n = Notification::new();
+                        n.summary(&title).body(&body).appname("actui");
+                        #[cfg(target_os = "linux")]
+                        n.urgency(if failed {
+                            notify_rust::Urgency::Critical
+                        } else {
+                            notify_rust::Urgency::Normal
+                        });
+                        #[cfg(not(target_os = "linux"))]
+                        let _ = failed;
+                        let _ = n.show();
+                    });
+                }
             }
         }
     }
