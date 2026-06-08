@@ -480,6 +480,22 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_body(f: &mut Frame, app: &App, area: Rect) {
+    // Live steps open as a third pane so the run detail + jobs list stay
+    // visible — you keep your place in the jobs list while watching steps.
+    if app.mode == Mode::Logs && app.steps_view.is_some() {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(36),
+                Constraint::Percentage(28),
+                Constraint::Percentage(36),
+            ])
+            .split(area);
+        draw_table(f, app, cols[0]);
+        draw_detail(f, app, cols[1]);
+        draw_steps_pane(f, app, cols[2]);
+        return;
+    }
     // Give the detail pane more room while it's showing logs.
     let detail = if app.mode == Mode::Logs { 55 } else { 36 };
     let cols = Layout::default()
@@ -487,9 +503,7 @@ fn draw_body(f: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Percentage(100 - detail), Constraint::Percentage(detail)])
         .split(area);
     draw_table(f, app, cols[0]);
-    if app.mode == Mode::Logs && app.steps_view.is_some() {
-        draw_steps_pane(f, app, cols[1]);
-    } else if app.mode == Mode::Logs && app.logs.is_some() {
+    if app.mode == Mode::Logs && app.logs.is_some() {
         draw_logs_pane(f, app, cols[1]);
     } else {
         draw_detail(f, app, cols[1]);
