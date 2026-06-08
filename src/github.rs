@@ -166,12 +166,8 @@ impl Github {
         struct U {
             login: String,
         }
-        let u: U = self
-            .send(self.client.get(format!("{API}/user")))
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let resp = self.send(self.client.get(format!("{API}/user"))).await?;
+        let u: U = ensure_ok(resp).await?.json().await?;
         Ok(u.login)
     }
 
@@ -206,18 +202,8 @@ impl Github {
     /// (relative secs) or `X-RateLimit-Reset` (epoch), defaulting to 60s.
     fn note_rate_limited(&self, headers: &reqwest::header::HeaderMap) {
         let hv = |k: &str| headers.get(k).and_then(|v| v.to_str().ok());
-        let secs = hv("retry-after")
-            .and_then(|s| s.parse::<u64>().ok())
-            .or_else(|| {
-                hv("x-ratelimit-reset")
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .map(|reset| {
-                        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                        reset.saturating_sub(now)
-                    })
-            })
-            .unwrap_or(60)
-            .clamp(1, 3600);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let secs = backoff_secs(hv("retry-after"), hv("x-ratelimit-reset"), now);
         let until = Instant::now() + Duration::from_secs(secs);
         let mut st = self.rate_state.lock().unwrap();
         st.pause_until = Some(match st.pause_until {
@@ -248,7 +234,7 @@ impl Github {
         if resp.status() == StatusCode::NOT_MODIFIED {
             return Ok(Cond::NotModified);
         }
-        let resp = resp.error_for_status()?;
+        let resp = ensure_ok(resp).await?;
         if let Some(tag) = resp.headers().get(ETAG).and_then(|v| v.to_str().ok()) {
             let mut etags = self.etags.lock().unwrap();
             // Bound the cache: per-run job ETags accumulate over a long session.
@@ -344,16 +330,14 @@ impl Github {
         struct Resp {
             workflows: Vec<Workflow>,
         }
-        let resp: Resp = self
+        let resp = self
             .send(
                 self.client
                     .get(format!("{API}/repos/{full_name}/actions/workflows"))
                     .query(&[("per_page", "100")]),
             )
-            .await?
-            .error_for_status()?
-            .json()
             .await?;
+        let resp: Resp = ensure_ok(resp).await?.json().await?;
         Ok(resp.workflows)
     }
 
@@ -398,16 +382,14 @@ impl Github {
             content: String,
             encoding: String,
         }
-        let c: Contents = self
+        let resp = self
             .send(
                 self.client
                     .get(format!("{API}/repos/{full_name}/contents/{path}"))
                     .query(&[("ref", git_ref)]),
             )
-            .await?
-            .error_for_status()?
-            .json()
             .await?;
+        let c: Contents = ensure_ok(resp).await?.json().await?;
         if c.encoding != "base64" {
             return Err(anyhow!("unexpected content encoding: {}", c.encoding));
         }
@@ -465,15 +447,13 @@ impl Github {
         full_name: &str,
         run_id: u64,
     ) -> Result<Vec<PendingDeployment>> {
-        let resp: Vec<PendingDeployment> = self
+        let resp = self
             .send(self.client.get(format!(
                 "{API}/repos/{full_name}/actions/runs/{run_id}/pending_deployments"
             )))
-            .await?
-            .error_for_status()?
-            .json()
             .await?;
-        Ok(resp)
+        let items: Vec<PendingDeployment> = ensure_ok(resp).await?.json().await?;
+        Ok(items)
     }
 
     /// Approve (or reject) the gated deployments for the given environment ids.
@@ -523,16 +503,14 @@ impl Github {
         let mut out = Vec::new();
         let mut page = 1u32;
         loop {
-            let batch: Vec<Named> = self
+            let resp = self
                 .send(
                     self.client
                         .get(format!("{API}/{sub}"))
                         .query(&[("per_page", "100".to_string()), ("page", page.to_string())]),
                 )
-                .await?
-                .error_for_status()?
-                .json()
                 .await?;
+            let batch: Vec<Named> = ensure_ok(resp).await?.json().await?;
             let n = batch.len();
             out.extend(batch.into_iter().map(|b| b.name));
             if n < 100 || page >= 10 {
@@ -549,16 +527,14 @@ impl Github {
         struct Resp {
             artifacts: Vec<Artifact>,
         }
-        let resp: Resp = self
+        let resp = self
             .send(
                 self.client
                     .get(format!("{API}/repos/{full_name}/actions/runs/{run_id}/artifacts"))
                     .query(&[("per_page", "100")]),
             )
-            .await?
-            .error_for_status()?
-            .json()
             .await?;
+        let resp: Resp = ensure_ok(resp).await?.json().await?;
         Ok(resp.artifacts)
     }
 
@@ -569,18 +545,16 @@ impl Github {
                 self.client
                     .get(format!("{API}/repos/{full_name}/actions/artifacts/{artifact_id}/zip")),
             )
-            .await?
-            .error_for_status()?;
-        Ok(resp.bytes().await?.to_vec())
+            .await?;
+        Ok(ensure_ok(resp).await?.bytes().await?.to_vec())
     }
 
     /// Plain-text logs for a single job (follows the redirect to the log blob).
     pub async fn job_logs(&self, full_name: &str, job_id: u64) -> Result<String> {
         let resp = self
             .send(self.client.get(format!("{API}/repos/{full_name}/actions/jobs/{job_id}/logs")))
-            .await?
-            .error_for_status()?;
-        Ok(resp.text().await?)
+            .await?;
+        Ok(ensure_ok(resp).await?.text().await?)
     }
 
     /// One-shot snapshot used at startup (the `/rate_limit` endpoint itself does
@@ -594,24 +568,44 @@ impl Github {
         struct Res {
             core: RateLimit,
         }
-        let resp: Resp = self
-            .send(self.client.get(format!("{API}/rate_limit")))
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let resp = self.send(self.client.get(format!("{API}/rate_limit"))).await?;
+        let resp: Resp = ensure_ok(resp).await?.json().await?;
         self.rate_state.lock().unwrap().rate = Some(resp.resources.core.clone());
         Ok(resp.resources.core)
     }
 }
 
-async fn check(resp: reqwest::Response) -> Result<()> {
+/// Ensure a response is a success, otherwise surface GitHub's own error
+/// `message` field (like `check`) instead of reqwest's generic status error,
+/// which discards the body. Returns the response on success for chaining.
+async fn ensure_ok(resp: Response) -> Result<Response> {
     let status = resp.status();
     if status.is_success() {
-        return Ok(());
+        return Ok(resp);
     }
     let body = resp.text().await.unwrap_or_default();
     Err(anyhow!("GitHub API {status}: {}", first_line(&body)))
+}
+
+/// Like `ensure_ok` but for mutating endpoints that return no body of interest.
+async fn check(resp: Response) -> Result<()> {
+    ensure_ok(resp).await.map(|_| ())
+}
+
+/// Seconds to back off after a rate-limit response: prefer `Retry-After`
+/// (relative seconds), else `X-RateLimit-Reset` (epoch) minus now, defaulting
+/// to 60s. Clamped to 1..=3600 so a bad/absent header can neither hammer the
+/// API nor stall the poller for hours.
+fn backoff_secs(retry_after: Option<&str>, reset_epoch: Option<&str>, now_epoch: u64) -> u64 {
+    retry_after
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| {
+            reset_epoch
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(|reset| reset.saturating_sub(now_epoch))
+        })
+        .unwrap_or(60)
+        .clamp(1, 3600)
 }
 
 fn first_line(s: &str) -> String {
@@ -953,5 +947,25 @@ jobs: {}
             parse_dispatch("on:\n  push:\n    branches: [main]\njobs: {}\n"),
             WfDispatch::NotDispatchable
         ));
+    }
+
+    #[test]
+    fn backoff_prefers_retry_after_then_reset_then_default() {
+        // Retry-After wins even when a reset epoch is also present.
+        assert_eq!(backoff_secs(Some("30"), Some("9999999999"), 1000), 30);
+        // No Retry-After: fall back to reset-epoch minus now.
+        assert_eq!(backoff_secs(None, Some("1120"), 1000), 120);
+        // Neither header present: the 60s default.
+        assert_eq!(backoff_secs(None, None, 1000), 60);
+    }
+
+    #[test]
+    fn backoff_clamps_and_saturates() {
+        // A reset already in the past saturates to 0, then clamps up to the 1s floor.
+        assert_eq!(backoff_secs(None, Some("500"), 1000), 1);
+        // An absurd reset clamps to the 1h ceiling.
+        assert_eq!(backoff_secs(None, Some("999999999"), 0), 3600);
+        // A garbage Retry-After is ignored and falls through to the default.
+        assert_eq!(backoff_secs(Some("soon"), None, 0), 60);
     }
 }

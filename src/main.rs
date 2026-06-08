@@ -132,26 +132,31 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, gh: Github, cfg: Config) -
                 let paused = gh.pause_remaining();
                 app.paused_secs = paused.map(|d| d.as_secs());
 
-                // When rate-limited, do nothing until the back-off clears.
+                // Pause all polling on a rate-limit back-off or when quota is low.
                 let low = app.rate.as_ref().is_some_and(|r| r.remaining < 50);
-                let blocked = app.loading || paused.is_some();
+                let throttled = paused.is_some() || low;
 
                 // Honor X-Poll-Interval as a floor (absent on Actions endpoints today).
                 let floor = Duration::from_secs(gh.poll_interval_secs());
 
-                if !blocked && !low && last_broad.elapsed() >= broad_iv.max(floor) {
+                // A broad sweep is gated on `loading` so we never stack two sweeps;
+                // the live-steps and focused tiers deliberately are NOT, so the open
+                // live step view keeps advancing on its tight cadence even while a
+                // slow broad sweep is in flight (their FetchJobs are cheap, bounded,
+                // and ETag-conditional). All tiers still pause when throttled.
+                if !app.loading && !throttled && last_broad.elapsed() >= broad_iv.max(floor) {
                     app.queue_broad_refresh();
                     last_broad = std::time::Instant::now();
                     last_focused = std::time::Instant::now(); // broad already covers jobs
                     last_live = std::time::Instant::now();
-                } else if !blocked
+                } else if !throttled
                     && app.live_steps_run().is_some()
                     && last_live.elapsed() >= live_iv.max(floor)
                 {
                     // Tight poll of the one run feeding the open live step view.
                     app.queue_live_steps_refresh();
                     last_live = std::time::Instant::now();
-                } else if !blocked
+                } else if !throttled
                     && app.any_run_active()
                     && last_focused.elapsed() >= focused_iv.max(floor)
                 {
@@ -175,6 +180,30 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, gh: Github, cfg: Config) -
         dispatch_commands(&mut app, &gh, &cfg, &tx);
     }
     Ok(())
+}
+
+/// Spawn a fire-and-forget mutation and report its outcome to the UI: a fixed
+/// success notice, or the error under `err_prefix`. Captures the shared
+/// `Ok(()) -> Action / Err -> Error` shape of the action commands so each arm
+/// can't drift in how it reports success or failure.
+fn spawn_action<F, Fut>(
+    tx: &UnboundedSender<DataMsg>,
+    ok: impl Into<String>,
+    err_prefix: &'static str,
+    fut: F,
+) where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    let tx = tx.clone();
+    let ok = ok.into();
+    tokio::spawn(async move {
+        let msg = match fut().await {
+            Ok(()) => DataMsg::Action(ok),
+            Err(e) => DataMsg::Error(format!("{err_prefix}: {e}")),
+        };
+        let _ = tx.send(msg);
+    });
 }
 
 /// Execute everything the UI queued since the last iteration.
@@ -245,63 +274,40 @@ fn dispatch_commands(app: &mut App, gh: &Github, cfg: &Config, tx: &UnboundedSen
                 });
             }
             Command::Dispatch { repo, workflow_id, git_ref, inputs } => {
-                let (gh, tx) = (gh.clone(), tx.clone());
-                tokio::spawn(async move {
-                    match gh.dispatch(&repo, workflow_id, &git_ref, inputs).await {
-                        Ok(()) => {
-                            let _ = tx.send(DataMsg::Action(format!(
-                                "Dispatched workflow on {repo}@{git_ref}"
-                            )));
-                        }
-                        Err(e) => {
-                            let _ = tx.send(DataMsg::Error(format!("dispatch: {e}")));
-                        }
-                    }
+                let gh = gh.clone();
+                let ok = format!("Dispatched workflow on {repo}@{git_ref}");
+                spawn_action(tx, ok, "dispatch", move || async move {
+                    gh.dispatch(&repo, workflow_id, &git_ref, inputs).await
                 });
             }
             Command::Cancel { repo, run_id } => {
-                let (gh, tx) = (gh.clone(), tx.clone());
-                tokio::spawn(async move {
-                    match gh.cancel(&repo, run_id).await {
-                        Ok(()) => { let _ = tx.send(DataMsg::Action("Cancellation requested".into())); }
-                        Err(e) => { let _ = tx.send(DataMsg::Error(format!("cancel: {e}"))); }
-                    }
+                let gh = gh.clone();
+                spawn_action(tx, "Cancellation requested", "cancel", move || async move {
+                    gh.cancel(&repo, run_id).await
                 });
             }
             Command::Rerun { repo, run_id } => {
-                let (gh, tx) = (gh.clone(), tx.clone());
-                tokio::spawn(async move {
-                    match gh.rerun(&repo, run_id).await {
-                        Ok(()) => { let _ = tx.send(DataMsg::Action("Re-run requested".into())); }
-                        Err(e) => { let _ = tx.send(DataMsg::Error(format!("rerun: {e}"))); }
-                    }
+                let gh = gh.clone();
+                spawn_action(tx, "Re-run requested", "rerun", move || async move {
+                    gh.rerun(&repo, run_id).await
                 });
             }
             Command::RerunFailed { repo, run_id } => {
-                let (gh, tx) = (gh.clone(), tx.clone());
-                tokio::spawn(async move {
-                    match gh.rerun_failed(&repo, run_id).await {
-                        Ok(()) => { let _ = tx.send(DataMsg::Action("Re-run (failed jobs) requested".into())); }
-                        Err(e) => { let _ = tx.send(DataMsg::Error(format!("rerun-failed: {e}"))); }
-                    }
+                let gh = gh.clone();
+                spawn_action(tx, "Re-run (failed jobs) requested", "rerun-failed", move || async move {
+                    gh.rerun_failed(&repo, run_id).await
                 });
             }
             Command::RerunJob { repo, job_id } => {
-                let (gh, tx) = (gh.clone(), tx.clone());
-                tokio::spawn(async move {
-                    match gh.rerun_job(&repo, job_id).await {
-                        Ok(()) => { let _ = tx.send(DataMsg::Action("Re-run (job) requested".into())); }
-                        Err(e) => { let _ = tx.send(DataMsg::Error(format!("rerun-job: {e}"))); }
-                    }
+                let gh = gh.clone();
+                spawn_action(tx, "Re-run (job) requested", "rerun-job", move || async move {
+                    gh.rerun_job(&repo, job_id).await
                 });
             }
             Command::Approve { repo, run_id } => {
-                let (gh, tx) = (gh.clone(), tx.clone());
-                tokio::spawn(async move {
-                    match gh.approve(&repo, run_id).await {
-                        Ok(()) => { let _ = tx.send(DataMsg::Action("Run approved".into())); }
-                        Err(e) => { let _ = tx.send(DataMsg::Error(format!("approve: {e}"))); }
-                    }
+                let gh = gh.clone();
+                spawn_action(tx, "Run approved", "approve", move || async move {
+                    gh.approve(&repo, run_id).await
                 });
             }
             Command::FetchPendingDeployments { repo, run_id } => {
@@ -319,16 +325,11 @@ fn dispatch_commands(app: &mut App, gh: &Github, cfg: &Config, tx: &UnboundedSen
                 });
             }
             Command::ReviewDeployments { repo, run_id, env_ids, approve, comment } => {
-                let (gh, tx) = (gh.clone(), tx.clone());
-                tokio::spawn(async move {
-                    let state = if approve { "approved" } else { "rejected" };
-                    match gh.review_deployments(&repo, run_id, &env_ids, state, &comment).await {
-                        Ok(()) => {
-                            let word = if approve { "approved" } else { "rejected" };
-                            let _ = tx.send(DataMsg::Action(format!("Deployment {word}")));
-                        }
-                        Err(e) => { let _ = tx.send(DataMsg::Error(format!("review: {e}"))); }
-                    }
+                let gh = gh.clone();
+                // The same word is both the API `state` and the success notice.
+                let word = if approve { "approved" } else { "rejected" };
+                spawn_action(tx, format!("Deployment {word}"), "review", move || async move {
+                    gh.review_deployments(&repo, run_id, &env_ids, word, &comment).await
                 });
             }
             Command::FetchRefs { repo } => {

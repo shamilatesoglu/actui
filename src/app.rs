@@ -71,7 +71,7 @@ pub enum Command {
     Notify { title: String, body: String, failed: bool },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Filter {
     All,
     Running,
@@ -338,7 +338,7 @@ pub struct LogsView {
 }
 
 /// Strip a leading BOM, trailing CR/LF, and the ISO timestamp prefix.
-fn log_content(raw: &str) -> &str {
+pub(crate) fn log_content(raw: &str) -> &str {
     let s = raw
         .trim_start_matches('\u{feff}')
         .trim_end_matches(['\r', '\n']);
@@ -1252,16 +1252,8 @@ impl App {
             }
             KeyCode::Char('j') | KeyCode::Down => list_move(&mut av.state, av.items.len(), 1),
             KeyCode::Char('k') | KeyCode::Up => list_move(&mut av.state, av.items.len(), -1),
-            KeyCode::Char('g') | KeyCode::Home => {
-                if !av.items.is_empty() {
-                    av.state.select(Some(0));
-                }
-            }
-            KeyCode::Char('G') | KeyCode::End => {
-                if !av.items.is_empty() {
-                    av.state.select(Some(av.items.len() - 1));
-                }
-            }
+            KeyCode::Char('g') | KeyCode::Home => list_jump(&mut av.state, av.items.len(), true),
+            KeyCode::Char('G') | KeyCode::End => list_jump(&mut av.state, av.items.len(), false),
             KeyCode::Enter => {
                 if let Some(a) = av.state.selected().and_then(|i| av.items.get(i)) {
                     if a.expired {
@@ -1717,16 +1709,12 @@ impl App {
             }
             KeyCode::Char('g') | KeyCode::Home => {
                 if let Some(av) = &mut self.approval {
-                    if !av.items.is_empty() {
-                        av.state.select(Some(0));
-                    }
+                    list_jump(&mut av.state, av.items.len(), true);
                 }
             }
             KeyCode::Char('G') | KeyCode::End => {
                 if let Some(av) = &mut self.approval {
-                    if !av.items.is_empty() {
-                        av.state.select(Some(av.items.len() - 1));
-                    }
+                    list_jump(&mut av.state, av.items.len(), false);
                 }
             }
             // Toggle the highlighted environment (only if the user can approve it).
@@ -1957,6 +1945,13 @@ fn list_move(state: &mut ListState, len: usize, delta: i32) {
     state.select(Some(next));
 }
 
+/// Jump a list selection to the top or bottom; a no-op when the list is empty.
+fn list_jump(state: &mut ListState, len: usize, top: bool) {
+    if len > 0 {
+        state.select(Some(if top { 0 } else { len - 1 }));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2173,5 +2168,179 @@ mod tests {
         let v = src_lines(&lv);
         assert!(!v.contains(&"Contents: read"));
         assert!(!v.contains(&"##[error]boom")); // even the error group folds on "fold all"
+    }
+
+    fn job(id: u64) -> Job {
+        Job {
+            id,
+            name: "build".into(),
+            status: "completed".into(),
+            html_url: String::new(),
+            conclusion: Some("success".into()),
+            started_at: None,
+            completed_at: None,
+            steps: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn recompute_view_preserves_selection_by_run_id() {
+        let mut app = App::new();
+        app.runs = vec![
+            run_with(1, "in_progress", None),         // Running
+            run_with(2, "completed", Some("success")), // Success
+            run_with(3, "completed", Some("failure")), // Failure
+        ];
+        app.recompute_view();
+        // Select a run that is NOT at index 0, so preservation is distinguishable
+        // from the fall-back-to-0 path.
+        app.table_state.select(Some(1));
+        assert_eq!(app.selected_run().unwrap().id, 2);
+
+        // (a) A filter that keeps the selected run: selection stays on run 2.
+        app.filter = Filter::Success;
+        app.recompute_view();
+        assert_eq!(app.selected_run().unwrap().id, 2);
+
+        // (b) A filter that excludes it: selection falls back to the first row.
+        app.filter = Filter::Running;
+        app.recompute_view();
+        assert_eq!(app.selected_run().unwrap().id, 1);
+
+        // (c) A filter matching nothing: selection becomes None.
+        app.filter = Filter::Queued;
+        app.recompute_view();
+        assert!(app.selected_run().is_none());
+    }
+
+    #[test]
+    fn sync_jobs_serves_cache_on_hit_and_clears_on_miss() {
+        // Hit: a cached run shows its jobs immediately and still queues a refetch.
+        let mut hit = App::new();
+        hit.runs = vec![run_with(1, "in_progress", None)];
+        hit.jobs_cache.insert(1, vec![job(10)]);
+        hit.recompute_view();
+        assert_eq!(hit.jobs.len(), 1);
+        assert_eq!(hit.jobs_run_id, Some(1));
+        assert!(hit
+            .pending
+            .iter()
+            .any(|c| matches!(c, Command::FetchJobs { run_id: 1, .. })));
+
+        // Miss: an uncached run clears the list but still queues a refetch.
+        let mut miss = App::new();
+        miss.runs = vec![run_with(2, "in_progress", None)];
+        miss.recompute_view();
+        assert!(miss.jobs.is_empty());
+        assert_eq!(miss.jobs_state.selected(), None);
+        assert_eq!(miss.jobs_run_id, None);
+        assert!(miss
+            .pending
+            .iter()
+            .any(|c| matches!(c, Command::FetchJobs { run_id: 2, .. })));
+    }
+
+    #[test]
+    fn finish_refresh_prunes_jobs_cache_to_live_runs() {
+        let mut app = App::new();
+        app.jobs_cache.insert(1, vec![job(1)]);
+        app.jobs_cache.insert(2, vec![job(2)]);
+        app.jobs_cache.insert(3, vec![job(3)]);
+        // Only runs 1 and 3 survive the latest sweep.
+        app.runs = vec![
+            run_with(1, "completed", Some("success")),
+            run_with(3, "in_progress", None),
+        ];
+        app.finish_refresh();
+        assert!(app.jobs_cache.contains_key(&1));
+        assert!(!app.jobs_cache.contains_key(&2)); // dropped: no longer in runs
+        assert!(app.jobs_cache.contains_key(&3));
+    }
+
+    #[test]
+    fn cycle_filter_wraps_both_directions() {
+        let mut app = App::new();
+        assert_eq!(app.filter, Filter::All);
+        app.cycle_filter(-1);
+        assert_eq!(app.filter, Filter::Success); // wrap backward past the start
+        app.cycle_filter(1);
+        assert_eq!(app.filter, Filter::All); // wrap forward past the end
+        for _ in 0..Filter::ALL.len() {
+            app.cycle_filter(1);
+        }
+        assert_eq!(app.filter, Filter::All); // a full lap returns to the start
+    }
+
+    fn dispatch_field(name: &str, required: bool, kind: FieldKind) -> DispatchField {
+        DispatchField { name: name.into(), description: String::new(), required, kind }
+    }
+
+    fn loaded_dispatch(fields: Vec<DispatchField>, git_ref: &str) -> DispatchState {
+        DispatchState {
+            repo: "org/api".into(),
+            workflows: Vec::new(),
+            wf_state: ListState::default(),
+            stage: DispatchStage::EditParams,
+            git_ref: git_ref.into(),
+            fetched_ref: git_ref.into(),
+            workflow_id: 42,
+            workflow_path: ".github/workflows/ci.yml".into(),
+            fields,
+            loaded: true,
+            dispatchable: true,
+            field_idx: 0,
+        }
+    }
+
+    #[test]
+    fn submit_dispatch_omits_empty_optionals_and_includes_the_rest() {
+        let mut app = App::new();
+        app.dispatch = Some(loaded_dispatch(
+            vec![
+                dispatch_field("required_field", true, FieldKind::Text { value: "val".into(), numeric: false }),
+                dispatch_field("optional_empty", false, FieldKind::Text { value: String::new(), numeric: false }),
+                dispatch_field("flag", false, FieldKind::Bool(true)),
+                dispatch_field("env", false, FieldKind::Choice { options: vec!["dev".into(), "prod".into()], idx: 1 }),
+            ],
+            "main",
+        ));
+        app.submit_dispatch();
+
+        let inputs = app
+            .pending
+            .iter()
+            .find_map(|c| match c {
+                Command::Dispatch { workflow_id: 42, inputs, git_ref, .. } if git_ref == "main" => Some(inputs.clone()),
+                _ => None,
+            })
+            .expect("a Dispatch command should be queued");
+        assert_eq!(inputs.get("required_field").map(String::as_str), Some("val"));
+        assert!(!inputs.contains_key("optional_empty")); // empty optional → omitted so the workflow default applies
+        assert_eq!(inputs.get("flag").map(String::as_str), Some("true"));
+        assert_eq!(inputs.get("env").map(String::as_str), Some("prod"));
+        assert!(app.dispatch.is_none()); // form closed on a successful submit
+    }
+
+    #[test]
+    fn submit_dispatch_rejects_missing_required_and_blank_ref() {
+        // A blank required field is rejected with a per-field message; nothing queued.
+        let mut app = App::new();
+        app.dispatch = Some(loaded_dispatch(
+            vec![dispatch_field("token", true, FieldKind::Text { value: String::new(), numeric: false })],
+            "main",
+        ));
+        app.submit_dispatch();
+        assert!(app.dispatch.is_some()); // form stays open
+        assert!(!app.pending.iter().any(|c| matches!(c, Command::Dispatch { .. })));
+        let (msg, is_err) = app.status().expect("an error status");
+        assert!(is_err && msg.contains("token"));
+
+        // A blank ref is rejected too.
+        let mut app = App::new();
+        app.dispatch = Some(loaded_dispatch(Vec::new(), "   "));
+        app.submit_dispatch();
+        assert!(!app.pending.iter().any(|c| matches!(c, Command::Dispatch { .. })));
+        let (msg, is_err) = app.status().expect("an error status");
+        assert!(is_err && msg.to_lowercase().contains("ref"));
     }
 }

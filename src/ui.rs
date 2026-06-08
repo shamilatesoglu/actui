@@ -1,6 +1,6 @@
 //! All rendering. `draw` is called every frame with the current `App`.
 
-use crate::app::{App, DispatchStage, Filter, Focus, Mode, RefKind};
+use crate::app::{log_content, App, DispatchStage, Filter, Focus, Mode, RefKind};
 use crate::github::{Job, Run, RunState, Step};
 use ansi_to_tui::IntoText;
 use chrono::{DateTime, Utc};
@@ -656,7 +656,7 @@ fn draw_jobs(f: &mut Frame, app: &App, area: Rect) {
         .jobs
         .iter()
         .map(|j| {
-            let (icon, color) = job_glyph(j);
+            let (icon, color) = status_glyph(&j.status, j.conclusion.as_deref());
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{icon} "), Style::default().fg(color)),
                 Span::raw(truncate(&j.name, 28)),
@@ -785,8 +785,7 @@ fn draw_logs_pane(f: &mut Frame, app: &App, area: Rect) {
     let shown = lv.visible.len();
 
     // Center the cursor in the viewport (pure function of cursor + sizes).
-    let max_scroll = shown.saturating_sub(height);
-    let scroll = lv.cursor.saturating_sub(height / 2).min(max_scroll);
+    let scroll = center_scroll(lv.cursor, height, shown);
 
     let text: Vec<Line> = lv
         .visible
@@ -801,14 +800,10 @@ fn draw_logs_pane(f: &mut Frame, app: &App, area: Rect) {
                 let g = lv.line_group[src].unwrap();
                 let collapsed = lv.groups[g].collapsed;
                 let arrow = if collapsed { "▸" } else { "▾" };
-                let name = strip_ts(
-                    lv.lines[src]
-                        .trim_start_matches('\u{feff}')
-                        .trim_end_matches(['\r', '\n']),
-                )
-                .strip_prefix("##[group]")
-                .unwrap_or("")
-                .to_string();
+                let name = log_content(&lv.lines[src])
+                    .strip_prefix("##[group]")
+                    .unwrap_or("")
+                    .to_string();
                 let acc = Style::default().fg(accent()).add_modifier(Modifier::BOLD);
                 let mut spans = vec![
                     Span::styled(format!("{arrow} "), acc),
@@ -893,15 +888,14 @@ fn draw_steps_pane(f: &mut Frame, app: &App, area: Rect) {
         );
     } else {
         let height = body.height as usize;
-        let max_scroll = steps.len().saturating_sub(height);
-        let scroll = sv.cursor.saturating_sub(height / 2).min(max_scroll);
+        let scroll = center_scroll(sv.cursor, height, steps.len());
         let lines: Vec<Line> = steps
             .iter()
             .enumerate()
             .skip(scroll)
             .take(height)
             .map(|(i, s)| {
-                let (icon, color) = step_glyph(s);
+                let (icon, color) = status_glyph(&s.status, s.conclusion.as_deref());
                 let running = s.status == "in_progress";
                 let name_style = if running {
                     Style::default().add_modifier(Modifier::BOLD)
@@ -932,11 +926,13 @@ fn draw_steps_pane(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn step_glyph(s: &Step) -> (&'static str, Color) {
-    match s.status.as_str() {
+/// Status glyph shared by jobs and steps (both carry the same GitHub
+/// `status` + `conclusion` model, so they render identically).
+fn status_glyph(status: &str, conclusion: Option<&str>) -> (&'static str, Color) {
+    match status {
         "in_progress" => ("●", Color::Yellow),
         "queued" | "waiting" | "pending" => ("○", Color::Cyan),
-        "completed" => match s.conclusion.as_deref() {
+        "completed" => match conclusion {
             Some("success") => ("●", Color::Green),
             Some("failure") | Some("timed_out") => ("●", Color::Red),
             Some("cancelled") => ("◌", dim()),
@@ -957,7 +953,7 @@ fn step_dur(s: &Step) -> String {
 
 /// Render a matching log line with every occurrence of `query` highlighted.
 fn highlight_match(raw: &str, query: &str) -> Line<'static> {
-    let content = strip_ts(raw.trim_start_matches('\u{feff}').trim_end_matches(['\r', '\n']));
+    let content = log_content(raw);
     // Byte offsets from the lowercased copy only line up when the text is ASCII.
     if !content.is_ascii() || content.contains('\x1b') {
         return highlight_log(raw);
@@ -1187,27 +1183,18 @@ fn state_label(s: RunState) -> &'static str {
     }
 }
 
-fn job_glyph(j: &Job) -> (&'static str, Color) {
-    match j.status.as_str() {
-        "in_progress" => ("●", Color::Yellow),
-        "queued" | "waiting" | "pending" => ("○", Color::Cyan),
-        "completed" => match j.conclusion.as_deref() {
-            Some("success") => ("●", Color::Green),
-            Some("failure") | Some("timed_out") => ("●", Color::Red),
-            Some("cancelled") => ("◌", dim()),
-            Some("skipped") => ("○", dim()),
-            _ => ("·", dim()),
-        },
-        _ => ("·", dim()),
-    }
-}
-
 fn job_dur(j: &Job) -> String {
     match (j.started_at, j.completed_at) {
         (Some(s), Some(e)) => fmt_dur((e - s).num_seconds().max(0)),
         (Some(s), None) => format!("{}…", fmt_dur((Utc::now() - s).num_seconds().max(0))),
         _ => String::new(),
     }
+}
+
+/// Scroll offset that centers `cursor` in a viewport of `height` rows over
+/// `total` items, clamped so the final page never scrolls past the end.
+fn center_scroll(cursor: usize, height: usize, total: usize) -> usize {
+    cursor.saturating_sub(height / 2).min(total.saturating_sub(height))
 }
 
 fn fmt_dur(secs: i64) -> String {
@@ -1300,23 +1287,11 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// GitHub job logs prefix every line with an ISO timestamp; drop it for display.
-fn strip_ts(line: &str) -> &str {
-    if let Some((first, rest)) = line.split_once(' ') {
-        if first.len() >= 20 && first.contains('T') && first.contains(':') {
-            return rest;
-        }
-    }
-    line
-}
-
 /// Colorize one raw log line: GitHub `##[…]` workflow markers, then any
-/// embedded ANSI escape sequences the build tools emitted.
+/// embedded ANSI escape sequences the build tools emitted. `log_content`
+/// strips the BOM, trailing CR/LF, and the ISO timestamp prefix.
 fn highlight_log(raw: &str) -> Line<'static> {
-    let line = raw
-        .trim_end_matches(['\r', '\n'])
-        .trim_start_matches('\u{feff}'); // strip CR/LF and a leading UTF-8 BOM
-    let content = strip_ts(line);
+    let content = log_content(raw);
 
     let marker = |prefix: &str, rest: &str, color: Color, bold: bool| {
         let mut style = Style::default().fg(color);
