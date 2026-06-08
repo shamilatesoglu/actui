@@ -33,8 +33,22 @@ async fn main() -> Result<()> {
     res
 }
 
+/// Resolve the active palette: an explicit "dark"/"light" override, else the
+/// system's current light/dark setting (defaulting to dark when unknown).
+fn resolve_theme(cfg: &Config) -> ui::Theme {
+    match cfg.theme.as_str() {
+        "light" => ui::Theme::light(),
+        "dark" => ui::Theme::dark(),
+        _ => match dark_light::detect() {
+            dark_light::Mode::Light => ui::Theme::light(),
+            _ => ui::Theme::dark(), // Dark or Default
+        },
+    }
+}
+
 async fn run(terminal: &mut ratatui::DefaultTerminal, gh: Github, cfg: Config) -> Result<()> {
     let mut app = App::new();
+    ui::set_theme(resolve_theme(&cfg));
     let (tx, mut rx) = mpsc::unbounded_channel::<DataMsg>();
 
     // Initial load.
@@ -74,6 +88,9 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, gh: Github, cfg: Config) -
     let mut last_broad = std::time::Instant::now();
     let mut last_focused = std::time::Instant::now();
     let mut last_live = std::time::Instant::now();
+    // Re-check the system theme periodically so it switches live (auto mode only).
+    let auto_theme = cfg.theme != "dark" && cfg.theme != "light";
+    let mut last_theme = std::time::Instant::now();
 
     loop {
         terminal.draw(|f| ui::draw(f, &app))?;
@@ -98,6 +115,18 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, gh: Github, cfg: Config) -
                 app.tick(); // animates spinner while loading, expires stale status
             }
             _ = sched.tick() => {
+                // Follow the system light/dark setting while running (auto mode).
+                // Detection can block (dbus on Linux), so keep it off the UI loop.
+                if auto_theme && last_theme.elapsed() >= Duration::from_secs(3) {
+                    last_theme = std::time::Instant::now();
+                    tokio::task::spawn_blocking(|| {
+                        let t = match dark_light::detect() {
+                            dark_light::Mode::Light => ui::Theme::light(),
+                            _ => ui::Theme::dark(),
+                        };
+                        ui::set_theme(t);
+                    });
+                }
                 // Surface live rate-limit / back-off state from response headers.
                 app.rate = gh.rate();
                 let paused = gh.pause_remaining();

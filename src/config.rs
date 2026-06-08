@@ -30,6 +30,9 @@ pub struct Config {
     pub notify: bool,
     /// Ring the terminal bell when a watched run finishes.
     pub bell: bool,
+    /// Color theme: "auto" (follow the system light/dark setting), "dark", or
+    /// "light".
+    pub theme: String,
 }
 
 impl Default for Config {
@@ -46,6 +49,7 @@ impl Default for Config {
             exclude: Vec::new(),
             notify: true,
             bell: true,
+            theme: "auto".to_string(),
         }
     }
 }

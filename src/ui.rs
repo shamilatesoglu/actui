@@ -11,35 +11,98 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Tabs, Wrap,
 };
 use ratatui::Frame;
+use std::sync::{OnceLock, RwLock};
 
-const ACCENT: Color = Color::Rgb(137, 180, 250);
-const DIM: Color = Color::Rgb(127, 132, 156);
-const BG_SEL: Color = Color::Rgb(49, 50, 68); // selection background (focused pane)
-const BG_SEL_DIM: Color = Color::Rgb(40, 41, 56); // selection background (unfocused pane)
-const PALE: Color = Color::Rgb(166, 173, 200); // unfocused selected text
+/// Palette tints that must differ between light and dark backgrounds. Status
+/// colors (red/green/yellow/cyan) are left to the terminal's own palette so
+/// they already adapt; only these custom tints need a per-mode value.
+#[derive(Clone, Copy)]
+pub struct Theme {
+    accent: Color,
+    dim: Color,
+    bg_sel: Color,     // selection background (focused pane)
+    bg_sel_dim: Color, // selection background (unfocused pane)
+    pale: Color,       // unfocused selected text
+    popup_bg: Color,   // popup window fill
+}
+
+impl Theme {
+    pub fn dark() -> Self {
+        Self {
+            accent: Color::Rgb(137, 180, 250),
+            dim: Color::Rgb(127, 132, 156),
+            bg_sel: Color::Rgb(49, 50, 68),
+            bg_sel_dim: Color::Rgb(40, 41, 56),
+            pale: Color::Rgb(166, 173, 200),
+            popup_bg: Color::Rgb(30, 31, 48),
+        }
+    }
+    pub fn light() -> Self {
+        Self {
+            accent: Color::Rgb(30, 102, 245),
+            dim: Color::Rgb(108, 111, 133),
+            bg_sel: Color::Rgb(188, 200, 240),
+            bg_sel_dim: Color::Rgb(220, 224, 232),
+            pale: Color::Rgb(76, 79, 105),
+            popup_bg: Color::Rgb(230, 233, 239),
+        }
+    }
+}
+
+fn theme_store() -> &'static RwLock<Theme> {
+    static CURRENT: OnceLock<RwLock<Theme>> = OnceLock::new();
+    CURRENT.get_or_init(|| RwLock::new(Theme::dark()))
+}
+
+/// Set the active palette (called from the main loop when the system theme,
+/// or the configured override, resolves to light or dark).
+pub fn set_theme(t: Theme) {
+    *theme_store().write().unwrap() = t;
+}
+
+fn theme() -> Theme {
+    *theme_store().read().unwrap()
+}
+
+fn accent() -> Color {
+    theme().accent
+}
+fn dim() -> Color {
+    theme().dim
+}
+fn bg_sel() -> Color {
+    theme().bg_sel
+}
+fn bg_sel_dim() -> Color {
+    theme().bg_sel_dim
+}
+fn pale() -> Color {
+    theme().pale
+}
+fn popup_bg() -> Color {
+    theme().popup_bg
+}
+
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Row/list selection highlight: bright when focused, dim when not.
 fn select_style(focused: bool) -> Style {
     if focused {
-        Style::default().bg(BG_SEL).add_modifier(Modifier::BOLD)
+        Style::default().bg(bg_sel()).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(PALE).bg(BG_SEL_DIM)
+        Style::default().fg(pale()).bg(bg_sel_dim())
     }
 }
-
-/// Background fill that makes a popup read as a distinct window over the UI.
-const POPUP_BG: Color = Color::Rgb(30, 31, 48);
 
 /// A pane's title: a highlighted (inverted) tab when focused, plain dim when not.
 fn pane_title(title: &str, focused: bool) -> Span<'static> {
     if focused {
         Span::styled(
             format!(" {title} "),
-            Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Black).bg(accent()).add_modifier(Modifier::BOLD),
         )
     } else {
-        Span::styled(format!(" {title} "), Style::default().fg(DIM).add_modifier(Modifier::BOLD))
+        Span::styled(format!(" {title} "), Style::default().fg(dim()).add_modifier(Modifier::BOLD))
     }
 }
 
@@ -49,7 +112,7 @@ fn pane(f: &mut Frame, area: Rect, title: &str, focused: bool) -> Rect {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(if focused { ACCENT } else { DIM }))
+        .border_style(Style::default().fg(if focused { accent() } else { dim() }))
         .title(pane_title(title, focused));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -64,7 +127,7 @@ fn popup(f: &mut Frame, area: Rect, title: &str, accent: Color) -> Rect {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(accent))
-        .style(Style::default().bg(POPUP_BG))
+        .style(Style::default().bg(popup_bg()))
         .title(Span::styled(
             format!(" {title} "),
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
@@ -105,18 +168,18 @@ pub fn draw(f: &mut Frame, app: &App) {
 fn draw_artifacts(f: &mut Frame, app: &App) {
     let Some(av) = &app.artifacts else { return };
     let area = centered(60, 60, f.area());
-    let inner = popup(f, area, &format!("Artifacts · {}", av.repo), ACCENT);
+    let inner = popup(f, area, &format!("Artifacts · {}", av.repo), accent());
 
     if !av.loaded {
         f.render_widget(
-            Paragraph::new("Loading artifacts…").style(Style::default().fg(DIM)),
+            Paragraph::new("Loading artifacts…").style(Style::default().fg(dim())),
             inner,
         );
         return;
     }
     if av.items.is_empty() {
         f.render_widget(
-            Paragraph::new("No artifacts for this run.").style(Style::default().fg(DIM)),
+            Paragraph::new("No artifacts for this run.").style(Style::default().fg(dim())),
             inner,
         );
         return;
@@ -129,7 +192,7 @@ fn draw_artifacts(f: &mut Frame, app: &App) {
             let (note, c) = if a.expired {
                 (" (expired)".to_string(), Color::Red)
             } else {
-                (format!("  {}", fmt_bytes(a.size_in_bytes)), DIM)
+                (format!("  {}", fmt_bytes(a.size_in_bytes)), dim())
             };
             ListItem::new(Line::from(vec![
                 Span::raw(a.name.clone()),
@@ -138,11 +201,11 @@ fn draw_artifacts(f: &mut Frame, app: &App) {
         })
         .collect();
     let list = List::new(items)
-        .highlight_style(Style::default().bg(BG_SEL).add_modifier(Modifier::BOLD))
+        .highlight_style(Style::default().bg(bg_sel()).add_modifier(Modifier::BOLD))
         .highlight_symbol("▌")
         .block(Block::default().title(Span::styled(
             " ⏎ download (.zip) · j/k move · Esc close ",
-            Style::default().fg(DIM),
+            Style::default().fg(dim()),
         )));
     let mut state = av.state.clone();
     f.render_stateful_widget(list, inner, &mut state);
@@ -155,7 +218,7 @@ fn draw_approval(f: &mut Frame, app: &App) {
 
     if !av.loaded {
         f.render_widget(
-            Paragraph::new("Loading pending deployments…").style(Style::default().fg(DIM)),
+            Paragraph::new("Loading pending deployments…").style(Style::default().fg(dim())),
             inner,
         );
         return;
@@ -174,11 +237,11 @@ fn draw_approval(f: &mut Frame, app: &App) {
             let approvable = p.current_user_can_approve;
             let checked = av.selected.contains(&i);
             let (mark, mark_c) = if !approvable {
-                ("[-]", DIM)
+                ("[-]", dim())
             } else if checked {
                 ("[x]", Color::Green)
             } else {
-                ("[ ]", DIM)
+                ("[ ]", dim())
             };
             let mut spans = vec![
                 Span::styled(format!("{mark} "), Style::default().fg(mark_c)),
@@ -198,10 +261,10 @@ fn draw_approval(f: &mut Frame, app: &App) {
 
     // Comment line (editable with `c`).
     let comment = if av.comment.is_empty() && !av.editing_comment {
-        Line::from(Span::styled(" comment: (press c to add)", Style::default().fg(DIM)))
+        Line::from(Span::styled(" comment: (press c to add)", Style::default().fg(dim())))
     } else {
         let mut s = vec![
-            Span::styled(" comment: ", Style::default().fg(DIM)),
+            Span::styled(" comment: ", Style::default().fg(dim())),
             Span::raw(av.comment.clone()),
         ];
         if av.editing_comment {
@@ -217,7 +280,7 @@ fn draw_approval(f: &mut Frame, app: &App) {
         " Space toggle · ⏎/y approve · x reject · c comment · Esc cancel "
     };
     f.render_widget(
-        Paragraph::new(Span::styled(hint, Style::default().fg(DIM))).alignment(Alignment::Right),
+        Paragraph::new(Span::styled(hint, Style::default().fg(dim()))).alignment(Alignment::Right),
         rows[2],
     );
 }
@@ -225,11 +288,11 @@ fn draw_approval(f: &mut Frame, app: &App) {
 fn draw_ref_picker(f: &mut Frame, app: &App) {
     let Some(rp) = &app.ref_picker else { return };
     let area = centered(50, 70, f.area());
-    let inner = popup(f, area, &format!("Pick ref · {}", rp.repo), ACCENT);
+    let inner = popup(f, area, &format!("Pick ref · {}", rp.repo), accent());
 
     if !rp.loaded {
         f.render_widget(
-            Paragraph::new("Loading branches & tags…").style(Style::default().fg(DIM)),
+            Paragraph::new("Loading branches & tags…").style(Style::default().fg(dim())),
             inner,
         );
         return;
@@ -242,12 +305,12 @@ fn draw_ref_picker(f: &mut Frame, app: &App) {
 
     // Filter prompt.
     let filt = Line::from(vec![
-        Span::styled(" /", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(" /", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
         Span::raw(rp.filter.clone()),
-        Span::styled("▏", Style::default().fg(ACCENT)),
+        Span::styled("▏", Style::default().fg(accent())),
         Span::styled(
             format!("  {} match{}", rp.view.len(), if rp.view.len() == 1 { "" } else { "es" }),
-            Style::default().fg(DIM),
+            Style::default().fg(dim()),
         ),
     ]);
     f.render_widget(Paragraph::new(filt), rows[0]);
@@ -258,7 +321,7 @@ fn draw_ref_picker(f: &mut Frame, app: &App) {
         .filter_map(|&i| rp.items.get(i))
         .map(|r| {
             let (tag, c) = match r.kind {
-                RefKind::Branch => ("br ", ACCENT),
+                RefKind::Branch => ("br ", accent()),
                 RefKind::Tag => ("tag", Color::Magenta),
             };
             ListItem::new(Line::from(vec![
@@ -276,7 +339,7 @@ fn draw_ref_picker(f: &mut Frame, app: &App) {
     f.render_widget(
         Paragraph::new(Span::styled(
             " type to filter · ↑/↓ move · ⏎ select · Esc cancel ",
-            Style::default().fg(DIM),
+            Style::default().fg(dim()),
         ))
         .alignment(Alignment::Right),
         rows[2],
@@ -299,7 +362,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(ACCENT));
+        .border_style(Style::default().fg(accent()));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -310,14 +373,14 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let line1 = Line::from(vec![
-        Span::styled("  actui ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("@{}  ", app.user), Style::default().fg(DIM)),
+        Span::styled("  actui ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("@{}  ", app.user), Style::default().fg(dim())),
         Span::styled(spin, Style::default().fg(Color::Yellow)),
         chip("●", running, Color::Yellow),
         chip("○", queued, Color::Cyan),
         chip("●", failed, Color::Red),
         chip("●", success, Color::Green),
-        Span::styled(format!("  {} runs", app.runs.len()), Style::default().fg(DIM)),
+        Span::styled(format!("  {} runs", app.runs.len()), Style::default().fg(dim())),
     ]);
 
     let mut right = Vec::new();
@@ -339,7 +402,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         ));
     }
     if let Some(rl) = &app.rate {
-        let c = if rl.remaining < 200 { Color::Red } else { DIM };
+        let c = if rl.remaining < 200 { Color::Red } else { dim() };
         right.push(Span::styled(
             format!(" api {}/{} ", rl.remaining, rl.limit),
             Style::default().fg(c),
@@ -348,7 +411,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     if let Some(ts) = app.last_refresh {
         right.push(Span::styled(
             format!(" updated {} ", fmt_age(ts)),
-            Style::default().fg(DIM),
+            Style::default().fg(dim()),
         ));
     }
     let status = Line::from(right).alignment(Alignment::Right);
@@ -378,15 +441,15 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
     let at_runs = !logs && app.focus == Focus::Runs;
     let crumb = |label: &'static str, active: bool, reached: bool| {
         let style = if active {
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD)
         } else if reached {
             Style::default().fg(Color::White)
         } else {
-            Style::default().fg(DIM)
+            Style::default().fg(dim())
         };
         Span::styled(label, style)
     };
-    let sep = || Span::styled(" › ", Style::default().fg(DIM));
+    let sep = || Span::styled(" › ", Style::default().fg(dim()));
     vec![
         Span::raw("  "),
         crumb("Runs", at_runs, true),
@@ -405,11 +468,11 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     let sel = Filter::ALL.iter().position(|x| *x == app.filter).unwrap_or(0);
     let tabs = Tabs::new(titles)
         .select(sel)
-        .style(Style::default().fg(DIM))
+        .style(Style::default().fg(dim()))
         .highlight_style(
             Style::default()
                 .fg(Color::Black)
-                .bg(ACCENT)
+                .bg(accent())
                 .add_modifier(Modifier::BOLD),
         )
         .divider("");
@@ -446,7 +509,7 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
             "No runs found for this filter."
         };
         let p = Paragraph::new(msg)
-            .style(Style::default().fg(DIM))
+            .style(Style::default().fg(dim()))
             .alignment(Alignment::Center);
         f.render_widget(p, content);
         return;
@@ -462,7 +525,7 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
         Cell::from("Dur"),
         Cell::from("Age"),
     ])
-    .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
+    .style(Style::default().fg(accent()).add_modifier(Modifier::BOLD));
 
     let rows = app.view.iter().map(|&i| {
         let r = &app.runs[i];
@@ -473,7 +536,7 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
             // Workflow name with a dim run number, so #NNN is scannable inline.
             Cell::from(Line::from(vec![
                 Span::raw(truncate(r.workflow_name(), 15)),
-                Span::styled(format!("  #{}", r.run_number), Style::default().fg(DIM)),
+                Span::styled(format!("  #{}", r.run_number), Style::default().fg(dim())),
             ])),
             Cell::from(truncate(r.head_branch.as_deref().unwrap_or("-"), 16)),
             Cell::from(event_label(&r.event)),
@@ -481,8 +544,8 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
                 r.actor.as_ref().map(|a| a.login.as_str()).unwrap_or("-"),
                 12,
             )),
-            Cell::from(run_dur(r)).style(Style::default().fg(DIM)),
-            Cell::from(fmt_age(r.updated_at)).style(Style::default().fg(DIM)),
+            Cell::from(run_dur(r)).style(Style::default().fg(dim())),
+            Cell::from(fmt_age(r.updated_at)).style(Style::default().fg(dim())),
         ])
     });
 
@@ -514,7 +577,7 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
 
     let Some(run) = app.selected_run() else {
         f.render_widget(
-            Paragraph::new("Select a run to see details.").style(Style::default().fg(DIM)),
+            Paragraph::new("Select a run to see details.").style(Style::default().fg(dim())),
             inner,
         );
         return;
@@ -535,10 +598,10 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     let mut first = vec![
         Span::styled(format!("{icon} "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
         Span::styled(label, Style::default().fg(label_color).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("  #{}", run.run_number), Style::default().fg(DIM)),
+        Span::styled(format!("  #{}", run.run_number), Style::default().fg(dim())),
     ];
     if run.needs_approval() {
-        first.push(Span::styled("  · press a", Style::default().fg(DIM)));
+        first.push(Span::styled("  · press a", Style::default().fg(dim())));
     }
     let mut info = vec![
         Line::from(first),
@@ -562,14 +625,14 @@ fn draw_jobs(f: &mut Frame, app: &App, area: Rect) {
     let title = if focused { " Jobs · ⏎ logs " } else { " Jobs " };
     let block = Block::default()
         .borders(Borders::TOP)
-        .border_style(Style::default().fg(if focused { ACCENT } else { DIM }))
+        .border_style(Style::default().fg(if focused { accent() } else { dim() }))
         .title(pane_title(title.trim(), focused));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     if app.jobs.is_empty() {
         f.render_widget(
-            Paragraph::new("Loading jobs…").style(Style::default().fg(DIM)),
+            Paragraph::new("Loading jobs…").style(Style::default().fg(dim())),
             inner,
         );
         return;
@@ -583,7 +646,7 @@ fn draw_jobs(f: &mut Frame, app: &App, area: Rect) {
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{icon} "), Style::default().fg(color)),
                 Span::raw(truncate(&j.name, 28)),
-                Span::styled(format!("  {}", job_dur(j)), Style::default().fg(DIM)),
+                Span::styled(format!("  {}", job_dur(j)), Style::default().fg(dim())),
             ]))
         })
         .collect();
@@ -599,10 +662,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     // The runs search prompt always wins while you're typing in it.
     if app.mode == Mode::Search {
         let line = Line::from(vec![
-            Span::styled(" /", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(" /", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
             Span::raw(app.search.clone()),
-            Span::styled("▏", Style::default().fg(ACCENT)),
-            Span::styled("  (Esc clear · Enter keep)", Style::default().fg(DIM)),
+            Span::styled("▏", Style::default().fg(accent())),
+            Span::styled("  (Esc clear · Enter keep)", Style::default().fg(dim())),
         ]);
         f.render_widget(Paragraph::new(line), area);
         return;
@@ -619,7 +682,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     }
     if app.mode == Mode::Logs && app.steps_view.is_some() {
         let hint = " live steps · updates automatically · ⏎ try logs · j/k move · Esc close";
-        f.render_widget(Paragraph::new(Span::styled(hint, Style::default().fg(DIM))), area);
+        f.render_widget(Paragraph::new(Span::styled(hint, Style::default().fg(dim()))), area);
         return;
     }
     let hint: String = match (app.mode == Mode::Logs, app.focus) {
@@ -638,7 +701,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         }
     };
     f.render_widget(
-        Paragraph::new(Span::styled(hint, Style::default().fg(DIM))),
+        Paragraph::new(Span::styled(hint, Style::default().fg(dim()))),
         area,
     );
 }
@@ -647,7 +710,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_help(f: &mut Frame) {
     let area = centered(60, 70, f.area());
-    let inner = popup(f, area, "Help", ACCENT);
+    let inner = popup(f, area, "Help", accent());
     let body = Text::from(vec![
         hl("Panes  (two-pane: Runs ⟷ Jobs)"),
         help_row("Tab", "switch focus between Runs and Jobs"),
@@ -732,7 +795,7 @@ fn draw_logs_pane(f: &mut Frame, app: &App, area: Rect) {
                 .strip_prefix("##[group]")
                 .unwrap_or("")
                 .to_string();
-                let acc = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+                let acc = Style::default().fg(accent()).add_modifier(Modifier::BOLD);
                 let mut spans = vec![
                     Span::styled(format!("{arrow} "), acc),
                     Span::styled(name, acc),
@@ -745,7 +808,7 @@ fn draw_logs_pane(f: &mut Frame, app: &App, area: Rect) {
                     meta.push_str(&format!("  {}", fmt_secs(secs)));
                 }
                 if !meta.is_empty() {
-                    spans.push(Span::styled(meta, Style::default().fg(DIM)));
+                    spans.push(Span::styled(meta, Style::default().fg(dim())));
                 }
                 Line::from(spans)
             } else if !lv.search.is_empty() && lv.is_match(src) {
@@ -755,13 +818,13 @@ fn draw_logs_pane(f: &mut Frame, app: &App, area: Rect) {
             };
             // Cursor gutter + tree connector for lines inside a step.
             let gutter = if row == lv.cursor {
-                Span::styled("▌", Style::default().fg(ACCENT))
+                Span::styled("▌", Style::default().fg(accent()))
             } else {
                 Span::raw(" ")
             };
             let mut spans = vec![gutter, Span::raw(" ")];
             if in_group && !lv.is_header[src] {
-                spans.push(Span::styled("│ ", Style::default().fg(DIM)));
+                spans.push(Span::styled("│ ", Style::default().fg(dim())));
             }
             spans.extend(line.spans);
             Line::from(spans)
@@ -779,7 +842,7 @@ fn draw_logs_pane(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("▏", Style::default().fg(Color::Yellow)),
             Span::styled(
                 format!("  {} matches  (Enter keep · Esc cancel)", lv.matches.len()),
-                Style::default().fg(DIM),
+                Style::default().fg(dim()),
             ),
         ]);
         f.render_widget(Paragraph::new(line), by);
@@ -795,7 +858,7 @@ fn draw_logs_pane(f: &mut Frame, app: &App, area: Rect) {
         let hs = if lv.hscroll > 0 { format!(" · →{}", lv.hscroll) } else { String::new() };
         let bar = format!(" {pos}/{shown} · j/k{folds} · / search{search} · s save{hs} · Esc close ");
         f.render_widget(
-            Paragraph::new(Span::styled(bar, Style::default().fg(DIM))).alignment(Alignment::Right),
+            Paragraph::new(Span::styled(bar, Style::default().fg(dim()))).alignment(Alignment::Right),
             by,
         );
     }
@@ -811,7 +874,7 @@ fn draw_steps_pane(f: &mut Frame, app: &App, area: Rect) {
     let body = Rect { height: inner.height.saturating_sub(1), ..inner };
     if steps.is_empty() {
         f.render_widget(
-            Paragraph::new("Waiting for the job to start…").style(Style::default().fg(DIM)),
+            Paragraph::new("Waiting for the job to start…").style(Style::default().fg(dim())),
             body,
         );
     } else {
@@ -832,7 +895,7 @@ fn draw_steps_pane(f: &mut Frame, app: &App, area: Rect) {
                     Style::default()
                 };
                 let gutter = if i == sv.cursor {
-                    Span::styled("▌", Style::default().fg(ACCENT))
+                    Span::styled("▌", Style::default().fg(accent()))
                 } else {
                     Span::raw(" ")
                 };
@@ -840,7 +903,7 @@ fn draw_steps_pane(f: &mut Frame, app: &App, area: Rect) {
                     gutter,
                     Span::styled(format!(" {icon} "), Style::default().fg(color)),
                     Span::styled(s.name.clone(), name_style),
-                    Span::styled(format!("  {}", step_dur(s)), Style::default().fg(DIM)),
+                    Span::styled(format!("  {}", step_dur(s)), Style::default().fg(dim())),
                 ])
             })
             .collect();
@@ -850,7 +913,7 @@ fn draw_steps_pane(f: &mut Frame, app: &App, area: Rect) {
     let by = Rect { x: inner.x, y: inner.y + inner.height - 1, width: inner.width, height: 1 };
     let bar = " live · full logs load when the job finishes · j/k · Esc close ";
     f.render_widget(
-        Paragraph::new(Span::styled(bar, Style::default().fg(DIM))).alignment(Alignment::Right),
+        Paragraph::new(Span::styled(bar, Style::default().fg(dim()))).alignment(Alignment::Right),
         by,
     );
 }
@@ -862,11 +925,11 @@ fn step_glyph(s: &Step) -> (&'static str, Color) {
         "completed" => match s.conclusion.as_deref() {
             Some("success") => ("●", Color::Green),
             Some("failure") | Some("timed_out") => ("●", Color::Red),
-            Some("cancelled") => ("◌", DIM),
-            Some("skipped") => ("○", DIM),
-            _ => ("·", DIM),
+            Some("cancelled") => ("◌", dim()),
+            Some("skipped") => ("○", dim()),
+            _ => ("·", dim()),
         },
-        _ => ("·", DIM),
+        _ => ("·", dim()),
     }
 }
 
@@ -908,13 +971,13 @@ fn highlight_match(raw: &str, query: &str) -> Line<'static> {
 fn draw_dispatch(f: &mut Frame, app: &App) {
     let Some(d) = &app.dispatch else { return };
     let area = centered(70, 70, f.area());
-    let inner = popup(f, area, &format!("Dispatch · {}", d.repo), ACCENT);
+    let inner = popup(f, area, &format!("Dispatch · {}", d.repo), accent());
 
     match d.stage {
         DispatchStage::SelectWorkflow => {
             if d.workflows.is_empty() {
                 f.render_widget(
-                    Paragraph::new("Loading workflows…").style(Style::default().fg(DIM)),
+                    Paragraph::new("Loading workflows…").style(Style::default().fg(dim())),
                     inner,
                 );
                 return;
@@ -925,20 +988,20 @@ fn draw_dispatch(f: &mut Frame, app: &App) {
                 .map(|w| {
                     let active = w.state == "active";
                     let dot = if active { "●" } else { "○" };
-                    let c = if active { Color::Green } else { DIM };
+                    let c = if active { Color::Green } else { dim() };
                     ListItem::new(Line::from(vec![
                         Span::styled(format!("{dot} "), Style::default().fg(c)),
                         Span::raw(w.name.clone()),
-                        Span::styled(format!("  {}", w.path), Style::default().fg(DIM)),
+                        Span::styled(format!("  {}", w.path), Style::default().fg(dim())),
                     ]))
                 })
                 .collect();
             let list = List::new(items)
-                .highlight_style(Style::default().bg(BG_SEL).add_modifier(Modifier::BOLD))
+                .highlight_style(Style::default().bg(bg_sel()).add_modifier(Modifier::BOLD))
                 .highlight_symbol("▌")
                 .block(Block::default().title(Span::styled(
                     " Pick a workflow · ⏎ next · Esc cancel ",
-                    Style::default().fg(DIM),
+                    Style::default().fg(dim()),
                 )));
             let mut state = d.wf_state.clone();
             f.render_stateful_widget(list, inner, &mut state);
@@ -954,7 +1017,7 @@ fn draw_dispatch_form(f: &mut Frame, d: &crate::app::DispatchState, area: Rect) 
 
     if !d.loaded {
         f.render_widget(
-            Paragraph::new("Loading inputs…").style(Style::default().fg(DIM)),
+            Paragraph::new("Loading inputs…").style(Style::default().fg(dim())),
             area,
         );
         return;
@@ -963,15 +1026,15 @@ fn draw_dispatch_form(f: &mut Frame, d: &crate::app::DispatchState, area: Rect) 
     // Highlight for the focused field's value.
     let val_style = |on: bool| {
         if on {
-            Style::default().fg(Color::Black).bg(ACCENT)
+            Style::default().fg(Color::Black).bg(accent())
         } else {
-            Style::default().fg(Color::White).bg(BG_SEL)
+            Style::default().fg(Color::White).bg(bg_sel())
         }
     };
 
     let mut lines: Vec<Line> = vec![
         Line::from(vec![
-            Span::styled("workflow  ", Style::default().fg(DIM)),
+            Span::styled("workflow  ", Style::default().fg(dim())),
             Span::styled(name.to_string(), Style::default().add_modifier(Modifier::BOLD)),
         ]),
         Line::raw(""),
@@ -979,14 +1042,14 @@ fn draw_dispatch_form(f: &mut Frame, d: &crate::app::DispatchState, area: Rect) 
 
     // Field 0: ref.
     let ref_focused = d.field_idx == 0;
-    let mut ref_label = vec![Span::styled("ref (branch / tag / sha)", Style::default().fg(DIM))];
+    let mut ref_label = vec![Span::styled("ref (branch / tag / sha)", Style::default().fg(dim()))];
     if ref_focused {
-        ref_label.push(Span::styled("  — Space/→ to pick", Style::default().fg(ACCENT)));
+        ref_label.push(Span::styled("  — Space/→ to pick", Style::default().fg(accent())));
     }
     lines.push(Line::from(ref_label));
     lines.push(Line::from(vec![
         Span::styled(format!(" {} ", d.git_ref), val_style(ref_focused)),
-        Span::styled(" ▾", Style::default().fg(if ref_focused { ACCENT } else { DIM })),
+        Span::styled(" ▾", Style::default().fg(if ref_focused { accent() } else { dim() })),
     ]));
     lines.push(Line::raw(""));
 
@@ -996,18 +1059,18 @@ fn draw_dispatch_form(f: &mut Frame, d: &crate::app::DispatchState, area: Rect) 
             Style::default().fg(Color::Red),
         )));
     } else if d.fields.is_empty() {
-        lines.push(Line::from(Span::styled("(no inputs)", Style::default().fg(DIM))));
+        lines.push(Line::from(Span::styled("(no inputs)", Style::default().fg(dim()))));
     } else {
         for (i, field) in d.fields.iter().enumerate() {
             let focused = d.field_idx == i + 1;
-            let mut label = vec![Span::styled(field.name.clone(), Style::default().fg(DIM))];
+            let mut label = vec![Span::styled(field.name.clone(), Style::default().fg(dim()))];
             if field.required {
                 label.push(Span::styled(" *", Style::default().fg(Color::Red)));
             }
             if !field.description.is_empty() {
                 label.push(Span::styled(
                     format!("  — {}", field.description),
-                    Style::default().fg(DIM),
+                    Style::default().fg(dim()),
                 ));
             }
             lines.push(Line::from(label));
@@ -1019,7 +1082,7 @@ fn draw_dispatch_form(f: &mut Frame, d: &crate::app::DispatchState, area: Rect) 
                     let mark = if *b { "[x] true" } else { "[ ] false" };
                     Line::from(vec![
                         Span::styled(format!(" {mark} "), val_style(focused)),
-                        Span::styled("  (Space toggles)", Style::default().fg(DIM)),
+                        Span::styled("  (Space toggles)", Style::default().fg(dim())),
                     ])
                 }
                 FieldKind::Choice { options, idx } => {
@@ -1028,7 +1091,7 @@ fn draw_dispatch_form(f: &mut Frame, d: &crate::app::DispatchState, area: Rect) 
                         Span::styled(format!(" ‹ {cur} › "), val_style(focused)),
                         Span::styled(
                             format!("  ({}/{}, ←/→)", idx + 1, options.len()),
-                            Style::default().fg(DIM),
+                            Style::default().fg(dim()),
                         ),
                     ])
                 }
@@ -1040,7 +1103,7 @@ fn draw_dispatch_form(f: &mut Frame, d: &crate::app::DispatchState, area: Rect) 
 
     lines.push(Line::from(Span::styled(
         "↑/↓ field · type/Space/←→ edit · ⏎ dispatch · Esc back",
-        Style::default().fg(DIM),
+        Style::default().fg(dim()),
     )));
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
@@ -1066,7 +1129,7 @@ fn draw_confirm(f: &mut Frame, app: &App) {
 
 fn kv(k: &str, v: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{k:>8}  "), Style::default().fg(DIM)),
+        Span::styled(format!("{k:>8}  "), Style::default().fg(dim())),
         Span::raw(v.to_string()),
     ])
 }
@@ -1074,7 +1137,7 @@ fn kv(k: &str, v: &str) -> Line<'static> {
 fn hl(s: &str) -> Line<'static> {
     Line::from(Span::styled(
         s.to_string(),
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        Style::default().fg(accent()).add_modifier(Modifier::BOLD),
     ))
 }
 
@@ -1092,9 +1155,9 @@ fn state_glyph(s: RunState) -> (&'static str, Color) {
         RunState::Queued => ("○", Color::Cyan),
         RunState::Success => ("●", Color::Green),
         RunState::Failure => ("●", Color::Red),
-        RunState::Cancelled => ("◌", DIM),
-        RunState::Skipped => ("○", DIM),
-        RunState::Other => ("·", DIM),
+        RunState::Cancelled => ("◌", dim()),
+        RunState::Skipped => ("○", dim()),
+        RunState::Other => ("·", dim()),
     }
 }
 
@@ -1117,11 +1180,11 @@ fn job_glyph(j: &Job) -> (&'static str, Color) {
         "completed" => match j.conclusion.as_deref() {
             Some("success") => ("●", Color::Green),
             Some("failure") | Some("timed_out") => ("●", Color::Red),
-            Some("cancelled") => ("◌", DIM),
-            Some("skipped") => ("○", DIM),
-            _ => ("·", DIM),
+            Some("cancelled") => ("◌", dim()),
+            Some("skipped") => ("○", dim()),
+            _ => ("·", dim()),
         },
-        _ => ("·", DIM),
+        _ => ("·", dim()),
     }
 }
 
@@ -1259,7 +1322,7 @@ fn highlight_log(raw: &str) -> Line<'static> {
         return marker("● ", rest, Color::Cyan, false);
     }
     if let Some(rest) = content.strip_prefix("##[group]") {
-        return marker("▸ ", rest, ACCENT, true);
+        return marker("▸ ", rest, accent(), true);
     }
     if content.starts_with("##[endgroup]") {
         return Line::raw("");
@@ -1268,10 +1331,10 @@ fn highlight_log(raw: &str) -> Line<'static> {
         return marker("$ ", rest, Color::Magenta, false);
     }
     if let Some(rest) = content.strip_prefix("##[debug]") {
-        return marker("", rest, DIM, false);
+        return marker("", rest, dim(), false);
     }
     if let Some(rest) = content.strip_prefix("##[section]") {
-        return marker("", rest, ACCENT, true);
+        return marker("", rest, accent(), true);
     }
 
     // Render embedded ANSI (e.g. colored cargo/clippy/test output) faithfully.

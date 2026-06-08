@@ -30,6 +30,7 @@ toml = "0.8"
 serde_yaml = "0.9"
 base64 = "0.22"
 notify-rust = "4"
+dark-light = "1"
 
 [profile.release]
 lto = "thin"

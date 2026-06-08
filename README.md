@@ -22,6 +22,7 @@ A fast, beautiful terminal UI for viewing and managing **GitHub Actions** across
 - **Aggregated view** of recent workflow runs across the repos you own and your org repos, sorted by latest activity. Each row shows the repo, workflow + run number, branch, trigger event, who triggered it, run **duration** (live-ticking while active), and age.
 - **Live status** with color-coded states: running, queued, failed, success, cancelled, skipped. lazyactions-style panes: the focused pane gets an accent border and a highlighted (inverted) title tab; the unfocused pane dims its border and keeps a dimmed selection so you never lose your place. Popups float on a filled background.
 - **Completion notifications** — a terminal bell plus a desktop toast the moment a watched run flips to success/failure/cancelled, so you can leave it running in the background. Configurable (`notify` / `bell`).
+- **Automatic light/dark theme** — follows your OS appearance setting and switches live when you flip it. Pin it with `theme = "dark"` / `"light"` if you'd rather not auto-detect.
 - **Two-pane navigation** (Runs ⟷ Jobs) with a `Runs › Jobs › Logs` breadcrumb; `Tab` moves focus, `j`/`k` move within the focused pane.
 - **Filter** by status (`1`–`5`) and **fuzzy search** (`/`) across repo, workflow, and branch.
 - **Job detail pane** that auto-loads the selected run's jobs with per-job durations.
@@ -79,6 +80,7 @@ max_repos           = 60  # cap, from most-recently-pushed repos (0 = no cap)
 skip_archived       = true
 notify              = true  # desktop notification when a watched run finishes
 bell                = true  # ring the terminal bell when a watched run finishes
+theme               = "auto"  # "auto" follows the OS light/dark setting; or "dark" / "light"
 
 # Only watch repos whose full name contains one of these (empty = all):
 include = []            # e.g. ["my-org/", "you/important-repo"]
