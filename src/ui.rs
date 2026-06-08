@@ -925,7 +925,7 @@ fn draw_steps_pane(f: &mut Frame, app: &App, area: Rect) {
     }
 
     let by = Rect { x: inner.x, y: inner.y + inner.height - 1, width: inner.width, height: 1 };
-    let bar = " live · full logs load when the job finishes · j/k · Esc close ";
+    let bar = " live · full logs load when the job finishes · j/k · c cancel run · Esc close ";
     f.render_widget(
         Paragraph::new(Span::styled(bar, Style::default().fg(dim()))).alignment(Alignment::Right),
         by,

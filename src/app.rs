@@ -1149,6 +1149,9 @@ impl App {
                 KeyCode::Char('G') | KeyCode::End => {
                     self.steps_view.as_mut().unwrap().cursor = n.saturating_sub(1)
                 }
+                // Cancel the run this job belongs to (GitHub has no per-job
+                // cancel); confirmation returns here, keeping the step view open.
+                KeyCode::Char('c') => self.confirm_cancel(),
                 // Force a text-log fetch (works once the blob exists).
                 KeyCode::Enter | KeyCode::Char('l') => {
                     let sv = self.steps_view.as_ref().unwrap();
@@ -1423,13 +1426,24 @@ impl App {
                         }
                     }
                 }
-                self.mode = Mode::Normal;
+                self.mode = self.overlay_return_mode();
             }
             KeyCode::Char('n') | KeyCode::Esc | KeyCode::Backspace => {
                 self.pending_action = None;
-                self.mode = Mode::Normal;
+                self.mode = self.overlay_return_mode();
             }
             _ => {}
+        }
+    }
+
+    /// Mode to restore after a confirm/overlay closes: back to the logs/steps
+    /// view if one is open (e.g. cancel invoked while watching live steps),
+    /// otherwise the normal two-pane view.
+    fn overlay_return_mode(&self) -> Mode {
+        if self.steps_view.is_some() || self.logs.is_some() {
+            Mode::Logs
+        } else {
+            Mode::Normal
         }
     }
 
