@@ -9,6 +9,9 @@ pub struct Config {
     pub refresh_secs: u64,
     /// Faster refresh interval used while any run is queued or in progress.
     pub active_refresh_secs: u64,
+    /// Tight refresh interval for the one run feeding an open live step view,
+    /// so steps advance near real-time. Clamped to 1–10s.
+    pub live_refresh_secs: u64,
     /// How many recent runs to pull per repo.
     pub runs_per_repo: u32,
     /// Max repos fetched concurrently.
@@ -34,6 +37,7 @@ impl Default for Config {
         Self {
             refresh_secs: 60,
             active_refresh_secs: 15,
+            live_refresh_secs: 2,
             runs_per_repo: 15,
             concurrency: 3,
             max_repos: 60,

@@ -1497,6 +1497,26 @@ impl App {
         }
     }
 
+    /// When the live step view is open on a still-running job, the run whose
+    /// jobs feed it. Used to poll that one run on a tight cadence so steps
+    /// advance near real-time instead of on the slower focused interval.
+    pub fn live_steps_run(&self) -> Option<(String, u64)> {
+        if self.mode != Mode::Logs {
+            return None;
+        }
+        let sv = self.steps_view.as_ref()?;
+        let run_id = self.jobs_run_id?;
+        let running = self.jobs.iter().any(|j| j.id == sv.job_id && j.is_running());
+        running.then(|| (sv.repo.clone(), run_id))
+    }
+
+    /// Queue a jobs fetch for the run feeding the open live step view, if any.
+    pub fn queue_live_steps_refresh(&mut self) {
+        if let Some((repo, run_id)) = self.live_steps_run() {
+            self.pending.push(Command::FetchJobs { repo, run_id });
+        }
+    }
+
     fn queue_selected_jobs(&mut self) {
         if let Some(run) = self.selected_run() {
             self.pending.push(Command::FetchJobs {

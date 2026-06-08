@@ -68,8 +68,12 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, gh: Github, cfg: Config) -
     // poll of just the selected run's jobs while it's active.
     let broad_iv = Duration::from_secs(cfg.refresh_secs.max(15));
     let focused_iv = Duration::from_secs(cfg.active_refresh_secs.clamp(5, cfg.refresh_secs.max(15)));
+    // While the live step view is open on a running job, poll just that one run
+    // on a tight cadence so steps advance near real-time, like the web UI.
+    let live_iv = Duration::from_secs(cfg.live_refresh_secs.clamp(1, 10));
     let mut last_broad = std::time::Instant::now();
     let mut last_focused = std::time::Instant::now();
+    let mut last_live = std::time::Instant::now();
 
     loop {
         terminal.draw(|f| ui::draw(f, &app))?;
@@ -110,6 +114,14 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, gh: Github, cfg: Config) -
                     app.queue_broad_refresh();
                     last_broad = std::time::Instant::now();
                     last_focused = std::time::Instant::now(); // broad already covers jobs
+                    last_live = std::time::Instant::now();
+                } else if !blocked
+                    && app.live_steps_run().is_some()
+                    && last_live.elapsed() >= live_iv.max(floor)
+                {
+                    // Tight poll of the one run feeding the open live step view.
+                    app.queue_live_steps_refresh();
+                    last_live = std::time::Instant::now();
                 } else if !blocked
                     && app.any_run_active()
                     && last_focused.elapsed() >= focused_iv.max(floor)
