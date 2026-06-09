@@ -241,6 +241,30 @@ fn dispatch_commands(app: &mut App, gh: &Github, cfg: &Config, tx: &UnboundedSen
                     }
                 });
             }
+            Command::FetchAnnotations { run_id, jobs } => {
+                let (gh, tx) = (gh.clone(), tx.clone());
+                tokio::spawn(async move {
+                    // Fetch each job's annotations concurrently; a job that errors
+                    // (or has none) just contributes nothing rather than failing all.
+                    let fetches = jobs.into_iter().map(|j| {
+                        let gh = gh.clone();
+                        async move {
+                            gh.annotations(&j.check_run_url)
+                                .await
+                                .unwrap_or_default()
+                                .iter()
+                                .map(|a| app::AnnotationItem::new(j.job_id, &j.job_name, a))
+                                .collect::<Vec<_>>()
+                        }
+                    });
+                    let items = futures::future::join_all(fetches)
+                        .await
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                    let _ = tx.send(DataMsg::Annotations { run_id, items });
+                });
+            }
             Command::FetchWorkflows { repo } => {
                 let (gh, tx) = (gh.clone(), tx.clone());
                 tokio::spawn(async move {

@@ -549,6 +549,16 @@ impl Github {
         Ok(ensure_ok(resp).await?.bytes().await?.to_vec())
     }
 
+    /// Check-run annotations for a job — the file:line errors/warnings GitHub
+    /// distils from a job's output (the red boxes shown on a PR). `check_run_url`
+    /// is the job's own `check_run_url`; the annotations hang off `…/annotations`.
+    pub async fn annotations(&self, check_run_url: &str) -> Result<Vec<Annotation>> {
+        let resp = self
+            .send(self.client.get(format!("{check_run_url}/annotations")))
+            .await?;
+        Ok(ensure_ok(resp).await?.json().await?)
+    }
+
     /// Plain-text logs for a single job (follows the redirect to the log blob).
     pub async fn job_logs(&self, full_name: &str, job_id: u64) -> Result<String> {
         let resp = self
@@ -772,6 +782,9 @@ pub struct Job {
     /// Job page on github.com (may be empty on older API responses).
     #[serde(default)]
     pub html_url: String,
+    /// Check-run API URL for this job; the source of its failure annotations.
+    #[serde(default)]
+    pub check_run_url: String,
     #[serde(default)]
     pub conclusion: Option<String>,
     #[serde(default)]
@@ -830,6 +843,25 @@ pub struct EnvRef {
     pub id: u64,
     #[serde(default)]
     pub name: String,
+}
+
+/// One check-run annotation: a file:line problem (or warning/notice) GitHub
+/// extracted from a job's output.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Annotation {
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub start_line: u64,
+    #[serde(default)]
+    pub end_line: u64,
+    /// "failure" | "warning" | "notice" (absent on some responses).
+    #[serde(default)]
+    pub annotation_level: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -947,6 +979,34 @@ jobs: {}
             parse_dispatch("on:\n  push:\n    branches: [main]\njobs: {}\n"),
             WfDispatch::NotDispatchable
         ));
+    }
+
+    #[test]
+    fn parses_check_run_annotations() {
+        // The shape GitHub returns from `…/check-runs/{id}/annotations`.
+        let json = r#"[
+          {
+            "path": "src/main.rs",
+            "start_line": 42,
+            "end_line": 42,
+            "annotation_level": "failure",
+            "title": "rustc",
+            "message": "error[E0382]: borrow of moved value: `x`"
+          },
+          {
+            "path": ".github/workflows/ci.yml",
+            "start_line": 7,
+            "end_line": 7,
+            "message": "no level field here"
+          }
+        ]"#;
+        let anns: Vec<Annotation> = serde_json::from_str(json).unwrap();
+        assert_eq!(anns.len(), 2);
+        assert_eq!(anns[0].path, "src/main.rs");
+        assert_eq!(anns[0].start_line, 42);
+        assert_eq!(anns[0].annotation_level.as_deref(), Some("failure"));
+        // A missing `annotation_level` deserializes to None (we bucket it as a warning).
+        assert!(anns[1].annotation_level.is_none());
     }
 
     #[test]

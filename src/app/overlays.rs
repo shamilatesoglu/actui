@@ -3,7 +3,7 @@
 //! are plain data plus view-local logic; none reference `App`. The few methods
 //! the `App` reducer / input handlers call are `pub(crate)`.
 
-use crate::github::{Artifact, PendingDeployment, WfInput, WfInputKind, Workflow};
+use crate::github::{Annotation, Artifact, PendingDeployment, WfInput, WfInputKind, Workflow};
 use ratatui::widgets::ListState;
 use std::collections::HashSet;
 
@@ -64,6 +64,115 @@ impl ApprovalView {
             .filter(|&&i| self.can_approve(i))
             .filter_map(|&i| self.items.get(i).map(|p| p.environment.id))
             .collect()
+    }
+}
+
+/// Severity of a check-run annotation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AnnLevel {
+    Failure,
+    Warning,
+    Notice,
+}
+
+impl AnnLevel {
+    fn from_api(level: Option<&str>) -> Self {
+        match level {
+            Some("failure") => AnnLevel::Failure,
+            Some("notice") => AnnLevel::Notice,
+            // GitHub's default bucket (and our fallback for an absent level).
+            _ => AnnLevel::Warning,
+        }
+    }
+    /// Triage order: failures first, then warnings, then notices.
+    pub fn rank(self) -> u8 {
+        match self {
+            AnnLevel::Failure => 0,
+            AnnLevel::Warning => 1,
+            AnnLevel::Notice => 2,
+        }
+    }
+}
+
+/// One annotation flattened for display: which job it came from, where, and what.
+pub struct AnnotationItem {
+    pub job_id: u64,
+    pub job_name: String,
+    pub level: AnnLevel,
+    pub path: String,
+    pub start_line: u64,
+    pub end_line: u64,
+    /// The producing tool/check label, when GitHub provides one (e.g. "rustc").
+    pub title: Option<String>,
+    pub message: String,
+}
+
+impl AnnotationItem {
+    pub fn new(job_id: u64, job_name: &str, a: &Annotation) -> Self {
+        Self {
+            job_id,
+            job_name: job_name.to_string(),
+            level: AnnLevel::from_api(a.annotation_level.as_deref()),
+            path: a.path.clone(),
+            start_line: a.start_line,
+            end_line: a.end_line.max(a.start_line),
+            title: a.title.clone().filter(|t| !t.is_empty()),
+            message: a.message.clone(),
+        }
+    }
+    /// `path:line`, or `path:start-end` when the annotation spans a line range.
+    pub fn location(&self) -> String {
+        if self.end_line > self.start_line {
+            format!("{}:{}-{}", self.path, self.start_line, self.end_line)
+        } else {
+            format!("{}:{}", self.path, self.start_line)
+        }
+    }
+    /// First line of the (possibly multi-line) message — for the compact row and
+    /// as the query when jumping into the logs. Falls back to the title.
+    pub fn summary(&self) -> &str {
+        let first = self.message.lines().next().unwrap_or("").trim();
+        if first.is_empty() {
+            self.title.as_deref().unwrap_or("")
+        } else {
+            first
+        }
+    }
+}
+
+/// Failure-annotations browser for a run (open with `v`).
+pub struct AnnotationsView {
+    pub repo: String,
+    pub run_id: u64,
+    pub items: Vec<AnnotationItem>,
+    pub state: ListState,
+    pub loaded: bool,
+}
+
+impl AnnotationsView {
+    pub fn selected(&self) -> Option<&AnnotationItem> {
+        self.items.get(self.state.selected()?)
+    }
+    /// Annotation counts by severity, for the status bar.
+    pub fn counts(&self) -> (usize, usize, usize) {
+        let (mut f, mut w, mut n) = (0, 0, 0);
+        for it in &self.items {
+            match it.level {
+                AnnLevel::Failure => f += 1,
+                AnnLevel::Warning => w += 1,
+                AnnLevel::Notice => n += 1,
+            }
+        }
+        (f, w, n)
+    }
+    /// Whether the annotations span more than one job (drives showing job tags).
+    pub fn multi_job(&self) -> bool {
+        self.items
+            .iter()
+            .map(|i| i.job_id)
+            .collect::<HashSet<_>>()
+            .len()
+            > 1
     }
 }
 
@@ -204,6 +313,31 @@ mod tests {
         rp.recompute();
         assert_eq!(rp.view.len(), 1);
         assert_eq!(rp.selected_ref().unwrap().name, "release/1.0");
+    }
+
+    #[test]
+    fn annotation_item_classifies_level_and_first_line() {
+        let ann = |level: Option<&str>| Annotation {
+            path: "src/main.rs".into(),
+            start_line: 42,
+            end_line: 44,
+            annotation_level: level.map(String::from),
+            title: Some("rustc".into()),
+            message: "error[E0382]: borrow of moved value\n  extra detail line".into(),
+        };
+        let fail = AnnotationItem::new(7, "build", &ann(Some("failure")));
+        assert!(matches!(fail.level, AnnLevel::Failure));
+        assert_eq!(fail.start_line, 42);
+        // A multi-line span renders as a range; the tool label is kept.
+        assert_eq!(fail.location(), "src/main.rs:42-44");
+        assert_eq!(fail.title.as_deref(), Some("rustc"));
+        // The row/search use only the first line, trimmed.
+        assert_eq!(fail.summary(), "error[E0382]: borrow of moved value");
+        // An absent level buckets as a warning (GitHub's default).
+        assert!(matches!(AnnotationItem::new(7, "x", &ann(None)).level, AnnLevel::Warning));
+        // Triage order: failures sort ahead of warnings ahead of notices.
+        assert!(AnnLevel::Failure.rank() < AnnLevel::Warning.rank());
+        assert!(AnnLevel::Warning.rank() < AnnLevel::Notice.rank());
     }
 
     #[test]

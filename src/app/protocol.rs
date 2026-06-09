@@ -2,8 +2,17 @@
 //! synchronous UI loop. `DataMsg` flows worker → UI (consumed by `App::apply`);
 //! `Command` flows UI → worker (drained by the main loop's `dispatch_commands`).
 
+use super::overlays::AnnotationItem;
 use crate::github::{Artifact, Job, PendingDeployment, Run, WfInput, Workflow};
 use std::collections::HashMap;
+
+/// A job to fetch check-run annotations for: its identity (for display and the
+/// jump-to-log) plus the check-run URL the annotations hang off.
+pub struct AnnJob {
+    pub job_id: u64,
+    pub job_name: String,
+    pub check_run_url: String,
+}
 
 /// Messages flowing from async workers into the UI.
 pub enum DataMsg {
@@ -15,6 +24,8 @@ pub enum DataMsg {
     RepoError { repo: String, err: String },
     Jobs { run_id: u64, jobs: Vec<Job> },
     Logs { job_id: u64, title: String, text: String },
+    /// Flattened check-run annotations for a run's inspected jobs.
+    Annotations { run_id: u64, items: Vec<AnnotationItem> },
     Workflows { repo: String, workflows: Vec<Workflow> },
     WorkflowInputs { repo: String, dispatchable: bool, inputs: Vec<WfInput> },
     Artifacts { run_id: u64, artifacts: Vec<Artifact> },
@@ -32,6 +43,8 @@ pub enum Command {
     Refresh,
     FetchJobs { repo: String, run_id: u64 },
     FetchLogs { repo: String, job_id: u64, title: String },
+    /// Fetch check-run annotations for the given jobs of a run, concurrently.
+    FetchAnnotations { run_id: u64, jobs: Vec<AnnJob> },
     FetchWorkflows { repo: String },
     FetchWorkflowInputs { repo: String, path: String, git_ref: String },
     FetchArtifacts { repo: String, run_id: u64 },

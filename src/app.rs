@@ -10,7 +10,7 @@ mod protocol;
 
 pub use logs::{LogsView, StepsView};
 pub use overlays::*;
-pub use protocol::{Command, DataMsg};
+pub use protocol::{AnnJob, Command, DataMsg};
 pub(crate) use logs::log_content;
 
 use crate::github::{Job, RateLimit, Run, RunState, Step};
@@ -82,6 +82,7 @@ pub enum Mode {
     Errors,
     Artifacts,
     Approval,
+    Annotations,
     RefPicker,
 }
 
@@ -123,6 +124,10 @@ pub struct App {
     pub steps_view: Option<StepsView>,
     pub artifacts: Option<ArtifactsView>,
     pub approval: Option<ApprovalView>,
+    pub annotations: Option<AnnotationsView>,
+    /// When set, the next fetched log opens pre-searched for this text — lets the
+    /// annotations view jump straight to the offending line.
+    pub pending_log_search: Option<String>,
     pub ref_picker: Option<RefPicker>,
     pub pending_action: Option<PendingAction>,
 
@@ -166,6 +171,8 @@ impl App {
             steps_view: None,
             artifacts: None,
             approval: None,
+            annotations: None,
+            pending_log_search: None,
             ref_picker: None,
             pending_action: None,
             force_refresh: false,
@@ -257,10 +264,36 @@ impl App {
                     self.logs_cache.clear();
                 }
                 self.logs_cache.insert(job_id, text.clone());
-                self.logs = Some(LogsView::new(title, &text));
+                let mut lv = LogsView::new(title, &text);
+                // A jump from the annotations view pre-searches the offending line.
+                if let Some(q) = self.pending_log_search.take() {
+                    lv.search = q;
+                    lv.update_search();
+                }
+                self.logs = Some(lv);
                 self.steps_view = None; // text replaces the live step view
                 self.mode = Mode::Logs;
                 self.status_msg = None; // clear the "Fetching logs…" notice
+            }
+            DataMsg::Annotations { run_id, mut items } => {
+                let Some(av) = &mut self.annotations else { return };
+                if av.run_id != run_id {
+                    return;
+                }
+                // Failures first, then group by job and file for a steady order.
+                items.sort_by(|a, b| {
+                    a.level
+                        .rank()
+                        .cmp(&b.level.rank())
+                        .then_with(|| a.job_name.cmp(&b.job_name))
+                        .then_with(|| a.path.cmp(&b.path))
+                        .then_with(|| a.start_line.cmp(&b.start_line))
+                });
+                av.items = items;
+                av.loaded = true;
+                if av.state.selected().is_none() && !av.items.is_empty() {
+                    av.state.select(Some(0));
+                }
             }
             DataMsg::Artifacts { run_id, artifacts } => {
                 if let Some(av) = &mut self.artifacts {
@@ -678,12 +711,17 @@ mod tests {
     }
 
     fn job(id: u64) -> Job {
+        job_full(id, "build", Some("success"))
+    }
+
+    fn job_full(id: u64, name: &str, conclusion: Option<&str>) -> Job {
         Job {
             id,
-            name: "build".into(),
+            name: name.into(),
             status: "completed".into(),
             html_url: String::new(),
-            conclusion: Some("success".into()),
+            check_run_url: format!("https://api.github.com/repos/org/api/check-runs/{id}"),
+            conclusion: conclusion.map(Into::into),
             started_at: None,
             completed_at: None,
             steps: Vec::new(),
@@ -762,6 +800,47 @@ mod tests {
         assert!(app.jobs_cache.contains_key(&1));
         assert!(!app.jobs_cache.contains_key(&2)); // dropped: no longer in runs
         assert!(app.jobs_cache.contains_key(&3));
+    }
+
+    #[test]
+    fn annotation_targets_prefer_failed_jobs_then_fall_back_to_all() {
+        let mut app = App::new();
+        app.runs = vec![run_with(1, "completed", Some("failure"))];
+        app.recompute_view();
+        app.jobs_run_id = Some(1);
+        app.jobs = vec![
+            job_full(10, "build", Some("success")),
+            job_full(11, "test", Some("failure")),
+            job_full(12, "lint", Some("timed_out")),
+        ];
+        // From Runs focus we inspect only the failed/timed-out jobs.
+        let t = app.annotation_targets();
+        let ids: Vec<u64> = t.iter().map(|j| j.job_id).collect();
+        assert_eq!(ids, vec![11, 12]);
+
+        // With no failures, fall back to every completed job (warnings/notices).
+        app.jobs = vec![job_full(20, "build", Some("success"))];
+        let t = app.annotation_targets();
+        assert_eq!(t.iter().map(|j| j.job_id).collect::<Vec<_>>(), vec![20]);
+
+        // A running job has no check-run yet, so it's never a target.
+        app.jobs = vec![Job { status: "in_progress".into(), ..job_full(30, "deploy", None) }];
+        assert!(app.annotation_targets().is_empty());
+    }
+
+    #[test]
+    fn logs_message_applies_pending_search() {
+        let mut app = App::new();
+        app.pending_log_search = Some("boom".into());
+        app.apply(DataMsg::Logs {
+            job_id: 1,
+            title: "t".into(),
+            text: "all good\n2026-01-01T00:00:00.0000000Z ##[error]boom here\n".into(),
+        });
+        let lv = app.logs.expect("a logs view");
+        assert_eq!(lv.search, "boom");
+        assert_eq!(lv.matches.len(), 1, "the pre-search should locate the error line");
+        assert!(app.pending_log_search.is_none(), "the pending search is consumed once");
     }
 
     #[test]

@@ -14,7 +14,7 @@ A fast, beautiful terminal UI for viewing and managing **GitHub Actions** across
                                              ││▌● build        1m12s       │
                                              ││ ● test         48s         │
 ╰─────────────────────────────────────────╯╰────────────────────────────╯
- j/k move · Tab focus · / search · ⏎/o open · l logs · d dispatch · c cancel · x/X rerun · A artifacts · r refresh · ? help · q quit
+ j/k move · Tab focus · / search · ⏎/o open · l logs · d dispatch · c cancel · x/X rerun · v failures · A artifacts · r refresh · ? help · q quit
 ```
 
 ## Features
@@ -31,6 +31,7 @@ A fast, beautiful terminal UI for viewing and managing **GitHub Actions** across
   - syntax-highlighted — GitHub `##[error]`/`##[warning]`/`##[group]` markers and embedded ANSI color
   - **foldable step tree** (`Enter`) — each `##[group]` step folds into a tree node showing its **line count and elapsed time**; error/warning steps auto-expand
   - **in-log search** (`/`, then `n`/`N`) that reveals folded matches
+- **Failure annotations** (`v`) — the fastest path from a red run to its root cause. GitHub already distills each job's output into **check-run annotations** (the `file:line` error/warning boxes you see on a PR); actui aggregates them across the run's failed jobs into one panel, **color-coded** by level (failure / warning / notice) and tagged with the producing tool. Press `⏎` on any annotation to **jump straight into that job's logs, pre-searched** for the offending line — no scrolling through raw output. From the Jobs pane, `v` scopes to the focused job; a run with no failures falls back to surfacing its warnings.
 - **Manage runs** without the browser:
   - `d` — trigger a `workflow_dispatch`: pick the workflow, then fill a **typed form** built from the workflow's declared inputs (text fields, boolean toggles, choice pickers — defaults pre-filled, required fields marked). On the **ref** field, press `Space`/`→` to open a **branch & tag picker** (fuzzy-filterable) instead of typing the ref by hand.
   - `c` — cancel a running run

@@ -5,7 +5,7 @@
 //! `ui` module.
 
 use super::*;
-use crate::app::{App, DispatchStage, RefKind};
+use crate::app::{AnnLevel, App, DispatchStage, RefKind};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -132,6 +132,104 @@ pub(super) fn draw_approval(f: &mut Frame, app: &App) {
     );
 }
 
+pub(super) fn draw_annotations(f: &mut Frame, app: &App) {
+    let Some(av) = &app.annotations else { return };
+    let area = centered(72, 70, f.area());
+    let inner = popup(f, area, &format!("Failures · {}", av.repo), Color::Red);
+
+    if !av.loaded {
+        f.render_widget(
+            Paragraph::new("Scanning jobs for annotations…").style(Style::default().fg(dim())),
+            inner,
+        );
+        return;
+    }
+    if av.items.is_empty() {
+        f.render_widget(
+            Paragraph::new(
+                "No annotations — GitHub surfaced no file-level errors or warnings for these \
+                 jobs.\n\nClose with Esc, then press L to read the full logs instead.",
+            )
+            .style(Style::default().fg(dim()))
+            .wrap(Wrap { trim: true }),
+            inner,
+        );
+        return;
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .split(inner);
+
+    let multi_job = av.multi_job();
+    let avail = rows[0].width.saturating_sub(6) as usize; // border + gutter + indent
+    let items: Vec<ListItem> = av
+        .items
+        .iter()
+        .map(|it| {
+            let (icon, color) = ann_glyph(it.level);
+            // Row 1: ✗ path:line   (dim job tag when more than one job is shown).
+            let mut head = vec![Span::styled(
+                format!("{icon} "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )];
+            if it.path.is_empty() {
+                head.push(Span::styled("(no file)", Style::default().fg(dim())));
+            } else {
+                head.push(Span::styled(it.location(), Style::default().fg(color)));
+            }
+            if let Some(t) = &it.title {
+                head.push(Span::styled(format!("  {t}"), Style::default().fg(dim())));
+            }
+            if multi_job {
+                head.push(Span::styled(
+                    format!("   {}", truncate(&it.job_name, 24)),
+                    Style::default().fg(dim()),
+                ));
+            }
+            let mut lines = vec![Line::from(head)];
+            // Row 2: the message's first line, indented under the file.
+            let msg = it.summary();
+            if !msg.is_empty() {
+                lines.push(Line::from(Span::raw(format!("    {}", truncate(msg, avail)))));
+            }
+            ListItem::new(lines)
+        })
+        .collect();
+
+    let list = List::new(items)
+        .highlight_style(select_style(true))
+        .highlight_symbol("▌");
+    let mut state = av.state.clone();
+    f.render_stateful_widget(list, rows[0], &mut state);
+
+    let (fails, warns, notes) = av.counts();
+    let mut tally = vec![Span::raw(" ")];
+    if fails > 0 {
+        tally.push(Span::styled(format!("{fails} failures  "), Style::default().fg(Color::Red)));
+    }
+    if warns > 0 {
+        tally.push(Span::styled(format!("{warns} warnings  "), Style::default().fg(Color::Yellow)));
+    }
+    if notes > 0 {
+        tally.push(Span::styled(format!("{notes} notices  "), Style::default().fg(Color::Cyan)));
+    }
+    tally.push(Span::styled(
+        "· ⏎ jump to log · o open · j/k · Esc close ",
+        Style::default().fg(dim()),
+    ));
+    f.render_widget(Paragraph::new(Line::from(tally)).alignment(Alignment::Right), rows[1]);
+}
+
+fn ann_glyph(level: AnnLevel) -> (&'static str, Color) {
+    match level {
+        AnnLevel::Failure => ("✗", Color::Red),
+        AnnLevel::Warning => ("▲", Color::Yellow),
+        AnnLevel::Notice => ("●", Color::Cyan),
+    }
+}
+
 pub(super) fn draw_ref_picker(f: &mut Frame, app: &App) {
     let Some(rp) = &app.ref_picker else { return };
     let area = centered(50, 70, f.area());
@@ -235,6 +333,8 @@ pub(super) fn draw_help(f: &mut Frame) {
         help_row("  ↳ env review", "Space pick env · c comment · ⏎ approve · x reject"),
         help_row("  ↳ dispatch ref", "Space / → on the ref field to pick a branch or tag"),
         help_row("A", "browse / download run artifacts"),
+        help_row("v", "failure annotations (file:line) for the run / focused job"),
+        help_row("  ↳ in failures", "⏎ jump to that line in the logs · o open on GitHub"),
         help_row("r / F5", "refresh now (auto-refresh is on)"),
         help_row("E", "show repos that failed to load"),
         Line::raw(""),

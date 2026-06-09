@@ -17,10 +17,19 @@ async fn main() -> anyhow::Result<()> {
     };
     println!("repos: {}", repos.len());
     let mut total_runs = 0;
+    // Remember the first failed run we see, to exercise the annotations path.
+    let mut failed: Option<(String, u64)> = None;
     for r in repos.iter().take(5) {
         match gh.list_runs(&r.full_name, 5).await {
             Ok(github::Cond::Modified(runs)) => {
                 total_runs += runs.len();
+                if failed.is_none() {
+                    if let Some(run) =
+                        runs.iter().find(|run| run.state() == github::RunState::Failure)
+                    {
+                        failed = Some((r.full_name.clone(), run.id));
+                    }
+                }
                 if let Some(run) = runs.first() {
                     println!(
                         "  {} -> {} runs (latest: {} #{} [{:?}])",
@@ -39,5 +48,20 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     println!("sampled runs: {total_runs}");
+
+    // For the first failed run, fetch its jobs' check-run annotations.
+    if let Some((repo, run_id)) = failed {
+        if let Ok(github::Cond::Modified(jobs)) = gh.list_jobs(&repo, run_id).await {
+            println!("annotations for {repo} run {run_id}:");
+            for j in jobs.iter().filter(|j| !j.check_run_url.is_empty()) {
+                match gh.annotations(&j.check_run_url).await {
+                    Ok(anns) => println!("  {} -> {} annotation(s)", j.name, anns.len()),
+                    Err(e) => println!("  {} -> err {e}", j.name),
+                }
+            }
+        }
+    } else {
+        println!("annotations: no failed run in the sample");
+    }
     Ok(())
 }

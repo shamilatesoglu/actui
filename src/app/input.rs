@@ -27,6 +27,7 @@ impl App {
             Mode::Errors => self.mode = Mode::Normal, // any key closes
             Mode::Artifacts => self.key_artifacts(key),
             Mode::Approval => self.key_approval(key),
+            Mode::Annotations => self.key_annotations(key),
             Mode::RefPicker => self.key_ref_picker(key),
         }
     }
@@ -81,6 +82,7 @@ impl App {
             KeyCode::Char('R') => self.confirm_rerun_job(),
             KeyCode::Char('a') => self.confirm_approve(),
             KeyCode::Char('A') => self.open_artifacts(),
+            KeyCode::Char('v') => self.open_annotations(),
             KeyCode::Char('d') => self.open_dispatch(),
             _ => {}
         }
@@ -781,6 +783,157 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Open the failure-annotations view for the selected run (or, when a single
+    /// completed job is focused, just that job). Fetches the check-run
+    /// annotations for the chosen jobs and shows them as file:line problems.
+    fn open_annotations(&mut self) {
+        let Some(run) = self.selected_run() else {
+            self.set_status("Select a run first", true);
+            return;
+        };
+        let (repo, run_id) = (run.repository.full_name.clone(), run.id);
+        let targets = self.annotation_targets();
+        if targets.is_empty() {
+            self.set_status("No completed jobs to inspect for annotations", true);
+            return;
+        }
+        self.annotations = Some(AnnotationsView {
+            repo,
+            run_id,
+            items: Vec::new(),
+            state: ListState::default(),
+            loaded: false,
+        });
+        self.mode = Mode::Annotations;
+        self.pending.push(Command::FetchAnnotations { run_id, jobs: targets });
+    }
+
+    /// Which jobs to fetch annotations for. A single completed job in focus is
+    /// inspected on its own; otherwise we take the run's failed/timed-out jobs
+    /// (the "why did it fail" case), falling back to every completed job so a
+    /// warning-only run still surfaces something. Running jobs have no check-run
+    /// yet and are always skipped.
+    pub(crate) fn annotation_targets(&self) -> Vec<AnnJob> {
+        let mk = |j: &Job| AnnJob {
+            job_id: j.id,
+            job_name: j.name.clone(),
+            check_run_url: j.check_run_url.clone(),
+        };
+        let inspectable = |j: &&Job| !j.is_running() && !j.check_run_url.is_empty();
+
+        if self.focus == Focus::Jobs {
+            if let Some(j) = self.selected_job().filter(|j| inspectable(j)) {
+                return vec![mk(j)];
+            }
+        }
+        let completed: Vec<&Job> = self.jobs.iter().filter(inspectable).collect();
+        let failed: Vec<&Job> = completed
+            .iter()
+            .copied()
+            .filter(|j| matches!(j.conclusion.as_deref(), Some("failure") | Some("timed_out")))
+            .collect();
+        let chosen = if failed.is_empty() { completed } else { failed };
+        chosen.into_iter().map(mk).collect()
+    }
+
+    fn key_annotations(&mut self, key: KeyEvent) {
+        let loaded = self.annotations.as_ref().is_some_and(|a| a.loaded);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace | KeyCode::Left => {
+                self.annotations = None;
+                self.mode = Mode::Normal;
+            }
+            _ if !loaded => {}
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(a) = &mut self.annotations {
+                    list_move(&mut a.state, a.items.len(), 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(a) = &mut self.annotations {
+                    list_move(&mut a.state, a.items.len(), -1);
+                }
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                if let Some(a) = &mut self.annotations {
+                    list_jump(&mut a.state, a.items.len(), true);
+                }
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                if let Some(a) = &mut self.annotations {
+                    list_jump(&mut a.state, a.items.len(), false);
+                }
+            }
+            // Jump into that job's logs, pre-searched for the annotation.
+            KeyCode::Enter | KeyCode::Char('l') => self.jump_to_annotation_log(),
+            KeyCode::Char('o') => self.open_annotation_in_browser(),
+            _ => {}
+        }
+    }
+
+    /// Open the selected annotation's job logs, pre-searched for its message so
+    /// the cursor lands on (or near) the offending line.
+    fn jump_to_annotation_log(&mut self) {
+        let Some(av) = &self.annotations else { return };
+        let Some(item) = av.selected() else { return };
+        let (job_id, job_name, search) =
+            (item.job_id, item.job_name.clone(), item.summary().to_string());
+        let repo = av.repo.clone();
+        self.annotations = None;
+        self.open_logs_with_search(repo, job_id, job_name, search);
+    }
+
+    /// Show a completed job's logs with an initial in-log search applied. Serves
+    /// the cache instantly when present, else fetches (the pending search is
+    /// applied when the text arrives).
+    fn open_logs_with_search(
+        &mut self,
+        repo: String,
+        job_id: u64,
+        job_name: String,
+        search: String,
+    ) {
+        let title = format!("{repo} — {job_name}");
+        if let Some(text) = self.logs_cache.get(&job_id) {
+            let mut lv = LogsView::new(title, text);
+            lv.search = search;
+            lv.update_search();
+            self.logs = Some(lv);
+            self.steps_view = None;
+            self.mode = Mode::Logs;
+            self.status_msg = None;
+        } else {
+            self.pending_log_search = Some(search);
+            self.set_status("Fetching logs…", false);
+            self.pending.push(Command::FetchLogs { repo, job_id, title });
+        }
+    }
+
+    /// Open the github.com page for the selected annotation's job (else the run).
+    fn open_annotation_in_browser(&mut self) {
+        let Some(job_id) = self.annotations.as_ref().and_then(|a| a.selected()).map(|i| i.job_id)
+        else {
+            return;
+        };
+        let run_url = self.selected_run().map(|r| r.html_url.clone());
+        let url = self
+            .jobs
+            .iter()
+            .find(|j| j.id == job_id)
+            .map(|j| {
+                if j.html_url.is_empty() {
+                    run_url.as_ref().map(|u| format!("{u}/job/{job_id}")).unwrap_or_default()
+                } else {
+                    j.html_url.clone()
+                }
+            })
+            .filter(|u| !u.is_empty())
+            .or(run_url);
+        if let Some(url) = url {
+            self.pending.push(Command::OpenUrl(url));
         }
     }
 

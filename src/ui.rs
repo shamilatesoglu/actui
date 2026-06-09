@@ -165,6 +165,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Errors => draw_errors(f, app),
         Mode::Artifacts => draw_artifacts(f, app),
         Mode::Approval => draw_approval(f, app),
+        Mode::Annotations => draw_annotations(f, app),
         Mode::RefPicker => draw_ref_picker(f, app),
         _ => {}
     }
@@ -521,10 +522,16 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 ""
             };
-            format!(" j/k move · ⏎/l jobs · / search · o open · d dispatch · c cancel · x/X rerun{approve} · A artifacts · ? help · q quit")
+            // Offer `v failures` once the selected run has failed.
+            let fails = if app.selected_run().is_some_and(|r| r.state() == RunState::Failure) {
+                " · v failures"
+            } else {
+                ""
+            };
+            format!(" j/k move · ⏎/l jobs · / search · o open · d dispatch · c cancel · x/X rerun{approve}{fails} · A artifacts · ? help · q quit")
         }
         (false, Focus::Jobs) => {
-            " j/k job · ⏎/l logs · R rerun job · A artifacts · ←/Esc back · o open · ? help · q quit".into()
+            " j/k job · ⏎/l logs · R rerun job · v failures · A artifacts · ←/Esc back · o open · ? help · q quit".into()
         }
     };
     f.render_widget(
