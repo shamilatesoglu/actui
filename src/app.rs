@@ -15,6 +15,7 @@ pub(crate) use logs::log_content;
 
 use crate::github::{Job, RateLimit, Run, RunState, Step};
 use chrono::{DateTime, Utc};
+use ratatui::layout::Rect;
 use ratatui::widgets::{ListState, TableState};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -26,6 +27,10 @@ const MAX_LOG_CACHE: usize = 40;
 
 /// How long a transient status message stays on screen.
 const STATUS_TTL: Duration = Duration::from_secs(4);
+
+/// How long the runs selection must rest on a run before its jobs are fetched,
+/// so skimming the list doesn't issue one API request per row passed.
+const JOBS_FETCH_DEBOUNCE: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Filter {
@@ -69,6 +74,20 @@ impl Filter {
 pub enum Focus {
     Runs,
     Jobs,
+}
+
+/// Screen geometry of the interactive regions, recorded while drawing, so
+/// mouse events and page-sized movement resolve against the real layout.
+#[derive(Clone, Copy, Default)]
+pub struct HitMap {
+    /// Filter tabs row.
+    pub tabs: Rect,
+    /// Runs table content (its first row is the column header).
+    pub runs: Rect,
+    /// Jobs list content within the detail pane.
+    pub jobs: Rect,
+    /// Logs viewport height — the page size for PgUp/PgDn.
+    pub logs_h: u16,
 }
 
 #[derive(PartialEq, Eq)]
@@ -135,9 +154,15 @@ pub struct App {
     pub force_refresh: bool,
     pub pending: Vec<Command>,
 
+    /// Layout rects recorded at draw time, for mouse hit-testing and paging.
+    pub hit: HitMap,
+
     /// Last-seen state per run id, to detect active→terminal transitions and
     /// fire a completion notification. Rebuilt each broad sweep.
     run_states: HashMap<u64, RunState>,
+    /// Debounced jobs fetch for the selected run: (selected at, repo, run id).
+    /// Fired by `tick` once the selection has rested for `JOBS_FETCH_DEBOUNCE`.
+    jobs_fetch_due: Option<(Instant, String, u64)>,
 }
 
 impl App {
@@ -177,7 +202,9 @@ impl App {
             pending_action: None,
             force_refresh: false,
             pending: Vec::new(),
+            hit: HitMap::default(),
             run_states: HashMap::new(),
+            jobs_fetch_due: None,
         }
     }
 
@@ -243,7 +270,7 @@ impl App {
                     self.jobs = jobs;
                     self.jobs_run_id = Some(run_id);
                     if self.jobs_state.selected().is_none() && !self.jobs.is_empty() {
-                        self.jobs_state.select(Some(0));
+                        self.jobs_state.select(Some(default_job_idx(&self.jobs)));
                     }
                     // If we're watching a job's live steps and it just finished,
                     // pull the now-available full text logs.
@@ -483,8 +510,12 @@ impl App {
             Some(cached) => {
                 self.jobs = cached.clone();
                 self.jobs_run_id = Some(run_id);
-                if self.jobs_state.selected().is_none() && !self.jobs.is_empty() {
-                    self.jobs_state.select(Some(0));
+                // This is a run switch (guarded above), so reset the selection
+                // rather than keeping the previous run's job index.
+                if self.jobs.is_empty() {
+                    self.jobs_state.select(None);
+                } else {
+                    self.jobs_state.select(Some(default_job_idx(&self.jobs)));
                 }
             }
             None => {
@@ -493,8 +524,17 @@ impl App {
                 self.jobs_run_id = None;
             }
         }
-        // Always refresh (304 keeps the cache; Modified updates it).
-        self.pending.push(Command::FetchJobs { repo, run_id });
+        // Always refresh (304 keeps the cache; Modified updates it) — but
+        // debounced, so skimming the list doesn't fetch every row passed.
+        self.jobs_fetch_due = Some((Instant::now(), repo, run_id));
+    }
+
+    /// Issue the debounced jobs fetch now (the selection settled by intent,
+    /// e.g. the user drilled into the jobs pane or opened logs).
+    pub(crate) fn flush_jobs_fetch(&mut self) {
+        if let Some((_, repo, run_id)) = self.jobs_fetch_due.take() {
+            self.pending.push(Command::FetchJobs { repo, run_id });
+        }
     }
 
     pub fn counts(&self) -> (usize, usize, usize, usize) {
@@ -514,16 +554,30 @@ impl App {
         (running, queued, failed, success)
     }
 
-    pub fn tick(&mut self) {
+    /// Advance time-driven state. Returns true when something visible changed,
+    /// so the main loop can skip redrawing on idle ticks.
+    pub fn tick(&mut self) -> bool {
+        let mut dirty = false;
         if self.loading {
             self.spinner = (self.spinner + 1) % 10;
+            dirty = true;
         }
         // Expire stale status messages so the footer never shows outdated info.
         if let Some((_, _, at)) = &self.status_msg {
             if at.elapsed() >= STATUS_TTL {
                 self.status_msg = None;
+                dirty = true;
             }
         }
+        // Fire the debounced jobs fetch once the selection has settled.
+        if self
+            .jobs_fetch_due
+            .as_ref()
+            .is_some_and(|(at, _, _)| at.elapsed() >= JOBS_FETCH_DEBOUNCE)
+        {
+            self.flush_jobs_fetch();
+        }
+        dirty
     }
 
     // -- polling, refresh queueing & accessors -------------------------------
@@ -607,6 +661,14 @@ impl App {
         let i = self.jobs_state.selected()?;
         self.jobs.get(i)
     }
+}
+
+/// Default jobs-list selection: the first failed/timed-out job when there is
+/// one — it's the reason the user drilled in — else the first job.
+fn default_job_idx(jobs: &[Job]) -> usize {
+    jobs.iter()
+        .position(|j| matches!(j.conclusion.as_deref(), Some("failure") | Some("timed_out")))
+        .unwrap_or(0)
 }
 
 /// Case-insensitive subsequence match: every char of `needle` (already
@@ -760,13 +822,19 @@ mod tests {
 
     #[test]
     fn sync_jobs_serves_cache_on_hit_and_clears_on_miss() {
-        // Hit: a cached run shows its jobs immediately and still queues a refetch.
+        // Hit: a cached run shows its jobs immediately and still queues a
+        // refetch — debounced until the selection settles (or is flushed).
         let mut hit = App::new();
         hit.runs = vec![run_with(1, "in_progress", None)];
         hit.jobs_cache.insert(1, vec![job(10)]);
         hit.recompute_view();
         assert_eq!(hit.jobs.len(), 1);
         assert_eq!(hit.jobs_run_id, Some(1));
+        assert!(
+            !hit.pending.iter().any(|c| matches!(c, Command::FetchJobs { .. })),
+            "the refetch is debounced, not immediate"
+        );
+        hit.flush_jobs_fetch();
         assert!(hit
             .pending
             .iter()
@@ -779,10 +847,43 @@ mod tests {
         assert!(miss.jobs.is_empty());
         assert_eq!(miss.jobs_state.selected(), None);
         assert_eq!(miss.jobs_run_id, None);
+        miss.flush_jobs_fetch();
         assert!(miss
             .pending
             .iter()
             .any(|c| matches!(c, Command::FetchJobs { run_id: 2, .. })));
+
+        // The flush consumes the pending fetch: a second flush is a no-op.
+        let before = miss.pending.len();
+        miss.flush_jobs_fetch();
+        assert_eq!(miss.pending.len(), before);
+    }
+
+    #[test]
+    fn drilling_into_a_failed_run_preselects_the_failed_job() {
+        let mut app = App::new();
+        app.runs = vec![run_with(1, "completed", Some("failure"))];
+        app.jobs_cache.insert(
+            1,
+            vec![
+                job_full(10, "build", Some("success")),
+                job_full(11, "test", Some("failure")),
+                job_full(12, "lint", Some("success")),
+            ],
+        );
+        app.recompute_view();
+        assert_eq!(
+            app.jobs_state.selected(),
+            Some(1),
+            "selection should land on the failed job, not the first"
+        );
+
+        // With nothing failed, the first job is selected as before.
+        let mut ok = App::new();
+        ok.runs = vec![run_with(2, "completed", Some("success"))];
+        ok.jobs_cache.insert(2, vec![job(20), job(21)]);
+        ok.recompute_view();
+        assert_eq!(ok.jobs_state.selected(), Some(0));
     }
 
     #[test]

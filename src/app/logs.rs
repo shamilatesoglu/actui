@@ -41,6 +41,12 @@ pub struct LogsView {
     pub searching: bool,
     pub matches: Vec<usize>, // source-line indices containing the query (sorted)
     pub match_idx: Option<usize>,
+    /// Lowercased `log_content` of every line, built on the first search so
+    /// per-keystroke scans don't lowercase the whole log again.
+    lower: Vec<String>,
+    /// The query `matches` was last computed for (lowercased). When the new
+    /// query extends it, the match set can only narrow — no full rescan.
+    last_needle: String,
 }
 
 /// Strip a leading BOM, trailing CR/LF, and the ISO timestamp prefix.
@@ -136,6 +142,8 @@ impl LogsView {
             searching: false,
             matches: Vec::new(),
             match_idx: None,
+            lower: Vec::new(),
+            last_needle: String::new(),
         };
         v.recompute_visible();
         v
@@ -223,20 +231,26 @@ impl LogsView {
 
     /// Recompute matches for the current query and jump to the nearest one.
     pub fn update_search(&mut self) {
-        self.matches.clear();
         self.match_idx = None;
         if self.search.is_empty() {
+            self.matches.clear();
+            self.last_needle.clear();
             return;
         }
         let q = self.search.to_lowercase();
-        for i in 0..self.lines.len() {
-            if self.is_endgroup[i] {
-                continue;
-            }
-            if log_content(&self.lines[i]).to_lowercase().contains(&q) {
-                self.matches.push(i);
-            }
+        if self.lower.len() != self.lines.len() {
+            self.lower = self.lines.iter().map(|l| log_content(l).to_lowercase()).collect();
         }
+        if !self.last_needle.is_empty() && q.starts_with(&self.last_needle) {
+            // Typing extended the needle: narrow the previous match set.
+            let lower = &self.lower;
+            self.matches.retain(|&i| lower[i].contains(&q));
+        } else {
+            self.matches = (0..self.lines.len())
+                .filter(|&i| !self.is_endgroup[i] && self.lower[i].contains(&q))
+                .collect();
+        }
+        self.last_needle = q;
         // Reveal every group that holds a hit so matches are reachable.
         for &i in &self.matches {
             if let Some(g) = self.line_group[i] {
@@ -270,6 +284,7 @@ impl LogsView {
         self.searching = false;
         self.matches.clear();
         self.match_idx = None;
+        self.last_needle.clear();
     }
 
     pub fn is_match(&self, src: usize) -> bool {
@@ -358,6 +373,22 @@ mod tests {
         let lv = LogsView::new("t".into(), text);
         let s = lv.groups[0].secs.expect("duration");
         assert!((s - 3.0).abs() < 0.01, "expected ~3.0s, got {s}");
+    }
+
+    #[test]
+    fn extending_a_search_narrows_then_shrinking_rescans() {
+        let mut lv = LogsView::new("t".into(), SAMPLE);
+        lv.search = "read".into();
+        lv.update_search();
+        assert_eq!(lv.matches.len(), 2);
+        // Extending the needle narrows the existing match set.
+        lv.search = "readx".into();
+        lv.update_search();
+        assert!(lv.matches.is_empty());
+        // Shrinking it falls back to a full rescan and recovers the matches.
+        lv.search = "read".into();
+        lv.update_search();
+        assert_eq!(lv.matches.len(), 2);
     }
 
     #[test]

@@ -5,8 +5,12 @@
 
 use super::*;
 use crate::github::RunState;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Position;
 use std::collections::{HashMap, HashSet};
+
+/// Rows moved per mouse-wheel notch.
+const WHEEL_STEP: i32 = 3;
 
 impl App {
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -32,6 +36,137 @@ impl App {
         }
     }
 
+    /// Route a mouse event. Returns true when it changed visible state, so the
+    /// main loop can skip redraws for events we ignore (e.g. pointer motion).
+    pub fn handle_mouse(&mut self, m: MouseEvent) -> bool {
+        match m.kind {
+            MouseEventKind::ScrollDown => self.mouse_scroll(WHEEL_STEP, m.column, m.row),
+            MouseEventKind::ScrollUp => self.mouse_scroll(-WHEEL_STEP, m.column, m.row),
+            MouseEventKind::Down(MouseButton::Left) => self.mouse_click(m.column, m.row),
+            _ => false,
+        }
+    }
+
+    fn mouse_scroll(&mut self, delta: i32, x: u16, y: u16) -> bool {
+        match self.mode {
+            Mode::Logs => {
+                if let Some(lv) = &mut self.logs {
+                    lv.move_cursor(delta);
+                } else {
+                    let n = self.steps_view_steps().len();
+                    if let Some(sv) = &mut self.steps_view {
+                        if n > 0 {
+                            sv.cursor = (sv.cursor as i32 + delta).clamp(0, n as i32 - 1) as usize;
+                        }
+                    }
+                }
+                true
+            }
+            Mode::Normal | Mode::Search => {
+                // Scroll the pane under the pointer; elsewhere, the focused one.
+                let pos = Position::new(x, y);
+                if self.hit.jobs.contains(pos) {
+                    self.cycle_job(delta);
+                } else if self.hit.runs.contains(pos) {
+                    self.move_sel(delta);
+                } else {
+                    self.move_focused(delta);
+                }
+                true
+            }
+            Mode::Artifacts => {
+                if let Some(av) = &mut self.artifacts {
+                    list_move(&mut av.state, av.items.len(), delta);
+                }
+                true
+            }
+            Mode::Annotations => {
+                if let Some(av) = &mut self.annotations {
+                    list_move(&mut av.state, av.items.len(), delta);
+                }
+                true
+            }
+            Mode::Approval => {
+                if let Some(av) = &mut self.approval {
+                    list_move(&mut av.state, av.items.len(), delta);
+                }
+                true
+            }
+            Mode::RefPicker => {
+                if let Some(rp) = &mut self.ref_picker {
+                    list_move(&mut rp.state, rp.view.len(), delta);
+                }
+                true
+            }
+            Mode::Dispatch => {
+                if let Some(d) = &mut self.dispatch {
+                    if matches!(d.stage, DispatchStage::SelectWorkflow) {
+                        list_move(&mut d.wf_state, d.workflows.len(), delta);
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn mouse_click(&mut self, x: u16, y: u16) -> bool {
+        match self.mode {
+            // Any-key overlays dismiss on click too.
+            Mode::Help | Mode::Errors => {
+                self.mode = Mode::Normal;
+                true
+            }
+            Mode::Normal | Mode::Search => {
+                let pos = Position::new(x, y);
+                if self.hit.tabs.contains(pos) {
+                    // Map the click to a filter tab by cumulative label width.
+                    let mut x0 = self.hit.tabs.x;
+                    for filt in Filter::ALL {
+                        let w = filt.label().chars().count() as u16 + 2; // " label "
+                        if x < x0 + w {
+                            self.set_filter(filt);
+                            return true;
+                        }
+                        x0 += w;
+                    }
+                    false
+                } else if self.hit.runs.contains(pos) {
+                    self.focus = Focus::Runs;
+                    let row = (y - self.hit.runs.y) as usize;
+                    // Row 0 is the table's column header.
+                    if row >= 1 {
+                        let idx = self.table_state.offset() + row - 1;
+                        if idx < self.view.len() {
+                            self.select_idx(idx);
+                        }
+                    }
+                    true
+                } else if self.hit.jobs.contains(pos) {
+                    let idx = self.jobs_state.offset() + (y - self.hit.jobs.y) as usize;
+                    if idx < self.jobs.len() {
+                        self.focus = Focus::Jobs;
+                        self.jobs_state.select(Some(idx));
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// One page of the focused pane, from the rect recorded at draw time.
+    fn page_focused(&self) -> i32 {
+        let h = match self.focus {
+            Focus::Runs => self.hit.runs.height.saturating_sub(1), // header row
+            Focus::Jobs => self.hit.jobs.height,
+        };
+        (h as i32).max(1)
+    }
+
     fn key_normal(&mut self, key: KeyEvent) {
         self.status_msg = None;
         match key.code {
@@ -39,16 +174,23 @@ impl App {
             // Movement applies to whichever pane is focused.
             KeyCode::Char('j') | KeyCode::Down => self.move_focused(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_focused(-1),
-            KeyCode::PageDown => self.move_focused(10),
-            KeyCode::PageUp => self.move_focused(-10),
+            KeyCode::PageDown => self.move_focused(self.page_focused()),
+            KeyCode::PageUp => self.move_focused(-self.page_focused()),
             KeyCode::Char('g') | KeyCode::Home => self.jump_focused(true),
             KeyCode::Char('G') | KeyCode::End => self.jump_focused(false),
             // Pane focus.
             KeyCode::Tab => self.toggle_focus(),
             KeyCode::BackTab => self.toggle_focus(),
             KeyCode::Right => self.focus_jobs(),
-            KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace | KeyCode::Esc => {
-                self.focus = Focus::Runs
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => self.focus = Focus::Runs,
+            // Esc dismisses progressively: a kept search filter first, then focus.
+            KeyCode::Esc => {
+                if !self.search.is_empty() {
+                    self.search.clear();
+                    self.recompute_view();
+                } else {
+                    self.focus = Focus::Runs;
+                }
             }
             // Filters.
             KeyCode::Char('1') => self.set_filter(Filter::All),
@@ -117,11 +259,14 @@ impl App {
             Focus::Jobs => Focus::Runs,
         };
         if self.focus == Focus::Jobs {
+            self.flush_jobs_fetch();
             self.ensure_job_selected();
         }
     }
 
     fn focus_jobs(&mut self) {
+        // The user wants the jobs now — don't sit out the debounce window.
+        self.flush_jobs_fetch();
         if self.jobs.is_empty() {
             self.set_status("No jobs to focus (still loading?)", true);
             return;
@@ -132,7 +277,7 @@ impl App {
 
     fn ensure_job_selected(&mut self) {
         if self.jobs_state.selected().is_none() && !self.jobs.is_empty() {
-            self.jobs_state.select(Some(0));
+            self.jobs_state.select(Some(default_job_idx(&self.jobs)));
         }
     }
 
@@ -195,6 +340,7 @@ impl App {
             return;
         }
 
+        let page = self.hit.logs_h.max(1) as i32;
         let Some(lv) = &mut self.logs else {
             self.mode = Mode::Normal;
             return;
@@ -231,8 +377,8 @@ impl App {
             }
             KeyCode::Char('j') | KeyCode::Down => lv.move_cursor(1),
             KeyCode::Char('k') | KeyCode::Up => lv.move_cursor(-1),
-            KeyCode::PageDown => lv.move_cursor(20),
-            KeyCode::PageUp => lv.move_cursor(-20),
+            KeyCode::PageDown => lv.move_cursor(page),
+            KeyCode::PageUp => lv.move_cursor(-page),
             KeyCode::Char('g') | KeyCode::Home => lv.cursor_to(true),
             KeyCode::Char('G') | KeyCode::End => lv.cursor_to(false),
             // Horizontal scroll for lines wider than the pane.
@@ -430,21 +576,27 @@ impl App {
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
                 if let Some(a) = self.pending_action.take() {
+                    // Acknowledge immediately; the API result replaces this.
                     match a {
-                        PendingAction::Cancel { repo, run_id, .. } => {
-                            self.pending.push(Command::Cancel { repo, run_id })
+                        PendingAction::Cancel { repo, run_id, label } => {
+                            self.pending.push(Command::Cancel { repo, run_id });
+                            self.set_status(format!("Cancelling {label}…"), false);
                         }
-                        PendingAction::Rerun { repo, run_id, .. } => {
-                            self.pending.push(Command::Rerun { repo, run_id })
+                        PendingAction::Rerun { repo, run_id, label } => {
+                            self.pending.push(Command::Rerun { repo, run_id });
+                            self.set_status(format!("Re-running {label}…"), false);
                         }
-                        PendingAction::RerunFailed { repo, run_id, .. } => {
-                            self.pending.push(Command::RerunFailed { repo, run_id })
+                        PendingAction::RerunFailed { repo, run_id, label } => {
+                            self.pending.push(Command::RerunFailed { repo, run_id });
+                            self.set_status(format!("Re-running failed jobs of {label}…"), false);
                         }
-                        PendingAction::RerunJob { repo, job_id, .. } => {
-                            self.pending.push(Command::RerunJob { repo, job_id })
+                        PendingAction::RerunJob { repo, job_id, label } => {
+                            self.pending.push(Command::RerunJob { repo, job_id });
+                            self.set_status(format!("Re-running job {label}…"), false);
                         }
-                        PendingAction::Approve { repo, run_id, .. } => {
-                            self.pending.push(Command::Approve { repo, run_id })
+                        PendingAction::Approve { repo, run_id, label } => {
+                            self.pending.push(Command::Approve { repo, run_id });
+                            self.set_status(format!("Approving {label}…"), false);
                         }
                     }
                 }
@@ -521,6 +673,7 @@ impl App {
     }
 
     fn open_logs(&mut self) {
+        self.flush_jobs_fetch();
         let Some((job_id, job_name, running)) = self
             .selected_job()
             .map(|j| (j.id, j.name.clone(), j.is_running()))

@@ -303,57 +303,71 @@ pub(super) fn draw_errors(f: &mut Frame, app: &App) {
 }
 
 pub(super) fn draw_help(f: &mut Frame) {
-    let area = centered(60, 70, f.area());
+    // Two columns so the whole reference fits without clipping on short
+    // terminals (a single column runs ~45 rows).
+    let area = centered(86, 80, f.area());
     let inner = popup(f, area, "Help", accent());
-    let body = Text::from(vec![
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(inner);
+
+    let left = Text::from(vec![
         hl("Panes  (two-pane: Runs ⟷ Jobs)"),
         help_row("Tab", "switch focus between Runs and Jobs"),
         help_row("→ / l", "focus Jobs (drill into selected run)"),
-        help_row("← / h / Bksp / Esc", "focus Runs (Bksp/Esc go back anywhere)"),
+        help_row("← / h / Bksp", "focus Runs (Bksp/Esc go back anywhere)"),
+        help_row("Esc", "clear search filter, else focus Runs"),
         help_row("Enter", "Runs: drill to jobs · Jobs: view logs"),
         Line::raw(""),
         hl("Navigation  (acts on the focused pane)"),
         help_row("j / k, ↑ / ↓", "move selection"),
         help_row("g / G", "jump to top / bottom"),
         help_row("PgUp / PgDn", "page up / down"),
+        help_row("mouse", "wheel scroll · click selects / focuses"),
         Line::raw(""),
         hl("Filter & search"),
         help_row("1 - 5", "All / Running / Queued / Failed / Success"),
         help_row("[ / ]", "cycle status filter"),
         help_row("/", "fuzzy search (repo, workflow, branch)"),
         Line::raw(""),
-        hl("Actions"),
-        help_row("Enter / l / L", "view logs of selected job (L works anywhere)"),
-        help_row("o", "open in browser (focused job's page, else the run)"),
-        help_row("d", "dispatch a workflow (workflow_dispatch)"),
-        help_row("c", "cancel the selected run"),
-        help_row("x / X", "re-run failed jobs / re-run all"),
-        help_row("R", "re-run the selected job"),
-        help_row("a", "approve a held run (fork-PR or environment deployment)"),
-        help_row("  ↳ env review", "Space pick env · c comment · ⏎ approve · x reject"),
-        help_row("  ↳ dispatch ref", "Space / → on the ref field to pick a branch or tag"),
-        help_row("A", "browse / download run artifacts"),
-        help_row("v", "failure annotations (file:line) for the run / focused job"),
-        help_row("  ↳ in failures", "⏎ jump to that line in the logs · o open on GitHub"),
-        help_row("r / F5", "refresh now (auto-refresh is on)"),
-        help_row("E", "show repos that failed to load"),
-        Line::raw(""),
-        hl("Notifications"),
-        help_row("(auto)", "bell + desktop toast when a watched run finishes"),
-        Line::raw(""),
         hl("Logs view"),
         help_row("j / k", "move cursor"),
         help_row("← / →", "scroll horizontally"),
-        help_row("Enter / Space", "fold / unfold step at cursor (shows duration)"),
+        help_row("Enter / Space", "fold / unfold step (shows duration)"),
         help_row("e / f", "expand all / fold all steps"),
         help_row("/", "search logs (auto-expands folded hits)"),
         help_row("n / N", "next / previous match"),
         help_row("s", "save the log to a file"),
+    ]);
+
+    let right = Text::from(vec![
+        hl("Actions"),
+        help_row("Enter / l / L", "view logs of selected job (L anywhere)"),
+        help_row("o", "open in browser (job's page, else the run)"),
+        help_row("d", "dispatch a workflow (workflow_dispatch)"),
+        help_row("c", "cancel the selected run"),
+        help_row("x / X", "re-run failed jobs / re-run all"),
+        help_row("R", "re-run the selected job"),
+        help_row("a", "approve a held run (fork-PR / environment)"),
+        help_row("  ↳ env review", "Space pick · c comment · ⏎ ok · x reject"),
+        help_row("  ↳ dispatch ref", "Space / → on the ref field picks a ref"),
+        help_row("A", "browse / download run artifacts"),
+        help_row("v", "failure annotations (file:line)"),
+        help_row("  ↳ in failures", "⏎ jump to log line · o open on GitHub"),
+        help_row("r / F5", "refresh now (auto-refresh is on)"),
+        help_row("E", "show repos that failed to load"),
         Line::raw(""),
+        hl("Notifications"),
+        help_row("(auto)", "bell + toast when a watched run finishes"),
+        Line::raw(""),
+        hl("General"),
         help_row("?", "toggle this help"),
         help_row("q / Ctrl-C", "quit"),
     ]);
-    f.render_widget(Paragraph::new(body), inner);
+
+    f.render_widget(Paragraph::new(left), cols[0]);
+    f.render_widget(Paragraph::new(right), cols[1]);
 }
 
 pub(super) fn draw_dispatch(f: &mut Frame, app: &App) {

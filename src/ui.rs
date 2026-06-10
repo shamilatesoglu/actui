@@ -13,7 +13,8 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Tabs, Wrap,
+    Block, BorderType, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Table, Tabs, Wrap,
 };
 use ratatui::Frame;
 use std::sync::{OnceLock, RwLock};
@@ -142,17 +143,18 @@ fn popup(f: &mut Frame, area: Rect, title: &str, accent: Color) -> Rect {
     inner
 }
 
-pub fn draw(f: &mut Frame, app: &App) {
+pub fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // header
+            Constraint::Length(4), // header: borders + brand row + breadcrumb/status row
             Constraint::Length(1), // tabs
             Constraint::Min(3),    // body
             Constraint::Length(1), // footer
         ])
         .split(f.area());
 
+    app.hit.tabs = chunks[1];
     draw_header(f, app, chunks[0]);
     draw_tabs(f, app, chunks[1]);
     draw_body(f, app, chunks[2]);
@@ -293,7 +295,7 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(tabs, area);
 }
 
-fn draw_body(f: &mut Frame, app: &App, area: Rect) {
+fn draw_body(f: &mut Frame, app: &mut App, area: Rect) {
     // Live steps open as a third pane so the run detail + jobs list stay
     // visible — you keep your place in the jobs list while watching steps.
     if app.mode == Mode::Logs && app.steps_view.is_some() {
@@ -310,23 +312,31 @@ fn draw_body(f: &mut Frame, app: &App, area: Rect) {
         draw_steps_pane(f, app, cols[2]);
         return;
     }
-    // Give the detail pane more room while it's showing logs.
-    let detail = if app.mode == Mode::Logs { 55 } else { 36 };
+    // Text logs take the full width: CI log lines are long, and the runs list
+    // adds nothing while reading one job's output. Esc returns to the panes.
+    if app.mode == Mode::Logs && app.logs.is_some() {
+        draw_logs_pane(f, app, area);
+        return;
+    }
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(100 - detail), Constraint::Percentage(detail)])
+        .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
         .split(area);
     draw_table(f, app, cols[0]);
-    if app.mode == Mode::Logs && app.logs.is_some() {
-        draw_logs_pane(f, app, cols[1]);
-    } else {
-        draw_detail(f, app, cols[1]);
-    }
+    draw_detail(f, app, cols[1]);
 }
 
-fn draw_table(f: &mut Frame, app: &App, area: Rect) {
+fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Runs;
-    let content = pane(f, area, "Runs", focused);
+    // Position indicator in the title, so long lists stay orientable.
+    let title = if app.view.is_empty() {
+        "Runs".to_string()
+    } else {
+        let at = app.table_state.selected().map_or(0, |i| i + 1);
+        format!("Runs {at}/{}", app.view.len())
+    };
+    let content = pane(f, area, &title, focused);
+    app.hit.runs = content;
 
     if app.view.is_empty() {
         let msg = if app.loading {
@@ -343,22 +353,38 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let header = Row::new(vec![
-        Cell::from(""),
-        Cell::from("Repository"),
-        Cell::from("Workflow"),
-        Cell::from("Branch"),
-        Cell::from("Event"),
-        Cell::from("Actor"),
-        Cell::from("Dur"),
-        Cell::from("Age"),
-    ])
-    .style(Style::default().fg(accent()).add_modifier(Modifier::BOLD));
+    // Adaptive columns: drop the lower-value ones as the pane narrows so the
+    // essentials (status, repo, workflow, age) are never pushed off-screen.
+    let wide = content.width >= 100; // event + actor
+    let medium = content.width >= 72; // branch + duration
 
-    let rows = app.view.iter().map(|&i| {
+    let mut head = vec![Cell::from(""), Cell::from("Repository"), Cell::from("Workflow")];
+    let mut widths = vec![Constraint::Length(2), Constraint::Min(14), Constraint::Length(23)];
+    if medium {
+        head.push(Cell::from("Branch"));
+        widths.push(Constraint::Length(16));
+    }
+    if wide {
+        head.push(Cell::from("Event"));
+        head.push(Cell::from("Actor"));
+        widths.push(Constraint::Length(8));
+        widths.push(Constraint::Length(12));
+    }
+    if medium {
+        head.push(Cell::from("Dur"));
+        widths.push(Constraint::Length(8));
+    }
+    head.push(Cell::from("Age"));
+    widths.push(Constraint::Length(6));
+    let header = Row::new(head).style(Style::default().fg(accent()).add_modifier(Modifier::BOLD));
+
+    // Collected (owned), so the table can render against the real
+    // `table_state` — keeping its scroll offset is what lets mouse clicks
+    // map back to rows.
+    let rows: Vec<Row> = app.view.iter().map(|&i| {
         let r = &app.runs[i];
         let (icon, color) = state_glyph(r.state());
-        Row::new(vec![
+        let mut cells = vec![
             Cell::from(Span::styled(icon, Style::default().fg(color))),
             Cell::from(short_repo(&r.repository.full_name)),
             // Workflow name with a dim run number, so #NNN is scannable inline.
@@ -366,27 +392,23 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
                 Span::raw(truncate(r.workflow_name(), 15)),
                 Span::styled(format!("  #{}", r.run_number), Style::default().fg(dim())),
             ])),
-            Cell::from(truncate(r.head_branch.as_deref().unwrap_or("-"), 16)),
-            Cell::from(event_label(&r.event)),
-            Cell::from(truncate(
+        ];
+        if medium {
+            cells.push(Cell::from(truncate(r.head_branch.as_deref().unwrap_or("-"), 16)));
+        }
+        if wide {
+            cells.push(Cell::from(event_label(&r.event)));
+            cells.push(Cell::from(truncate(
                 r.actor.as_ref().map(|a| a.login.as_str()).unwrap_or("-"),
                 12,
-            )),
-            Cell::from(run_dur(r)).style(Style::default().fg(dim())),
-            Cell::from(fmt_age(r.updated_at)).style(Style::default().fg(dim())),
-        ])
-    });
-
-    let widths = [
-        Constraint::Length(2),
-        Constraint::Min(14),
-        Constraint::Length(23),
-        Constraint::Length(16),
-        Constraint::Length(8),
-        Constraint::Length(12),
-        Constraint::Length(8),
-        Constraint::Length(6),
-    ];
+            )));
+        }
+        if medium {
+            cells.push(Cell::from(run_dur(r)).style(Style::default().fg(dim())));
+        }
+        cells.push(Cell::from(fmt_age(r.updated_at)).style(Style::default().fg(dim())));
+        Row::new(cells)
+    }).collect();
 
     // Both panes show their selection; the unfocused one dims it (lazyactions).
     let hl = select_style(focused);
@@ -395,11 +417,22 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
         .row_highlight_style(hl)
         .highlight_symbol(if focused { "▌" } else { " " });
 
-    let mut state = app.table_state.clone();
-    f.render_stateful_widget(table, content, &mut state);
+    f.render_stateful_widget(table, content, &mut app.table_state);
+
+    // Scroll position feedback once the list outgrows the viewport. Rendered
+    // after the table so the offset reflects this frame.
+    let viewport = content.height.saturating_sub(1) as usize; // header row
+    if app.view.len() > viewport {
+        let mut sb = ScrollbarState::new(app.view.len()).position(app.table_state.offset());
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            area.inner(Margin { vertical: 1, horizontal: 0 }),
+            &mut sb,
+        );
+    }
 }
 
-fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
+fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Jobs;
     let inner = pane(f, area, "Detail", focused);
 
@@ -447,7 +480,7 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     draw_jobs(f, app, rows[1]);
 }
 
-fn draw_jobs(f: &mut Frame, app: &App, area: Rect) {
+fn draw_jobs(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Jobs;
     // Divider rule between the run info and the jobs list within the Detail pane.
     let title = if focused { " Jobs · ⏎ logs " } else { " Jobs " };
@@ -457,12 +490,14 @@ fn draw_jobs(f: &mut Frame, app: &App, area: Rect) {
         .title(pane_title(title.trim(), focused));
     let inner = block.inner(area);
     f.render_widget(block, area);
+    app.hit.jobs = inner;
 
     if app.jobs.is_empty() {
-        f.render_widget(
-            Paragraph::new("Loading jobs…").style(Style::default().fg(dim())),
-            inner,
-        );
+        // Distinguish "the run truly has no jobs" from "still fetching".
+        let loaded = app.jobs_run_id.is_some()
+            && app.jobs_run_id == app.selected_run().map(|r| r.id);
+        let msg = if loaded { "No jobs for this run." } else { "Loading jobs…" };
+        f.render_widget(Paragraph::new(msg).style(Style::default().fg(dim())), inner);
         return;
     }
 
@@ -482,8 +517,7 @@ fn draw_jobs(f: &mut Frame, app: &App, area: Rect) {
     let list = List::new(items)
         .highlight_style(select_style(focused))
         .highlight_symbol(if focused { "▌" } else { " " });
-    let mut state = app.jobs_state.clone();
-    f.render_stateful_widget(list, inner, &mut state);
+    f.render_stateful_widget(list, inner, &mut app.jobs_state);
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
@@ -534,6 +568,12 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             " j/k job · ⏎/l logs · R rerun job · v failures · A artifacts · ←/Esc back · o open · ? help · q quit".into()
         }
     };
+    // A kept search filter stays visible (and dismissable) while it's active.
+    let hint = if app.mode != Mode::Logs && !app.search.is_empty() {
+        format!(" /{} · Esc clear ·{hint}", app.search)
+    } else {
+        hint
+    };
     f.render_widget(
         Paragraph::new(Span::styled(hint, Style::default().fg(dim()))),
         area,
@@ -542,13 +582,19 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 
 // -- overlays ---------------------------------------------------------------
 
-fn draw_logs_pane(f: &mut Frame, app: &App, area: Rect) {
-    let Some(lv) = &app.logs else { return };
-    let title = format!("Logs · {}", truncate(&lv.title, area.width.saturating_sub(10) as usize));
+fn draw_logs_pane(f: &mut Frame, app: &mut App, area: Rect) {
+    let title = match &app.logs {
+        Some(lv) => {
+            format!("Logs · {}", truncate(&lv.title, area.width.saturating_sub(10) as usize))
+        }
+        None => return,
+    };
     let inner = pane(f, area, &title, true);
 
     // Reserve the last row for a status indicator.
     let body = Rect { height: inner.height.saturating_sub(1), ..inner };
+    app.hit.logs_h = body.height;
+    let lv = app.logs.as_ref().unwrap();
     let height = body.height as usize;
     let shown = lv.visible.len();
 
@@ -609,6 +655,15 @@ fn draw_logs_pane(f: &mut Frame, app: &App, area: Rect) {
         .collect();
     // Horizontal scroll for lines wider than the pane (Left/Right adjust it).
     f.render_widget(Paragraph::new(text).scroll((0, lv.hscroll)), body);
+
+    if shown > height {
+        let mut sb = ScrollbarState::new(shown).position(scroll);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            area.inner(Margin { vertical: 1, horizontal: 0 }),
+            &mut sb,
+        );
+    }
 
     let by = Rect { x: inner.x, y: inner.y + inner.height - 1, width: inner.width, height: 1 };
     if lv.searching {

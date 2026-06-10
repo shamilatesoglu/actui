@@ -130,6 +130,12 @@ exclude = []            # e.g. ["fork-of-"]
 
 Auto-refresh is always on; `r` / `F5` force an immediate sweep.
 
+**Mouse**
+
+The wheel scrolls whichever pane is under the pointer (runs, jobs, logs, or
+any open picker). Clicking selects a run or job row, switches pane focus,
+and picks a filter tab; a click also dismisses the help and error popups.
+
 ## License
 
 MIT

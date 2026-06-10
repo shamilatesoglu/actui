@@ -9,7 +9,7 @@ use anyhow::Result;
 use app::{App, Command, DataMsg};
 use config::Config;
 use crossterm::event::{Event, EventStream, KeyEventKind};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use github::{Cond, Github, WfDispatch};
 use std::time::Duration;
 use tokio::sync::mpsc::{self, UnboundedSender};
@@ -28,7 +28,10 @@ async fn main() -> Result<()> {
     let gh = Github::new(&token)?;
 
     let mut terminal = ratatui::init();
+    // Mouse: wheel scrolls, click selects rows / panes / filter tabs.
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
     let res = run(&mut terminal, gh, cfg).await;
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
     res
 }
@@ -92,8 +95,12 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, gh: Github, cfg: Config) -
     let auto_theme = cfg.theme != "dark" && cfg.theme != "light";
     let mut last_theme = std::time::Instant::now();
 
+    let mut redraw = true;
     loop {
-        terminal.draw(|f| ui::draw(f, &app))?;
+        if redraw {
+            terminal.draw(|f| ui::draw(f, &mut app))?;
+            redraw = false;
+        }
         if app.should_quit {
             break;
         }
@@ -101,20 +108,22 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, gh: Github, cfg: Config) -
         tokio::select! {
             maybe_ev = events.next() => {
                 match maybe_ev {
-                    Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                        app.handle_key(key);
-                    }
-                    Some(Ok(_)) => {}      // resize/mouse/etc — redraw handles it
+                    Some(Ok(ev)) => redraw |= handle_event(&mut app, ev),
                     Some(Err(_)) | None => break,
                 }
             }
             Some(msg) = rx.recv() => {
                 app.apply(msg);
+                redraw = true;
             }
             _ = tick.tick() => {
-                app.tick(); // animates spinner while loading, expires stale status
+                // Animates the spinner while loading, expires stale status;
+                // idle ticks don't redraw.
+                redraw |= app.tick();
             }
             _ = sched.tick() => {
+                // The once-a-second redraw also keeps ages/durations current.
+                redraw = true;
                 // Follow the system light/dark setting while running (auto mode).
                 // Detection can block (dbus on Linux), so keep it off the UI loop.
                 if auto_theme && last_theme.elapsed() >= Duration::from_secs(3) {
@@ -166,6 +175,29 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, gh: Github, cfg: Config) -
             }
         }
 
+        // Coalesce whatever else is already ready into this same frame: a
+        // burst of per-repo results or auto-repeated keys becomes one redraw
+        // instead of one per item. Bounded so a flood can't starve rendering.
+        for _ in 0..256 {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    app.apply(msg);
+                    redraw = true;
+                }
+                Err(_) => break,
+            }
+        }
+        for _ in 0..64 {
+            match events.next().now_or_never() {
+                Some(Some(Ok(ev))) => redraw |= handle_event(&mut app, ev),
+                Some(Some(Err(_)) | None) => {
+                    app.should_quit = true;
+                    break;
+                }
+                None => break,
+            }
+        }
+
         // Manual refresh (r / F5): immediate broad sweep, unless backing off.
         if std::mem::take(&mut app.force_refresh) {
             if let Some(d) = gh.pause_remaining() {
@@ -180,6 +212,20 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, gh: Github, cfg: Config) -
         dispatch_commands(&mut app, &gh, &cfg, &tx);
     }
     Ok(())
+}
+
+/// Apply one terminal event. Returns true when it changed visible state and
+/// the frame needs a redraw (pointer motion, key releases etc. don't).
+fn handle_event(app: &mut App, ev: Event) -> bool {
+    match ev {
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            app.handle_key(key);
+            true
+        }
+        Event::Mouse(m) => app.handle_mouse(m),
+        Event::Resize(_, _) => true,
+        _ => false,
+    }
 }
 
 /// Spawn a fire-and-forget mutation and report its outcome to the UI: a fixed
