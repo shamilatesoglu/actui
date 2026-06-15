@@ -4,7 +4,7 @@
 
 mod overlays;
 
-use crate::app::{log_content, App, Filter, Focus, Mode};
+use crate::app::{is_error_line, log_content, App, Filter, Focus, Mode, RunnerRow, RunnerStatus};
 use crate::github::{Job, Run, RunState, Step};
 use ansi_to_tui::IntoText;
 use chrono::{DateTime, Utc};
@@ -296,6 +296,11 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_body(f: &mut Frame, app: &mut App, area: Rect) {
+    // The org-runners view takes over the body as its own dedicated pane.
+    if app.mode == Mode::Runners {
+        draw_runners_pane(f, app, area);
+        return;
+    }
     // Live steps open as a third pane so the run detail + jobs list stay
     // visible — you keep your place in the jobs list while watching steps.
     if app.mode == Mode::Logs && app.steps_view.is_some() {
@@ -501,6 +506,15 @@ fn draw_jobs(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    let jobs_len = app.jobs.len();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(jobs_len.min(6).max(3) as u16),
+            Constraint::Min(3),
+        ])
+        .split(inner);
+
     let items: Vec<ListItem> = app
         .jobs
         .iter()
@@ -517,7 +531,292 @@ fn draw_jobs(f: &mut Frame, app: &mut App, area: Rect) {
     let list = List::new(items)
         .highlight_style(select_style(focused))
         .highlight_symbol(if focused { "▌" } else { " " });
-    f.render_stateful_widget(list, inner, &mut app.jobs_state);
+    f.render_stateful_widget(list, chunks[0], &mut app.jobs_state);
+
+    // Title + body track the selected job: a failing log is titled "Error
+    // Previews · N" and lists every spot an error/fail line appears, so the pane
+    // never claims "Log Preview" while showing errors.
+    let mut title = " Log Preview ".to_string();
+    let mut title_style = Style::default().fg(dim());
+    let mut body: Vec<Line> = Vec::new();
+    let mut body_msg: Option<&str> = None;
+
+    if let Some(j) = app.selected_job() {
+        if j.is_running() {
+            body_msg = Some("Job is running (live steps are active).");
+        } else if let Some(text) = app.logs_cache.get(&j.id) {
+            let (lines, errors) = get_error_preview_lines(text, j.conclusion.as_deref());
+            if errors > 0 {
+                title = format!(" Error Previews · {errors} ");
+                title_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+            }
+            body = lines;
+        } else {
+            body_msg = Some("Loading preview…");
+        }
+    }
+
+    let preview_block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(dim()))
+        .title(Span::styled(title, title_style));
+    let preview_inner = preview_block.inner(chunks[1]);
+    f.render_widget(preview_block, chunks[1]);
+
+    if let Some(msg) = body_msg {
+        f.render_widget(
+            Paragraph::new(msg).style(Style::default().fg(dim())).wrap(Wrap { trim: true }),
+            preview_inner,
+        );
+    } else {
+        f.render_widget(Paragraph::new(body).wrap(Wrap { trim: true }), preview_inner);
+    }
+}
+
+/// Build the job-log preview lines, returning them alongside the count of
+/// error/fail lines found (0 → a clean log, so the caller keeps the plain
+/// "Log Preview" title).
+fn get_error_preview_lines(log_text: &str, conclusion: Option<&str>) -> (Vec<Line<'static>>, usize) {
+    let lines: Vec<&str> = log_text.lines().collect();
+    let n = lines.len();
+    let mut should_include = vec![false; n];
+    let mut error_count = 0usize;
+
+    for (idx, line) in lines.iter().enumerate() {
+        let content = log_content(line);
+        if is_error_line(content) {
+            error_count += 1;
+            let start = idx.saturating_sub(3);
+            let end = (idx + 3).min(n.saturating_sub(1));
+            for j in start..=end {
+                should_include[j] = true;
+            }
+        }
+    }
+
+    if error_count == 0 {
+        if matches!(conclusion, Some("failure") | Some("timed_out")) {
+            let start = n.saturating_sub(15);
+            let mut preview = vec![Line::from(vec![
+                Span::styled("No error/fail lines found. Showing end of log:", Style::default().fg(dim()))
+            ])];
+            for i in start..n {
+                let line_num_str = format!("{:>4} │ ", i + 1);
+                let highlighted = highlight_log(lines[i]);
+                let mut spans = vec![Span::styled(line_num_str, Style::default().fg(dim()))];
+                spans.extend(highlighted.spans);
+                preview.push(Line::from(spans));
+            }
+            return (preview, 0);
+        } else {
+            return (
+                vec![Line::from(vec![Span::styled(
+                    "Job completed successfully (no error/fail lines found).",
+                    Style::default().fg(dim()),
+                )])],
+                0,
+            );
+        }
+    }
+
+    let mut preview = Vec::new();
+    let mut in_gap = false;
+
+    for i in 0..n {
+        if should_include[i] {
+            if in_gap {
+                preview.push(Line::from(vec![
+                    Span::styled("  ...", Style::default().fg(dim()))
+                ]));
+                in_gap = false;
+            }
+            let line_num_str = format!("{:>4} │ ", i + 1);
+            let highlighted = highlight_log(lines[i]);
+            let mut spans = vec![Span::styled(line_num_str, Style::default().fg(dim()))];
+            spans.extend(highlighted.spans);
+            preview.push(Line::from(spans));
+        } else {
+            if !preview.is_empty() {
+                in_gap = true;
+            }
+        }
+    }
+
+    (preview, error_count)
+}
+
+/// The org self-hosted runners view: a dedicated, full-width body pane with a
+/// selectable list of runners grouped by org, and a tally on the last row.
+fn draw_runners_pane(f: &mut Frame, app: &mut App, area: Rect) {
+    let inner = pane(f, area, "Org runners", true);
+    let Some(rv) = &app.runners else {
+        app.hit.runners_pane = inner;
+        return;
+    };
+
+    // Reserve the last row for the status tally.
+    let body = Rect { height: inner.height.saturating_sub(1), ..inner };
+
+    if !rv.loaded {
+        app.hit.runners_pane = body;
+        f.render_widget(
+            Paragraph::new("Discovering organizations & runners…").style(Style::default().fg(dim())),
+            body,
+        );
+        return;
+    }
+    if rv.rows.is_empty() {
+        app.hit.runners_pane = body;
+        f.render_widget(
+            Paragraph::new(
+                "No organizations found.\n\nYou're not a member of an org, or the token can't \
+                 read your org memberships.",
+            )
+            .style(Style::default().fg(dim()))
+            .wrap(Wrap { trim: true }),
+            body,
+        );
+        return;
+    }
+
+    // With the detail pane open, split the body: list on the left, the selected
+    // runner's details on the right.
+    let detail_open = rv.detail_open && rv.selected_runner().is_some();
+    let (list_area, detail_area) = if detail_open {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .split(body);
+        (cols[0], Some(cols[1]))
+    } else {
+        (body, None)
+    };
+    app.hit.runners_pane = list_area;
+
+    let items: Vec<ListItem> = rv.rows.iter().map(runner_row_item).collect();
+    let list = List::new(items)
+        .highlight_style(select_style(true))
+        .highlight_symbol("▌");
+    let mut state = rv.state.clone();
+    f.render_stateful_widget(list, list_area, &mut state);
+
+    if rv.rows.len() > list_area.height as usize {
+        let mut sb = ScrollbarState::new(rv.rows.len()).position(state.offset());
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            list_area,
+            &mut sb,
+        );
+    }
+
+    if let Some(da) = detail_area {
+        draw_runner_detail(f, rv, da);
+    }
+
+    let by = Rect { x: inner.x, y: inner.y + inner.height - 1, width: inner.width, height: 1 };
+    let (online, offline, busy) = rv.totals();
+    let mut tally = vec![
+        Span::raw(" "),
+        Span::styled(format!("{online} online  "), Style::default().fg(Color::Green)),
+    ];
+    if busy > 0 {
+        tally.push(Span::styled(format!("{busy} busy  "), Style::default().fg(Color::Yellow)));
+    }
+    tally.push(Span::styled(format!("{offline} offline  "), Style::default().fg(dim())));
+    tally.push(Span::styled(
+        "· j/k move · ⏎ details · o open · r refresh · Esc back ",
+        Style::default().fg(dim()),
+    ));
+    f.render_widget(Paragraph::new(Line::from(tally)).alignment(Alignment::Right), by);
+}
+
+/// Detail side pane for the selected runner: its identity, live status, OS, and
+/// the full label set (which the list row truncates).
+fn draw_runner_detail(f: &mut Frame, rv: &crate::app::RunnersView, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(dim()))
+        .title(pane_title("Runner", true));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let Some(RunnerRow::Runner { name, status, os, labels }) = rv.selected_runner() else {
+        return;
+    };
+    let (glyph, gcolor, state_text, scolor) = match status {
+        RunnerStatus::Busy => ("●", Color::Yellow, "online · busy", Color::Yellow),
+        RunnerStatus::Online => ("●", Color::Green, "online · idle", Color::Green),
+        RunnerStatus::Offline => ("○", dim(), "offline", dim()),
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(format!("{glyph} "), Style::default().fg(gcolor).add_modifier(Modifier::BOLD)),
+            Span::styled(name.clone(), Style::default().add_modifier(Modifier::BOLD)),
+        ]),
+        Line::raw(""),
+        kv("org", rv.selected_org().unwrap_or("-")),
+        Line::from(vec![
+            Span::styled(format!("{:>8}  ", "status"), Style::default().fg(dim())),
+            Span::styled(state_text, Style::default().fg(scolor)),
+        ]),
+        kv("os", if os.is_empty() { "-" } else { os }),
+        Line::raw(""),
+        Line::from(Span::styled(
+            format!("  labels ({})", labels.len()),
+            Style::default().fg(dim()),
+        )),
+    ];
+    if labels.is_empty() {
+        lines.push(Line::from(Span::styled("  (none)", Style::default().fg(dim()))));
+    } else {
+        for l in labels {
+            lines.push(Line::from(vec![
+                Span::styled("  • ", Style::default().fg(accent())),
+                Span::raw(l.clone()),
+            ]));
+        }
+    }
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+}
+
+fn runner_row_item(row: &RunnerRow) -> ListItem<'static> {
+    match row {
+        RunnerRow::Note(text) => {
+            ListItem::new(Line::from(Span::styled(text.clone(), Style::default().fg(Color::Yellow))))
+        }
+        RunnerRow::Header { org, detail, detail_err } => {
+            let acc = Style::default().fg(accent()).add_modifier(Modifier::BOLD);
+            let dc = if *detail_err { Color::Red } else { dim() };
+            ListItem::new(Line::from(vec![
+                Span::styled("▸ ", acc),
+                Span::styled(org.clone(), acc),
+                Span::styled(format!("  {}", truncate(detail, 60)), Style::default().fg(dc)),
+            ]))
+        }
+        RunnerRow::Runner { name, status, os, labels } => {
+            let (icon, color, label, label_c) = match status {
+                RunnerStatus::Busy => ("●", Color::Yellow, "busy", Color::Yellow),
+                RunnerStatus::Online => ("●", Color::Green, "idle", Color::Green),
+                RunnerStatus::Offline => ("○", dim(), "offline", dim()),
+            };
+            let mut spans = vec![
+                Span::raw("  "),
+                Span::styled(format!("{icon} "), Style::default().fg(color)),
+                Span::raw(truncate(name, 28)),
+                Span::styled(format!("  {label}"), Style::default().fg(label_c)),
+            ];
+            if !os.is_empty() {
+                spans.push(Span::styled(format!("  {os}"), Style::default().fg(dim())));
+            }
+            if !labels.is_empty() {
+                spans.push(Span::styled(
+                    format!("  [{}]", labels.join(", ")),
+                    Style::default().fg(dim()),
+                ));
+            }
+            ListItem::new(Line::from(spans))
+        }
+    }
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
@@ -542,13 +841,22 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(Paragraph::new(Span::styled(format!(" {msg}"), style)), area);
         return;
     }
+    if app.mode == Mode::Runners {
+        let hint = " org self-hosted runners · j/k move · ⏎ details · o open on GitHub · r refresh · Esc back";
+        f.render_widget(Paragraph::new(Span::styled(hint, Style::default().fg(dim()))), area);
+        return;
+    }
     if app.mode == Mode::Logs && app.steps_view.is_some() {
         let hint = " live steps · updates automatically · ⏎ try logs · j/k move · Esc close";
         f.render_widget(Paragraph::new(Span::styled(hint, Style::default().fg(dim()))), area);
         return;
     }
     let hint: String = match (app.mode == Mode::Logs, app.focus) {
-        (true, _) => " j/k move · ←/→ scroll · ⏎ fold · e/f all · / search · n/N · s save · Esc close".into(),
+        (true, _) => {
+            let preview_only = app.logs.as_ref().map_or(false, |lv| lv.preview_only);
+            let mode_str = if preview_only { " [errors]" } else { "" };
+            format!(" j/k move · ←/→ scroll · ⏎ fold · e/f all · p preview{mode_str} · / search · n/N · s save · Esc close")
+        }
         (false, Focus::Runs) => {
             // Only advertise `a approve` when the selected run is actually held.
             let approve = if app.selected_run().is_some_and(|r| r.needs_approval()) {
@@ -562,10 +870,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 ""
             };
-            format!(" j/k move · ⏎/l jobs · / search · o open · d dispatch · c cancel · x/X rerun{approve}{fails} · A artifacts · ? help · q quit")
+            format!(" j/k move · ⏎/l jobs · / search · o open · d dispatch · c cancel · x/X rerun{approve}{fails} · A artifacts · s runners · ? help · q quit")
         }
         (false, Focus::Jobs) => {
-            " j/k job · ⏎/l logs · R rerun job · v failures · A artifacts · ←/Esc back · o open · ? help · q quit".into()
+            " j/k job · ⏎/l logs · R rerun job · v failures · A artifacts · s runners · ←/Esc back · o open · ? help · q quit".into()
         }
     };
     // A kept search filter stays visible (and dismissable) while it's active.
@@ -608,6 +916,18 @@ fn draw_logs_pane(f: &mut Frame, app: &mut App, area: Rect) {
         .skip(scroll)
         .take(height)
         .map(|(row, &src)| {
+            if src == usize::MAX {
+                let gutter = if row == lv.cursor {
+                    Span::styled("▌", Style::default().fg(accent()))
+                } else {
+                    Span::raw(" ")
+                };
+                return Line::from(vec![
+                    gutter,
+                    Span::raw(" "),
+                    Span::styled("  ...", Style::default().fg(dim())),
+                ]);
+            }
             let in_group = lv.line_group[src].is_some();
             let line = if lv.is_header[src] {
                 // Step node: ▸/▾ arrow, name, line count + duration.
@@ -686,9 +1006,10 @@ fn draw_logs_pane(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             String::new()
         };
-        let folds = if lv.has_groups() { " · ⏎ fold · e/f all" } else { "" };
+        let folds = if lv.has_groups() && !lv.preview_only { " · ⏎ fold · e/f all" } else { "" };
+        let preview_mode = if lv.preview_only { " [errors preview]" } else { "" };
         let hs = if lv.hscroll > 0 { format!(" · →{}", lv.hscroll) } else { String::new() };
-        let bar = format!(" {pos}/{shown} · j/k{folds} · / search{search} · s save{hs} · Esc close ");
+        let bar = format!(" {pos}/{shown}{preview_mode} · j/k{folds} · p preview · / search{search} · s save{hs} · Esc close ");
         f.render_widget(
             Paragraph::new(Span::styled(bar, Style::default().fg(dim()))).alignment(Alignment::Right),
             by,

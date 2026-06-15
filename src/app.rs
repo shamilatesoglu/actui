@@ -11,9 +11,9 @@ mod protocol;
 pub use logs::{LogsView, StepsView};
 pub use overlays::*;
 pub use protocol::{AnnJob, Command, DataMsg};
-pub(crate) use logs::log_content;
+pub(crate) use logs::{is_error_line, log_content};
 
-use crate::github::{Job, RateLimit, Run, RunState, Step};
+use crate::github::{Actor, Job, RateLimit, Run, RunRepo, RunState, Step};
 use chrono::{DateTime, Utc};
 use ratatui::layout::Rect;
 use ratatui::widgets::{ListState, TableState};
@@ -86,11 +86,13 @@ pub struct HitMap {
     pub runs: Rect,
     /// Jobs list content within the detail pane.
     pub jobs: Rect,
+    /// Org-runners pane content (for click-to-select).
+    pub runners_pane: Rect,
     /// Logs viewport height — the page size for PgUp/PgDn.
     pub logs_h: u16,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
     Search,
@@ -103,6 +105,7 @@ pub enum Mode {
     Approval,
     Annotations,
     RefPicker,
+    Runners,
 }
 
 pub struct App {
@@ -148,7 +151,12 @@ pub struct App {
     /// annotations view jump straight to the offending line.
     pub pending_log_search: Option<String>,
     pub ref_picker: Option<RefPicker>,
+    pub runners: Option<RunnersView>,
     pub pending_action: Option<PendingAction>,
+    pub pending_open_log_id: Option<u64>,
+    /// Debounced log fetch for the selected job (for preview): (selected at, job_id)
+    pub logs_fetch_due: Option<(Instant, u64)>,
+    pub last_selected_job_id: Option<u64>,
 
     /// Set by the refresh key; consumed by the main loop.
     pub force_refresh: bool,
@@ -163,6 +171,13 @@ pub struct App {
     /// Debounced jobs fetch for the selected run: (selected at, repo, run id).
     /// Fired by `tick` once the selection has rested for `JOBS_FETCH_DEBOUNCE`.
     jobs_fetch_due: Option<(Instant, String, u64)>,
+
+    /// Optimistic placeholder runs for freshly-dispatched workflows, shown until
+    /// GitHub registers the real run (or the dispatch fails / the placeholder
+    /// ages out). Re-injected into `runs` each refresh until reconciled away.
+    pending_dispatches: Vec<Run>,
+    /// Source of the synthetic, never-colliding ids given to placeholders.
+    next_placeholder_id: u64,
 }
 
 impl App {
@@ -199,12 +214,18 @@ impl App {
             annotations: None,
             pending_log_search: None,
             ref_picker: None,
+            runners: None,
             pending_action: None,
+            pending_open_log_id: None,
+            logs_fetch_due: None,
+            last_selected_job_id: None,
             force_refresh: false,
             pending: Vec::new(),
             hit: HitMap::default(),
             run_states: HashMap::new(),
             jobs_fetch_due: None,
+            pending_dispatches: Vec::new(),
+            next_placeholder_id: 0,
         }
     }
 
@@ -245,6 +266,7 @@ impl App {
                 // Replace any existing runs for this repo with the fresh set.
                 self.runs.retain(|r| r.repository.full_name != repo);
                 self.runs.extend(runs);
+                self.reconcile_pending_dispatches(&repo);
                 self.resort();
                 self.recompute_view();
                 if self.repos_done >= self.repos_total {
@@ -291,16 +313,26 @@ impl App {
                     self.logs_cache.clear();
                 }
                 self.logs_cache.insert(job_id, text.clone());
-                let mut lv = LogsView::new(title, &text);
-                // A jump from the annotations view pre-searches the offending line.
-                if let Some(q) = self.pending_log_search.take() {
-                    lv.search = q;
-                    lv.update_search();
+
+                if self.pending_open_log_id == Some(job_id) {
+                    self.pending_open_log_id = None;
+                    let mut lv = LogsView::new(title, &text);
+                    let failed = self.selected_job().is_some_and(|j| j.id == job_id && matches!(j.conclusion.as_deref(), Some("failure") | Some("timed_out")));
+                    if failed {
+                        lv.preview_only = true;
+                    }
+                    // A jump from the annotations view pre-searches the offending line.
+                    if let Some(q) = self.pending_log_search.take() {
+                        lv.search = q;
+                        lv.update_search();
+                    } else if failed {
+                        lv.recompute_visible();
+                    }
+                    self.logs = Some(lv);
+                    self.steps_view = None; // text replaces the live step view
+                    self.mode = Mode::Logs;
+                    self.status_msg = None; // clear the "Fetching logs…" notice
                 }
-                self.logs = Some(lv);
-                self.steps_view = None; // text replaces the live step view
-                self.mode = Mode::Logs;
-                self.status_msg = None; // clear the "Fetching logs…" notice
             }
             DataMsg::Annotations { run_id, mut items } => {
                 let Some(av) = &mut self.annotations else { return };
@@ -399,6 +431,17 @@ impl App {
                     }
                 }
             }
+            DataMsg::Runners { groups } => {
+                if let Some(rv) = &mut self.runners {
+                    rv.set_groups(groups);
+                }
+            }
+            DataMsg::DispatchFailed { placeholder_id, err } => {
+                self.pending_dispatches.retain(|p| p.id != placeholder_id);
+                self.runs.retain(|r| r.id != placeholder_id);
+                self.recompute_view();
+                self.set_status(err, true);
+            }
             DataMsg::Action(m) => self.set_status(m, false),
             DataMsg::Error(e) => self.set_status(e, true),
             DataMsg::RefreshDone => self.finish_refresh(),
@@ -460,6 +503,74 @@ impl App {
 
     fn resort(&mut self) {
         self.runs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    }
+
+    /// Insert an optimistic placeholder run for a just-submitted dispatch so the
+    /// TUI shows it as active immediately, before GitHub registers the real run.
+    /// Returns the placeholder id, which the `Dispatch` command carries back so a
+    /// failed dispatch can remove it.
+    pub(crate) fn push_dispatch_placeholder(
+        &mut self,
+        repo: &str,
+        workflow_name: &str,
+        git_ref: &str,
+    ) -> u64 {
+        self.next_placeholder_id += 1;
+        let id = self.next_placeholder_id;
+        let now = Utc::now();
+        let run = Run {
+            id,
+            name: Some(workflow_name.to_string()),
+            display_title: "manual dispatch".to_string(),
+            head_branch: Some(git_ref.to_string()),
+            run_number: 0,
+            event: "workflow_dispatch".to_string(),
+            status: "in_progress".to_string(),
+            conclusion: None,
+            html_url: String::new(),
+            created_at: now,
+            updated_at: now,
+            run_started_at: Some(now),
+            actor: Some(Actor { login: self.user.clone() }),
+            repository: RunRepo { full_name: repo.to_string() },
+        };
+        self.runs.push(run.clone());
+        self.pending_dispatches.push(run);
+        self.resort();
+        self.recompute_view();
+        id
+    }
+
+    fn is_placeholder(&self, id: u64) -> bool {
+        self.pending_dispatches.iter().any(|p| p.id == id)
+    }
+
+    /// Reconcile this repo's placeholders against a fresh refresh: a placeholder
+    /// is dropped once the real run shows up (matched by workflow, newer than the
+    /// dispatch) or once it ages out; otherwise it is re-injected so it survives
+    /// the refresh that just wiped this repo's runs.
+    fn reconcile_pending_dispatches(&mut self, repo: &str) {
+        let now = Utc::now();
+        let slack = chrono::Duration::minutes(2);
+        let ttl = chrono::Duration::seconds(90);
+        let runs = &self.runs;
+        self.pending_dispatches.retain(|p| {
+            if p.repository.full_name != repo {
+                return true; // a different repo's refresh — leave it untouched
+            }
+            let confirmed = runs.iter().any(|r| {
+                r.id != p.id
+                    && r.repository.full_name == p.repository.full_name
+                    && r.workflow_name() == p.workflow_name()
+                    && r.created_at >= p.created_at - slack
+            });
+            !confirmed && now - p.created_at < ttl
+        });
+        for p in &self.pending_dispatches {
+            if p.repository.full_name == repo {
+                self.runs.push(p.clone());
+            }
+        }
     }
 
     pub fn recompute_view(&mut self) {
@@ -554,6 +665,25 @@ impl App {
         (running, queued, failed, success)
     }
 
+    /// Distinct org owners seen across the loaded runs (excluding the user's own
+    /// repos) — seeds the runners view so it shows the orgs you actually watch,
+    /// even before `/user/orgs` resolves.
+    pub(crate) fn candidate_orgs(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for r in &self.runs {
+            if let Some((owner, _)) = r.repository.full_name.split_once('/') {
+                if owner.eq_ignore_ascii_case(&self.user) {
+                    continue;
+                }
+                if seen.insert(owner.to_lowercase()) {
+                    out.push(owner.to_string());
+                }
+            }
+        }
+        out
+    }
+
     /// Advance time-driven state. Returns true when something visible changed,
     /// so the main loop can skip redrawing on idle ticks.
     pub fn tick(&mut self) -> bool {
@@ -577,6 +707,37 @@ impl App {
         {
             self.flush_jobs_fetch();
         }
+
+        // Track selected job changes for background log pre-fetching
+        let current_sel_job_id = self.selected_job().map(|j| j.id);
+        if current_sel_job_id != self.last_selected_job_id {
+            self.last_selected_job_id = current_sel_job_id;
+            if let Some(job) = self.selected_job() {
+                if !job.is_running() && !self.logs_cache.contains_key(&job.id) {
+                    self.logs_fetch_due = Some((Instant::now(), job.id));
+                } else {
+                    self.logs_fetch_due = None;
+                }
+            } else {
+                self.logs_fetch_due = None;
+            }
+        }
+
+        // Fire the debounced logs fetch once the selection has settled.
+        if let Some((at, job_id)) = self.logs_fetch_due {
+            if at.elapsed() >= std::time::Duration::from_millis(300) {
+                self.logs_fetch_due = None;
+                if let Some(repo) = self.selected_run().map(|r| r.repository.full_name.clone()) {
+                    if let Some(job) = self.selected_job() {
+                        if job.id == job_id {
+                            let title = format!("{} — {}", repo, job.name);
+                            self.pending.push(Command::FetchLogs { repo, job_id, title });
+                        }
+                    }
+                }
+            }
+        }
+
         dirty
     }
 
@@ -607,6 +768,7 @@ impl App {
             .runs
             .iter()
             .filter(|r| matches!(r.state(), RunState::Running | RunState::Queued))
+            .filter(|r| !self.is_placeholder(r.id))
             .take(MAX_ACTIVE_POLL)
             .map(|r| (r.repository.full_name.clone(), r.id))
             .collect();
@@ -932,6 +1094,7 @@ mod tests {
     #[test]
     fn logs_message_applies_pending_search() {
         let mut app = App::new();
+        app.pending_open_log_id = Some(1);
         app.pending_log_search = Some("boom".into());
         app.apply(DataMsg::Logs {
             job_id: 1,
@@ -1029,5 +1192,58 @@ mod tests {
         assert!(!app.pending.iter().any(|c| matches!(c, Command::Dispatch { .. })));
         let (msg, is_err) = app.status().expect("an error status");
         assert!(is_err && msg.to_lowercase().contains("ref"));
+    }
+
+    #[test]
+    fn submit_dispatch_shows_an_immediate_active_placeholder() {
+        let mut app = App::new();
+        app.dispatch = Some(loaded_dispatch(Vec::new(), "main"));
+        app.submit_dispatch();
+
+        // The placeholder is in the runs list and visible, marked as active.
+        let ph = app.runs.iter().find(|r| app.is_placeholder(r.id)).expect("a placeholder run");
+        assert_eq!(ph.state(), RunState::Running);
+        assert_eq!(ph.repository.full_name, "org/api");
+        assert!(app.view.iter().any(|&i| app.runs[i].id == ph.id), "placeholder is rendered");
+
+        // The Dispatch command carries the placeholder id back for failure cleanup.
+        let carried = app.pending.iter().find_map(|c| match c {
+            Command::Dispatch { placeholder_id, .. } => Some(*placeholder_id),
+            _ => None,
+        });
+        assert_eq!(carried, Some(ph.id));
+    }
+
+    #[test]
+    fn dispatch_failure_removes_the_placeholder() {
+        let mut app = App::new();
+        let id = app.push_dispatch_placeholder("org/api", "CI", "main");
+        assert!(app.runs.iter().any(|r| r.id == id));
+
+        app.apply(DataMsg::DispatchFailed { placeholder_id: id, err: "dispatch: nope".into() });
+        assert!(!app.runs.iter().any(|r| r.id == id), "placeholder gone from runs");
+        assert!(!app.is_placeholder(id), "placeholder no longer pending");
+        let (msg, is_err) = app.status().expect("an error status");
+        assert!(is_err && msg.contains("nope"));
+    }
+
+    #[test]
+    fn placeholder_survives_refresh_then_yields_to_the_real_run() {
+        let mut app = App::new();
+        let id = app.push_dispatch_placeholder("org/api", "CI", "main");
+
+        // A refresh that doesn't yet include the real run keeps the placeholder.
+        app.apply(DataMsg::Runs { repo: "org/api".into(), runs: vec![] });
+        assert!(app.is_placeholder(id), "placeholder re-injected while GitHub lags");
+        assert!(app.runs.iter().any(|r| r.id == id));
+
+        // Once the real run (same workflow, newer) lands, the placeholder is dropped.
+        app.apply(DataMsg::Runs {
+            repo: "org/api".into(),
+            runs: vec![run_with(9_999_999, "in_progress", None)],
+        });
+        assert!(!app.is_placeholder(id), "placeholder reconciled away");
+        assert!(!app.runs.iter().any(|r| r.id == id));
+        assert!(app.runs.iter().any(|r| r.id == 9_999_999));
     }
 }

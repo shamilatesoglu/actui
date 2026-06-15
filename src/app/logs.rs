@@ -47,6 +47,7 @@ pub struct LogsView {
     /// The query `matches` was last computed for (lowercased). When the new
     /// query extends it, the match set can only narrow — no full rescan.
     last_needle: String,
+    pub preview_only: bool,
 }
 
 /// Strip a leading BOM, trailing CR/LF, and the ISO timestamp prefix.
@@ -60,6 +61,41 @@ pub(crate) fn log_content(raw: &str) -> &str {
         }
     }
     s
+}
+
+/// Keywords that mark a log line as an error/failure. Matched at a word boundary
+/// (see `word_at_boundary`) so substrings like `pipefail` (in `set -o pipefail`)
+/// or `hispanic` don't trip a false positive, while suffixed forms like
+/// `failed`/`errors`/`panicked`/`aborted` still match.
+const ERROR_KEYWORDS: &[&str] = &[
+    "error",
+    "fail",
+    "panic",
+    "fatal",
+    "traceback",
+    "exception",
+    "segfault",
+    "segmentation fault",
+    "abort",
+    "unable",
+];
+
+/// Whether a log line looks like an error/failure, for the failure preview.
+pub(crate) fn is_error_line(content: &str) -> bool {
+    // GitHub's annotation markers (`##[error]…`) and workflow-command form
+    // (`::error file=…::`) are unambiguous prefixes.
+    content.starts_with("##[error]")
+        || content.starts_with("::error")
+        || ERROR_KEYWORDS.iter().any(|kw| word_at_boundary(content, kw))
+}
+
+/// True when `needle` appears in `haystack` (case-insensitively) preceded by a
+/// non-alphanumeric char or the line start — i.e. as the start of a word.
+fn word_at_boundary(haystack: &str, needle: &str) -> bool {
+    let lower = haystack.to_lowercase();
+    lower.match_indices(needle).any(|(i, _)| {
+        i == 0 || !lower[..i].chars().next_back().is_some_and(|c| c.is_alphanumeric())
+    })
 }
 
 /// Parse the RFC3339 timestamp GitHub prefixes onto each log line.
@@ -144,6 +180,7 @@ impl LogsView {
             match_idx: None,
             lower: Vec::new(),
             last_needle: String::new(),
+            preview_only: false,
         };
         v.recompute_visible();
         v
@@ -153,19 +190,50 @@ impl LogsView {
         !self.groups.is_empty()
     }
 
-    fn recompute_visible(&mut self) {
+    pub(crate) fn recompute_visible(&mut self) {
         let prev = self.visible.get(self.cursor).copied();
-        self.visible = (0..self.lines.len())
-            .filter(|&i| {
-                if self.is_endgroup[i] {
-                    return false; // endgroup markers never render
+        if self.preview_only {
+            let n = self.lines.len();
+            let mut should_include = vec![false; n];
+            for i in 0..n {
+                let content = log_content(&self.lines[i]);
+                if is_error_line(content) {
+                    let start = i.saturating_sub(3);
+                    let end = (i + 3).min(n.saturating_sub(1));
+                    for j in start..=end {
+                        should_include[j] = true;
+                    }
                 }
-                match self.line_group[i] {
-                    None => true,
-                    Some(g) => self.is_header[i] || !self.groups[g].collapsed,
+            }
+
+            self.visible.clear();
+            let mut in_gap = false;
+            for i in 0..n {
+                if should_include[i] {
+                    if in_gap {
+                        self.visible.push(usize::MAX);
+                        in_gap = false;
+                    }
+                    self.visible.push(i);
+                } else {
+                    if !self.visible.is_empty() {
+                        in_gap = true;
+                    }
                 }
-            })
-            .collect();
+            }
+        } else {
+            self.visible = (0..self.lines.len())
+                .filter(|&i| {
+                    if self.is_endgroup[i] {
+                        return false; // endgroup markers never render
+                    }
+                    match self.line_group[i] {
+                        None => true,
+                        Some(g) => self.is_header[i] || !self.groups[g].collapsed,
+                    }
+                })
+                .collect();
+        }
         self.cursor = prev
             .and_then(|p| self.visible.iter().position(|&i| i == p))
             .unwrap_or_else(|| self.cursor.min(self.visible.len().saturating_sub(1)));
@@ -175,8 +243,21 @@ impl LogsView {
         if self.visible.is_empty() {
             return;
         }
-        let c = self.cursor as i32 + delta;
-        self.cursor = c.clamp(0, self.visible.len() as i32 - 1) as usize;
+        let n = self.visible.len();
+        let mut c = self.cursor as i32 + delta;
+        c = c.clamp(0, n as i32 - 1);
+        if self.visible[c as usize] == usize::MAX {
+            let step = if delta >= 0 { 1 } else { -1 };
+            let mut next_c = c + step;
+            while next_c >= 0 && next_c < n as i32 {
+                if self.visible[next_c as usize] != usize::MAX {
+                    c = next_c;
+                    break;
+                }
+                next_c += step;
+            }
+        }
+        self.cursor = c as usize;
     }
 
     pub fn cursor_to(&mut self, top: bool) {
@@ -185,6 +266,9 @@ impl LogsView {
         } else {
             self.visible.len().saturating_sub(1)
         };
+        if !self.visible.is_empty() && self.visible[self.cursor] == usize::MAX {
+            self.move_cursor(if top { 1 } else { -1 });
+        }
     }
 
     /// Fold/unfold the group the cursor sits in, keeping the cursor on its header.
@@ -192,6 +276,9 @@ impl LogsView {
         let Some(&src) = self.visible.get(self.cursor) else {
             return;
         };
+        if src == usize::MAX {
+            return;
+        }
         let Some(g) = self.line_group[src] else {
             return;
         };
@@ -213,7 +300,12 @@ impl LogsView {
     }
 
     fn current_src(&self) -> Option<usize> {
-        self.visible.get(self.cursor).copied()
+        let &src = self.visible.get(self.cursor)?;
+        if src == usize::MAX {
+            None
+        } else {
+            Some(src)
+        }
     }
 
     /// Move the cursor to a source line, expanding its group if folded.
@@ -409,5 +501,42 @@ mod tests {
         let v = src_lines(&lv);
         assert!(!v.contains(&"Contents: read"));
         assert!(!v.contains(&"##[error]boom")); // even the error group folds on "fold all"
+    }
+
+    #[test]
+    fn preview_only_shows_error_context() {
+        let mut lv = LogsView::new("t".into(), SAMPLE);
+        lv.preview_only = true;
+        lv.recompute_visible();
+        assert!(lv.visible.contains(&7)); // error line
+        assert!(lv.visible.contains(&6)); // context before
+        assert!(lv.visible.contains(&5)); // context before
+        assert!(lv.visible.contains(&4)); // context before (with 3-line context)
+        assert!(lv.visible.contains(&8)); // context after
+        assert!(!lv.visible.contains(&3)); // unrelated body line excluded
+    }
+
+    #[test]
+    fn is_error_line_respects_word_boundaries() {
+        // `pipefail` must not trip the `fail` keyword.
+        assert!(!is_error_line("Run set -o pipefail"));
+        assert!(!is_error_line("export SHELLOPTS=pipefail"));
+        // `panic`/`abort` must not trip on embedded substrings.
+        assert!(!is_error_line("downloaded hispanic-locale.tar"));
+        assert!(!is_error_line("collaborators added"));
+        // Genuine failure/error words still match, including suffixed forms.
+        assert!(is_error_line("the build failed"));
+        assert!(is_error_line("Error: something broke"));
+        assert!(is_error_line("2 errors, 0 warnings"));
+        assert!(is_error_line("##[error]boom"));
+        assert!(is_error_line("::error file=app.js,line=1::Missing semicolon"));
+        assert!(is_error_line("thread 'main' panicked at src/lib.rs"));
+        assert!(is_error_line("fatal: unable to access repo")); // two keywords, still one match
+        assert!(is_error_line("Traceback (most recent call last):"));
+        assert!(is_error_line("terminate called after throwing an exception"));
+        assert!(is_error_line("Segmentation fault (core dumped)"));
+        assert!(is_error_line("process aborted"));
+        // Boundary can be punctuation, not only whitespace.
+        assert!(is_error_line("step(fail)"));
     }
 }

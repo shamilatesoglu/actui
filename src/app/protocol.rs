@@ -2,7 +2,7 @@
 //! synchronous UI loop. `DataMsg` flows worker → UI (consumed by `App::apply`);
 //! `Command` flows UI → worker (drained by the main loop's `dispatch_commands`).
 
-use super::overlays::AnnotationItem;
+use super::overlays::{AnnotationItem, RunnerGroup};
 use crate::github::{Artifact, Job, PendingDeployment, Run, WfInput, Workflow};
 use std::collections::HashMap;
 
@@ -33,6 +33,10 @@ pub enum DataMsg {
     PendingDeployments { run_id: u64, items: Vec<PendingDeployment> },
     /// Branches and tags for a repo, for the dispatch ref picker.
     Refs { repo: String, branches: Vec<String>, tags: Vec<String> },
+    /// Self-hosted runners grouped per org, for the runners view.
+    Runners { groups: Vec<RunnerGroup> },
+    /// A dispatch request failed — drop the optimistic placeholder run it created.
+    DispatchFailed { placeholder_id: u64, err: String },
     Action(String),
     Error(String),
     RefreshDone,
@@ -49,7 +53,14 @@ pub enum Command {
     FetchWorkflowInputs { repo: String, path: String, git_ref: String },
     FetchArtifacts { repo: String, run_id: u64 },
     DownloadArtifact { repo: String, artifact_id: u64, name: String },
-    Dispatch { repo: String, workflow_id: u64, git_ref: String, inputs: HashMap<String, String> },
+    Dispatch {
+        repo: String,
+        workflow_id: u64,
+        git_ref: String,
+        inputs: HashMap<String, String>,
+        /// Optimistic placeholder run to remove if the dispatch fails.
+        placeholder_id: u64,
+    },
     Cancel { repo: String, run_id: u64 },
     Rerun { repo: String, run_id: u64 },
     RerunFailed { repo: String, run_id: u64 },
@@ -64,6 +75,9 @@ pub enum Command {
         comment: String,
     },
     FetchRefs { repo: String },
+    /// List self-hosted runners for these candidate orgs (merged with the
+    /// user's org memberships by the worker).
+    FetchRunners { orgs: Vec<String> },
     SaveLogs { name: String, content: String },
     OpenUrl(String),
     /// A watched run finished — ring the bell / raise a desktop notification.

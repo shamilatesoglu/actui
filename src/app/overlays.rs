@@ -3,7 +3,7 @@
 //! are plain data plus view-local logic; none reference `App`. The few methods
 //! the `App` reducer / input handlers call are `pub(crate)`.
 
-use crate::github::{Annotation, Artifact, PendingDeployment, WfInput, WfInputKind, Workflow};
+use crate::github::{Annotation, Artifact, PendingDeployment, Runner, WfInput, WfInputKind, Workflow};
 use ratatui::widgets::ListState;
 use std::collections::HashSet;
 
@@ -173,6 +173,192 @@ impl AnnotationsView {
             .collect::<HashSet<_>>()
             .len()
             > 1
+    }
+}
+
+/// One org's self-hosted runners (or the error encountered fetching them).
+pub struct RunnerGroup {
+    pub org: String,
+    pub runners: Vec<Runner>,
+    /// Set when the listing failed — most often "no admin access".
+    pub error: Option<String>,
+}
+
+impl RunnerGroup {
+    /// Triage rank: orgs with runners first, then accessible-but-empty, errors last.
+    pub(crate) fn rank(&self) -> u8 {
+        if !self.runners.is_empty() {
+            0
+        } else if self.error.is_none() {
+            1
+        } else {
+            2
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum RunnerStatus {
+    Busy,
+    Online,
+    Offline,
+}
+
+/// One rendered row of the runners view. Headers and notes are not selectable;
+/// the cursor only ever lands on `Runner` rows.
+pub enum RunnerRow {
+    /// A standalone note (e.g. the missing-scope hint).
+    Note(String),
+    /// An org header with a trailing detail (count, "no runners", or an error).
+    Header { org: String, detail: String, detail_err: bool },
+    Runner {
+        name: String,
+        status: RunnerStatus,
+        os: String,
+        labels: Vec<String>,
+    },
+}
+
+impl RunnerRow {
+    fn is_runner(&self) -> bool {
+        matches!(self, RunnerRow::Runner { .. })
+    }
+}
+
+/// Org self-hosted runners view, shown as a dedicated body pane (open with `s`).
+/// The groups are flattened into `rows`; selection moves over runner rows only.
+pub struct RunnersView {
+    pub rows: Vec<RunnerRow>,
+    pub state: ListState,
+    pub loaded: bool,
+    /// Whether the side detail pane for the selected runner is open (`Enter`).
+    pub detail_open: bool,
+}
+
+impl RunnersView {
+    /// A view in its initial "loading" state, before any groups arrive.
+    pub fn loading() -> Self {
+        Self { rows: Vec::new(), state: ListState::default(), loaded: false, detail_open: false }
+    }
+
+    /// The currently selected runner row, if the cursor is on one.
+    pub fn selected_runner(&self) -> Option<&RunnerRow> {
+        self.rows.get(self.state.selected()?).filter(|r| r.is_runner())
+    }
+
+    /// Replace the contents from a fresh fetch: sort orgs for triage, flatten to
+    /// rows, and park the cursor on the first runner.
+    pub fn set_groups(&mut self, mut groups: Vec<RunnerGroup>) {
+        // Orgs with runners first, accessible-but-empty next, errors last; then
+        // alphabetical so the list is stable across refreshes.
+        groups.sort_by(|a, b| a.rank().cmp(&b.rank()).then_with(|| a.org.cmp(&b.org)));
+
+        let mut rows = Vec::new();
+        // All orgs errored → almost always a token-scope problem, not real lack
+        // of access. Point the user at the fix.
+        if !groups.is_empty() && groups.iter().all(|g| g.error.is_some()) {
+            rows.push(RunnerRow::Note(
+                "Listing runners needs the admin:org scope. Run:  gh auth refresh -s admin:org"
+                    .into(),
+            ));
+        }
+        for g in &groups {
+            let (detail, detail_err) = if let Some(e) = &g.error {
+                (e.clone(), true)
+            } else if g.runners.is_empty() {
+                ("no self-hosted runners".into(), false)
+            } else {
+                let n = g.runners.len();
+                (format!("{n} runner{}", if n == 1 { "" } else { "s" }), false)
+            };
+            rows.push(RunnerRow::Header { org: g.org.clone(), detail, detail_err });
+            for r in &g.runners {
+                let status = if r.busy {
+                    RunnerStatus::Busy
+                } else if r.status == "online" {
+                    RunnerStatus::Online
+                } else {
+                    RunnerStatus::Offline
+                };
+                rows.push(RunnerRow::Runner {
+                    name: r.name.clone(),
+                    status,
+                    os: r.os.clone(),
+                    labels: r.labels.iter().map(|l| l.name.clone()).collect(),
+                });
+            }
+        }
+        self.rows = rows;
+        self.loaded = true;
+        self.state.select(self.runner_indices().first().copied());
+    }
+
+    /// Indices of the selectable (runner) rows, in display order.
+    fn runner_indices(&self) -> Vec<usize> {
+        self.rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.is_runner())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Move the cursor by `delta` runner rows, skipping headers/notes.
+    pub(crate) fn move_sel(&mut self, delta: i32) {
+        let runners = self.runner_indices();
+        if runners.is_empty() {
+            return;
+        }
+        let cur = self.state.selected().unwrap_or(runners[0]);
+        let pos = runners.iter().position(|&i| i == cur).unwrap_or(0) as i32;
+        let next = (pos + delta).clamp(0, runners.len() as i32 - 1) as usize;
+        self.state.select(Some(runners[next]));
+    }
+
+    /// Jump the cursor to the first / last runner.
+    pub(crate) fn jump(&mut self, top: bool) {
+        let runners = self.runner_indices();
+        let pick = if top { runners.first() } else { runners.last() };
+        if let Some(&i) = pick {
+            self.state.select(Some(i));
+        }
+    }
+
+    /// Select the runner at `row_from_top` of the viewport (mouse click); a
+    /// no-op when that row is a header/note or out of range.
+    pub(crate) fn click_row(&mut self, row_from_top: usize) {
+        let idx = self.state.offset() + row_from_top;
+        if self.rows.get(idx).is_some_and(RunnerRow::is_runner) {
+            self.state.select(Some(idx));
+        }
+    }
+
+    /// The org the selected runner belongs to (nearest header above it).
+    pub fn selected_org(&self) -> Option<&str> {
+        let sel = self.state.selected()?;
+        self.rows[..=sel].iter().rev().find_map(|r| match r {
+            RunnerRow::Header { org, .. } => Some(org.as_str()),
+            _ => None,
+        })
+    }
+
+    /// (online, offline, busy) tallied across every org, for the status bar.
+    /// Busy runners are also counted as online.
+    pub fn totals(&self) -> (usize, usize, usize) {
+        let (mut online, mut offline, mut busy) = (0, 0, 0);
+        for r in &self.rows {
+            if let RunnerRow::Runner { status, .. } = r {
+                match status {
+                    RunnerStatus::Busy => {
+                        online += 1;
+                        busy += 1;
+                    }
+                    RunnerStatus::Online => online += 1,
+                    RunnerStatus::Offline => offline += 1,
+                }
+            }
+        }
+        (online, offline, busy)
     }
 }
 

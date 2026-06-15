@@ -521,6 +521,51 @@ impl Github {
         Ok(out)
     }
 
+    /// Organizations the authenticated user belongs to (paginated).
+    pub async fn list_orgs(&self) -> Result<Vec<String>> {
+        #[derive(Deserialize)]
+        struct Org {
+            login: String,
+        }
+        let mut out = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let resp = self
+                .send(
+                    self.client
+                        .get(format!("{API}/user/orgs"))
+                        .query(&[("per_page", "100".to_string()), ("page", page.to_string())]),
+                )
+                .await?;
+            let batch: Vec<Org> = ensure_ok(resp).await?.json().await?;
+            let n = batch.len();
+            out.extend(batch.into_iter().map(|o| o.login));
+            if n < 100 || page >= 5 {
+                break;
+            }
+            page += 1;
+        }
+        Ok(out)
+    }
+
+    /// Self-hosted runners registered to an org. Requires org-admin (or the
+    /// `manage_runners:org` scope); the caller surfaces a `403` as "no access".
+    pub async fn list_org_runners(&self, org: &str) -> Result<Vec<Runner>> {
+        #[derive(Deserialize)]
+        struct Resp {
+            runners: Vec<Runner>,
+        }
+        let resp = self
+            .send(
+                self.client
+                    .get(format!("{API}/orgs/{org}/actions/runners"))
+                    .query(&[("per_page", "100")]),
+            )
+            .await?;
+        let resp: Resp = ensure_ok(resp).await?.json().await?;
+        Ok(resp.runners)
+    }
+
     /// Artifacts produced by a run.
     pub async fn list_artifacts(&self, full_name: &str, run_id: u64) -> Result<Vec<Artifact>> {
         #[derive(Deserialize)]
@@ -862,6 +907,27 @@ pub struct Annotation {
     pub title: Option<String>,
     #[serde(default)]
     pub message: String,
+}
+
+/// A self-hosted runner registered to an org.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Runner {
+    pub name: String,
+    #[serde(default)]
+    pub os: String,
+    /// "online" | "offline".
+    #[serde(default)]
+    pub status: String,
+    /// True while the runner is executing a job.
+    #[serde(default)]
+    pub busy: bool,
+    #[serde(default)]
+    pub labels: Vec<RunnerLabel>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RunnerLabel {
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

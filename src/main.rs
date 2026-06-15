@@ -6,7 +6,7 @@ mod github;
 mod ui;
 
 use anyhow::Result;
-use app::{App, Command, DataMsg};
+use app::{App, Command, DataMsg, RunnerGroup};
 use config::Config;
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::{FutureExt, StreamExt};
@@ -343,11 +343,19 @@ fn dispatch_commands(app: &mut App, gh: &Github, cfg: &Config, tx: &UnboundedSen
                     }
                 });
             }
-            Command::Dispatch { repo, workflow_id, git_ref, inputs } => {
-                let gh = gh.clone();
+            Command::Dispatch { repo, workflow_id, git_ref, inputs, placeholder_id } => {
+                let (gh, tx) = (gh.clone(), tx.clone());
                 let ok = format!("Dispatched workflow on {repo}@{git_ref}");
-                spawn_action(tx, ok, "dispatch", move || async move {
-                    gh.dispatch(&repo, workflow_id, &git_ref, inputs).await
+                tokio::spawn(async move {
+                    let msg = match gh.dispatch(&repo, workflow_id, &git_ref, inputs).await {
+                        Ok(()) => DataMsg::Action(ok),
+                        // Drop the optimistic placeholder we showed on submit.
+                        Err(e) => DataMsg::DispatchFailed {
+                            placeholder_id,
+                            err: format!("dispatch: {e}"),
+                        },
+                    };
+                    let _ = tx.send(msg);
                 });
             }
             Command::Cancel { repo, run_id } => {
@@ -417,6 +425,37 @@ fn dispatch_commands(app: &mut App, gh: &Github, cfg: &Config, tx: &UnboundedSen
                         branches: branches.unwrap_or_default(),
                         tags: tags.unwrap_or_default(),
                     });
+                });
+            }
+            Command::FetchRunners { orgs } => {
+                let (gh, tx) = (gh.clone(), tx.clone());
+                tokio::spawn(async move {
+                    // Merge the user's org memberships with the owners derived from
+                    // loaded runs, de-duped case-insensitively.
+                    let mut names = gh.list_orgs().await.unwrap_or_default();
+                    for o in orgs {
+                        if !names.iter().any(|n| n.eq_ignore_ascii_case(&o)) {
+                            names.push(o);
+                        }
+                    }
+                    names.sort_by_key(|s| s.to_lowercase());
+                    if names.is_empty() {
+                        let _ = tx.send(DataMsg::Runners { groups: vec![] });
+                        return;
+                    }
+                    // Each org's runners in parallel; a 403 (no admin) becomes a
+                    // per-org note rather than failing the whole view.
+                    let groups = futures::future::join_all(names.into_iter().map(|org| {
+                        let gh = gh.clone();
+                        async move {
+                            match gh.list_org_runners(&org).await {
+                                Ok(runners) => RunnerGroup { org, runners, error: None },
+                                Err(e) => RunnerGroup { org, runners: vec![], error: Some(e.to_string()) },
+                            }
+                        }
+                    }))
+                    .await;
+                    let _ = tx.send(DataMsg::Runners { groups });
                 });
             }
             Command::FetchArtifacts { repo, run_id } => {

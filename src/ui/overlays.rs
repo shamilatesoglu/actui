@@ -353,6 +353,8 @@ pub(super) fn draw_help(f: &mut Frame) {
         help_row("  ↳ env review", "Space pick · c comment · ⏎ ok · x reject"),
         help_row("  ↳ dispatch ref", "Space / → on the ref field picks a ref"),
         help_row("A", "browse / download run artifacts"),
+        help_row("s", "org self-hosted runners (online / busy)"),
+        help_row("  ↳ in runners", "⏎ details · o open on GitHub · r refresh"),
         help_row("v", "failure annotations (file:line)"),
         help_row("  ↳ in failures", "⏎ jump to log line · o open on GitHub"),
         help_row("r / F5", "refresh now (auto-refresh is on)"),

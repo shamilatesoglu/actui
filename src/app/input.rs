@@ -33,6 +33,7 @@ impl App {
             Mode::Approval => self.key_approval(key),
             Mode::Annotations => self.key_annotations(key),
             Mode::RefPicker => self.key_ref_picker(key),
+            Mode::Runners => self.key_runners(key),
         }
     }
 
@@ -98,6 +99,12 @@ impl App {
                 }
                 true
             }
+            Mode::Runners => {
+                if let Some(rv) = &mut self.runners {
+                    rv.move_sel(delta);
+                }
+                true
+            }
             Mode::Dispatch => {
                 if let Some(d) = &mut self.dispatch {
                     if matches!(d.stage, DispatchStage::SelectWorkflow) {
@@ -116,6 +123,16 @@ impl App {
             // Any-key overlays dismiss on click too.
             Mode::Help | Mode::Errors => {
                 self.mode = Mode::Normal;
+                true
+            }
+            Mode::Runners => {
+                let pos = Position::new(x, y);
+                if self.hit.runners_pane.contains(pos) {
+                    let row = (y - self.hit.runners_pane.y) as usize;
+                    if let Some(rv) = &mut self.runners {
+                        rv.click_row(row);
+                    }
+                }
                 true
             }
             Mode::Normal | Mode::Search => {
@@ -226,6 +243,7 @@ impl App {
             KeyCode::Char('A') => self.open_artifacts(),
             KeyCode::Char('v') => self.open_annotations(),
             KeyCode::Char('d') => self.open_dispatch(),
+            KeyCode::Char('s') => self.open_runners(),
             _ => {}
         }
     }
@@ -388,6 +406,10 @@ impl App {
             KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Tab => lv.toggle_fold(),
             KeyCode::Char('e') => lv.set_all_collapsed(false), // expand all
             KeyCode::Char('f') => lv.set_all_collapsed(true),  // fold all
+            KeyCode::Char('p') => {
+                lv.preview_only = !lv.preview_only;
+                lv.recompute_visible();
+            }
             // Search.
             KeyCode::Char('/') => {
                 lv.search.clear();
@@ -696,11 +718,18 @@ impl App {
             let title = format!("{repo} — {job_name}");
             // Serve cached logs instantly; completed-job logs never change.
             if let Some(text) = self.logs_cache.get(&job_id) {
-                self.logs = Some(LogsView::new(title, text));
+                let mut lv = LogsView::new(title, text);
+                let failed = self.selected_job().is_some_and(|j| matches!(j.conclusion.as_deref(), Some("failure") | Some("timed_out")));
+                if failed {
+                    lv.preview_only = true;
+                    lv.recompute_visible();
+                }
+                self.logs = Some(lv);
                 self.steps_view = None;
                 self.mode = Mode::Logs;
                 self.status_msg = None;
             } else {
+                self.pending_open_log_id = Some(job_id);
                 self.set_status("Fetching logs…", false);
                 self.pending.push(Command::FetchLogs { repo, job_id, title });
             }
@@ -1059,6 +1088,7 @@ impl App {
             self.mode = Mode::Logs;
             self.status_msg = None;
         } else {
+            self.pending_open_log_id = Some(job_id);
             self.pending_log_search = Some(search);
             self.set_status("Fetching logs…", false);
             self.pending.push(Command::FetchLogs { repo, job_id, title });
@@ -1132,6 +1162,87 @@ impl App {
         self.pending.push(Command::FetchWorkflows { repo });
     }
 
+    /// Open the org self-hosted runners view. Fetches runners for the orgs seen
+    /// across loaded runs (merged with the user's org memberships by the worker).
+    fn open_runners(&mut self) {
+        self.runners = Some(RunnersView::loading());
+        self.mode = Mode::Runners;
+        self.pending.push(Command::FetchRunners { orgs: self.candidate_orgs() });
+    }
+
+    fn key_runners(&mut self, key: KeyEvent) {
+        // Move several runners at a time for paging keys.
+        const PAGE: i32 = 10;
+        match key.code {
+            // Esc/← back out of the detail pane first, then close the view; `q`
+            // always closes the whole view.
+            KeyCode::Char('q') => {
+                self.runners = None;
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Esc | KeyCode::Backspace | KeyCode::Left => {
+                if self.runners.as_ref().is_some_and(|rv| rv.detail_open) {
+                    if let Some(rv) = &mut self.runners {
+                        rv.detail_open = false;
+                    }
+                } else {
+                    self.runners = None;
+                    self.mode = Mode::Normal;
+                }
+            }
+            // Open the detail pane for the selected runner (in-app).
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+                if let Some(rv) = &mut self.runners {
+                    if rv.selected_runner().is_some() {
+                        rv.detail_open = true;
+                    }
+                }
+            }
+            // Re-fetch (a runner may have come online / gone busy).
+            KeyCode::Char('r') => {
+                if let Some(rv) = &mut self.runners {
+                    rv.loaded = false;
+                }
+                self.pending.push(Command::FetchRunners { orgs: self.candidate_orgs() });
+            }
+            // Open the selected runner's org runner-settings page on github.com.
+            // Org settings live under /organizations/, not /orgs/.
+            KeyCode::Char('o') => {
+                let url = self
+                    .runners
+                    .as_ref()
+                    .and_then(|rv| rv.selected_org())
+                    .map(|org| {
+                        format!("https://github.com/organizations/{org}/settings/actions/runners")
+                    });
+                if let Some(url) = url {
+                    self.pending.push(Command::OpenUrl(url));
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down => self.runners_move(1),
+            KeyCode::Char('k') | KeyCode::Up => self.runners_move(-1),
+            KeyCode::PageDown => self.runners_move(PAGE),
+            KeyCode::PageUp => self.runners_move(-PAGE),
+            KeyCode::Char('g') | KeyCode::Home => {
+                if let Some(rv) = &mut self.runners {
+                    rv.jump(true);
+                }
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                if let Some(rv) = &mut self.runners {
+                    rv.jump(false);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn runners_move(&mut self, delta: i32) {
+        if let Some(rv) = &mut self.runners {
+            rv.move_sel(delta);
+        }
+    }
+
     pub(crate) fn submit_dispatch(&mut self) {
         let Some(d) = &self.dispatch else { return };
         if !d.loaded {
@@ -1166,11 +1277,23 @@ impl App {
                 }
             })
             .collect();
+        let repo = d.repo.clone();
+        let workflow_id = d.workflow_id;
+        let git_ref = d.git_ref.clone();
+        let workflow_name = d
+            .workflows
+            .iter()
+            .find(|w| w.id == workflow_id)
+            .map(|w| w.name.clone())
+            .unwrap_or_else(|| "workflow".to_string());
+        // Show the run immediately as active, before GitHub registers it.
+        let placeholder_id = self.push_dispatch_placeholder(&repo, &workflow_name, &git_ref);
         self.pending.push(Command::Dispatch {
-            repo: d.repo.clone(),
-            workflow_id: d.workflow_id,
-            git_ref: d.git_ref.clone(),
+            repo,
+            workflow_id,
+            git_ref,
             inputs,
+            placeholder_id,
         });
         self.dispatch = None;
         self.mode = Mode::Normal;
