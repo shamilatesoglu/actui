@@ -9,8 +9,6 @@ name: Test Workflow
 # slow so runs stay "in progress" long enough to watch live in actui.
 
 on:
-  push:
-  pull_request:
   workflow_dispatch:
     inputs:
       build_seconds:
