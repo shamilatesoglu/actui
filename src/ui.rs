@@ -219,8 +219,13 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     }
     if let Some(rl) = &app.rate {
         let c = if rl.remaining < 200 { Color::Red } else { dim() };
+        let pct = if rl.limit > 0 {
+            (rl.remaining as f64 / rl.limit as f64 * 100.0).round() as u32
+        } else {
+            0
+        };
         right.push(Span::styled(
-            format!(" api {}/{} ", rl.remaining, rl.limit),
+            format!(" api {pct}% "),
             Style::default().fg(c),
         ));
     }
