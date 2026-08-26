@@ -55,9 +55,9 @@ A fast, beautiful terminal UI for viewing and managing **GitHub Actions** across
 Requires the [GitHub CLI](https://cli.github.com/) (`gh`) for auth, or a `GITHUB_TOKEN`.
 
 ```sh
+cargo install actui
+# or, from a checkout:
 cargo install --path .
-# or, once published:
-# cargo install actui
 ```
 
 ## Auth
