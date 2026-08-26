@@ -305,7 +305,7 @@ pub(super) fn draw_errors(f: &mut Frame, app: &App) {
 pub(super) fn draw_help(f: &mut Frame) {
     // Two columns so the whole reference fits without clipping on short
     // terminals (a single column runs ~45 rows).
-    let area = centered(86, 80, f.area());
+    let area = centered(86, 90, f.area());
     let inner = popup(f, area, "Help", accent());
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -313,11 +313,11 @@ pub(super) fn draw_help(f: &mut Frame) {
         .split(inner);
 
     let left = Text::from(vec![
-        hl("Panes  (two-pane: Runs ⟷ Jobs)"),
-        help_row("Tab", "switch focus between Runs and Jobs"),
-        help_row("→ / l", "focus Jobs (drill into selected run)"),
-        help_row("← / h / Bksp", "focus Runs (Bksp/Esc go back anywhere)"),
-        help_row("Esc", "clear search filter, else focus Runs"),
+        hl("Panes  (Repos ⟷ Runs ⟷ Jobs)"),
+        help_row("Tab", "move focus one pane along"),
+        help_row("→ / l", "drill in (Repos → Runs → Jobs)"),
+        help_row("← / h / Bksp", "back out (Bksp/Esc go back anywhere)"),
+        help_row("Esc", "clear search, then repo scope, then focus"),
         help_row("Enter", "Runs: drill to jobs · Jobs: view logs"),
         Line::raw(""),
         hl("Navigation  (acts on the focused pane)"),
@@ -325,6 +325,11 @@ pub(super) fn draw_help(f: &mut Frame) {
         help_row("g / G", "jump to top / bottom"),
         help_row("PgUp / PgDn", "page up / down"),
         help_row("mouse", "wheel scroll · click selects / focuses"),
+        Line::raw(""),
+        hl("Repos sidebar  (★ = pinned in config)"),
+        help_row("p", "show / hide it — pinned first, then most used"),
+        help_row("j / k", "scope the runs list to that repo"),
+        help_row("< / >", "narrow / widen it (a long name slides past)"),
         Line::raw(""),
         hl("Filter & search"),
         help_row("1 - 5", "All / Running / Queued / Failed / Success"),
@@ -346,6 +351,7 @@ pub(super) fn draw_help(f: &mut Frame) {
         help_row("Enter / l / L", "view logs of selected job (L anywhere)"),
         help_row("o", "open in browser (job's page, else the run)"),
         help_row("d", "dispatch a workflow (workflow_dispatch)"),
+        help_row("  ↳ in Repos", "dispatch in a repo with no runs loaded"),
         help_row("c", "cancel the selected run"),
         help_row("x / X", "re-run failed jobs / re-run all"),
         help_row("R", "re-run the selected job"),

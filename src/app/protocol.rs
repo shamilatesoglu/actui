@@ -17,7 +17,8 @@ pub struct AnnJob {
 /// Messages flowing from async workers into the UI.
 pub enum DataMsg {
     User(String),
-    Repos(usize),
+    /// The repos this sweep watches, whether or not they have runs.
+    Repos(Vec<String>),
     Runs { repo: String, runs: Vec<Run> },
     /// A repo's runs were unchanged (304) — count it done, keep existing data.
     RunsUnchanged,

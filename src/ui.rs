@@ -3,12 +3,14 @@
 //! lives here; the floating modal overlays are in the `overlays` submodule.
 
 mod overlays;
+mod repos;
 
 use crate::app::{is_error_line, log_content, App, Filter, Focus, Mode, RunnerRow, RunnerStatus};
 use crate::github::{Job, Run, RunState, Step};
 use ansi_to_tui::IntoText;
 use chrono::{DateTime, Utc};
 use overlays::*;
+use repos::draw_repos;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -155,6 +157,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .split(f.area());
 
     app.hit.tabs = chunks[1];
+    // Cleared here so a stale rect can't take clicks in the views that drop the
+    // sidebar; draw_repos sets it again when it draws.
+    app.hit.repos = Rect::default();
+
     draw_header(f, app, chunks[0]);
     draw_tabs(f, app, chunks[1]);
     draw_body(f, app, chunks[2]);
@@ -260,6 +266,7 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
     let logs = app.mode == Mode::Logs;
     let at_jobs = !logs && app.focus == Focus::Jobs;
     let at_runs = !logs && app.focus == Focus::Runs;
+    let at_repos = !logs && app.focus == Focus::Repos;
     let crumb = |label: &'static str, active: bool, reached: bool| {
         let style = if active {
             Style::default().fg(accent()).add_modifier(Modifier::BOLD)
@@ -271,14 +278,19 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
         Span::styled(label, style)
     };
     let sep = || Span::styled(" › ", Style::default().fg(dim()));
-    vec![
-        Span::raw("  "),
+    let mut out = vec![Span::raw("  ")];
+    if app.repos.shown {
+        out.push(crumb("Repos", at_repos, true));
+        out.push(sep());
+    }
+    out.extend([
         crumb("Runs", at_runs, true),
         sep(),
         crumb("Jobs", at_jobs, at_jobs || logs),
         sep(),
         crumb("Logs", logs, logs),
-    ]
+    ]);
+    out
 }
 
 fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
@@ -328,33 +340,47 @@ fn draw_body(f: &mut Frame, app: &mut App, area: Rect) {
         draw_logs_pane(f, app, area);
         return;
     }
+    let body = if app.repos.shown {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(app.repos.width), Constraint::Min(20)])
+            .split(area);
+        draw_repos(f, app, cols[0]);
+        cols[1]
+    } else {
+        area
+    };
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
-        .split(area);
+        .split(body);
     draw_table(f, app, cols[0]);
     draw_detail(f, app, cols[1]);
 }
 
 fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Runs;
-    // Position indicator in the title, so long lists stay orientable.
+    // The scope (if any) and a position indicator, so long lists stay orientable.
+    let scoped = app.repos.scope().map(short_repo);
+    let scope = scoped.as_ref().map(|s| format!(" · {s}")).unwrap_or_default();
     let title = if app.view.is_empty() {
-        "Runs".to_string()
+        format!("Runs{scope}")
     } else {
         let at = app.table_state.selected().map_or(0, |i| i + 1);
-        format!("Runs {at}/{}", app.view.len())
+        format!("Runs{scope} {at}/{}", app.view.len())
     };
     let content = pane(f, area, &title, focused);
     app.hit.runs = content;
 
     if app.view.is_empty() {
         let msg = if app.loading {
-            "Loading workflow runs…"
+            "Loading workflow runs…".to_string()
         } else if !app.search.is_empty() {
-            "No runs match your search."
+            "No runs match your search.".to_string()
+        } else if let Some(repo) = &scoped {
+            format!("No recent runs in {repo}.\nPress d to dispatch a workflow there.")
         } else {
-            "No runs found for this filter."
+            "No runs found for this filter.".to_string()
         };
         let p = Paragraph::new(msg)
             .style(Style::default().fg(dim()))
@@ -364,28 +390,44 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     // Adaptive columns: drop the lower-value ones as the pane narrows so the
-    // essentials (status, repo, workflow, age) are never pushed off-screen.
-    let wide = content.width >= 100; // event + actor
-    let medium = content.width >= 72; // branch + duration
+    // essentials (status, repo, workflow, age) are never pushed off-screen. A
+    // repo scope makes the repository column redundant, and the rest of the
+    // table gets the width it was taking.
+    let scoped = scoped.is_some();
+    let budget = content.width + if scoped { REPO_COL_WIDTH } else { 0 };
+    let wide = budget >= 100; // event + actor
+    let medium = budget >= 72; // duration
+    let branch = budget >= 55; // branch, once the essentials are covered
 
-    let mut head = vec![Cell::from(""), Cell::from("Repository"), Cell::from("Workflow")];
-    let mut widths = vec![Constraint::Length(2), Constraint::Min(14), Constraint::Length(23)];
-    if medium {
+    // Every column is capped at what its text can be, and the leftover goes to
+    // one trailing spacer — so spare width shows up as a margin on the right
+    // instead of a hole in the middle of a row.
+    let mut head = vec![Cell::from("")];
+    let mut widths = vec![Constraint::Length(2)];
+    if !scoped {
+        head.push(Cell::from("Repository"));
+        widths.push(Constraint::Max(REPO_COL_WIDTH));
+    }
+    head.push(Cell::from("Workflow"));
+    widths.push(Constraint::Max(23));
+    if branch {
         head.push(Cell::from("Branch"));
-        widths.push(Constraint::Length(16));
+        widths.push(Constraint::Max(16));
     }
     if wide {
         head.push(Cell::from("Event"));
         head.push(Cell::from("Actor"));
-        widths.push(Constraint::Length(8));
-        widths.push(Constraint::Length(12));
+        widths.push(Constraint::Max(8));
+        widths.push(Constraint::Max(12));
     }
     if medium {
         head.push(Cell::from("Dur"));
-        widths.push(Constraint::Length(8));
+        widths.push(Constraint::Max(8));
     }
     head.push(Cell::from("Age"));
-    widths.push(Constraint::Length(6));
+    widths.push(Constraint::Max(6));
+    head.push(Cell::from(""));
+    widths.push(Constraint::Min(0));
     let header = Row::new(head).style(Style::default().fg(accent()).add_modifier(Modifier::BOLD));
 
     // Collected (owned), so the table can render against the real
@@ -394,16 +436,16 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     let rows: Vec<Row> = app.view.iter().map(|&i| {
         let r = &app.runs[i];
         let (icon, color) = state_glyph(r.state());
-        let mut cells = vec![
-            Cell::from(Span::styled(icon, Style::default().fg(color))),
-            Cell::from(short_repo(&r.repository.full_name)),
-            // Workflow name with a dim run number, so #NNN is scannable inline.
-            Cell::from(Line::from(vec![
-                Span::raw(truncate(r.workflow_name(), 15)),
-                Span::styled(format!("  #{}", r.run_number), Style::default().fg(dim())),
-            ])),
-        ];
-        if medium {
+        let mut cells = vec![Cell::from(Span::styled(icon, Style::default().fg(color)))];
+        if !scoped {
+            cells.push(Cell::from(short_repo(&r.repository.full_name)));
+        }
+        // Workflow name with a dim run number, so #NNN is scannable inline.
+        cells.push(Cell::from(Line::from(vec![
+            Span::raw(truncate(r.workflow_name(), if scoped { 24 } else { 15 })),
+            Span::styled(format!("  #{}", r.run_number), Style::default().fg(dim())),
+        ])));
+        if branch {
             cells.push(Cell::from(truncate(r.head_branch.as_deref().unwrap_or("-"), 16)));
         }
         if wide {
@@ -417,6 +459,7 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
             cells.push(Cell::from(run_dur(r)).style(Style::default().fg(dim())));
         }
         cells.push(Cell::from(fmt_age(r.updated_at)).style(Style::default().fg(dim())));
+        cells.push(Cell::from("")); // the trailing spacer
         Row::new(cells)
     }).collect();
 
@@ -875,10 +918,13 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 ""
             };
-            format!(" j/k move · ⏎/l jobs · / search · o open · d dispatch · c cancel · x/X rerun{approve}{fails} · A artifacts · s runners · ? help · q quit")
+            format!(" j/k move · ⏎/l jobs · / search · o open · d dispatch · c cancel · x/X rerun{approve}{fails} · A artifacts · p repos · ? help · q quit")
         }
         (false, Focus::Jobs) => {
             " j/k job · ⏎/l logs · R rerun job · v failures · A artifacts · s runners · ←/Esc back · o open · ? help · q quit".into()
+        }
+        (false, Focus::Repos) => {
+            " j/k repo · ⏎/→ runs · d dispatch here · < > resize · Esc all repos · p hide · ? help · q quit".into()
         }
     };
     // A kept search filter stays visible (and dismissable) while it's active.
@@ -1251,6 +1297,10 @@ fn fmt_dt(ts: DateTime<Utc>) -> String {
     ts.format("%Y-%m-%d %H:%M UTC").to_string()
 }
 
+/// What the repository column takes when it's shown — the width a repo scope
+/// hands back to the other columns.
+const REPO_COL_WIDTH: u16 = 24;
+
 fn short_repo(full: &str) -> String {
     // Keep owner/name but cap length nicely.
     truncate(full, 24)
@@ -1341,6 +1391,183 @@ mod tests {
 
     fn text_of(l: &Line) -> String {
         l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// Draw the whole screen into an off-screen terminal and read it back, so
+    /// layout changes are checked against what actually lands on the grid.
+    fn screen(app: &mut App, w: u16, h: u16) -> String {
+        app.sync_sidebar(w);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                out.push_str(buf.cell((x, y)).map_or(" ", |c| c.symbol()));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn demo_app() -> App {
+        use crate::app::DataMsg;
+        use crate::github::{Run, RunRepo};
+
+        let run = |repo: &str, id: u64, status: &str, conclusion: Option<&str>| Run {
+            id,
+            name: Some("CI".into()),
+            display_title: "fix the thing".into(),
+            head_branch: Some("main".into()),
+            run_number: 296,
+            event: "push".into(),
+            status: status.into(),
+            conclusion: conclusion.map(str::to_string),
+            html_url: String::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            run_started_at: Some(Utc::now()),
+            actor: None,
+            repository: RunRepo { full_name: repo.into() },
+        };
+        let cfg = crate::config::Config { pinned: vec!["org/api".into()], ..Default::default() };
+        let mut app = App::new(&cfg);
+        app.user = "you".into();
+        app.apply(DataMsg::Repos(vec![
+            "org/api".into(),
+            "org/web".into(),
+            "you/dotfiles".into(),
+            "org/quiet-one".into(),
+            "shamilatesoglu/actui-experiments".into(),
+        ]));
+        app.loading = false;
+        // Ignore whatever this machine has saved, so renders are deterministic.
+        app.repos.uses = crate::state::State::default();
+        app.repos.width = 28;
+        app.runs = vec![
+            run("org/api", 1, "in_progress", None),
+            run("org/web", 2, "completed", Some("failure")),
+            run("you/dotfiles", 3, "completed", Some("success")),
+        ];
+        app.recompute_view();
+        app
+    }
+
+    #[test]
+    fn sidebar_renders_beside_the_runs_table() {
+        let mut app = demo_app();
+        let out = screen(&mut app, 120, 14);
+        println!("{out}");
+
+        assert!(out.contains("All repos"), "the scope-clearing row is drawn");
+        assert!(out.contains("★ org/api"), "a pinned repo is marked");
+        assert!(out.contains("org/quiet-one"), "a repo with no runs is still listed");
+        assert!(out.contains("Repos › Runs › Jobs"), "the breadcrumb gains a level");
+        // Unscoped, the runs table keeps its repository column.
+        assert!(out.contains("Repository"));
+    }
+
+    #[test]
+    fn scoping_to_a_repo_drops_the_repository_column() {
+        let mut app = demo_app();
+        app.sync_sidebar(120);
+        let at = app.repos.rows.iter().position(|r| r.name == "org/web").unwrap();
+        app.repos.select(at + 1);
+        app.recompute_view();
+        let out = screen(&mut app, 120, 14);
+        println!("{out}");
+
+        assert!(out.contains("Runs · org/web 1/1"), "the pane title names the scope");
+        assert!(!out.contains("Repository"), "the repo column is redundant when scoped");
+        assert!(!out.contains("you/dotfiles   CI"), "other repos' runs are filtered out");
+    }
+
+    #[test]
+    fn a_wide_table_caps_its_columns_instead_of_stretching() {
+        let mut app = demo_app();
+        let out = screen(&mut app, 220, 12);
+        println!("{out}");
+        let row = out.lines().find(|l| l.contains("org/api  ")).unwrap();
+        // The sidebar names the repo too — the table's copy is the later one.
+        let from = row.rfind("org/api").unwrap();
+        let span = row[from..].find("CI  #296").unwrap();
+        assert!(span <= 26, "the repository column should stay capped, spans {span}");
+    }
+
+    #[test]
+    fn the_help_fits_a_standard_terminal() {
+        let mut app = demo_app();
+        app.mode = crate::app::Mode::Help;
+        let out = screen(&mut app, 120, 40);
+        println!("{out}");
+        // The last row of each column has to survive the popup's height.
+        assert!(out.contains("save the log to a file"), "left column is clipped");
+        assert!(out.contains("show repos that failed to load"), "right column is clipped");
+    }
+
+    #[test]
+    fn a_repo_with_no_runs_points_at_dispatch() {
+        let mut app = demo_app();
+        app.sync_sidebar(120);
+        let at = app.repos.rows.iter().position(|r| r.name == "org/quiet-one").unwrap();
+        app.repos.select(at + 1);
+        app.recompute_view();
+        let out = screen(&mut app, 120, 14);
+        println!("{out}");
+        assert!(out.contains("No recent runs in org/quiet-one"));
+        assert!(out.contains("Press d to dispatch"));
+    }
+
+    #[test]
+    fn a_name_too_long_for_the_sidebar_slides_past() {
+        let mut app = demo_app();
+        let first = screen(&mut app, 120, 14);
+        assert!(app.repos.sliding, "a name that long has to slide");
+
+        app.repos.step += 8;
+        let later = screen(&mut app, 120, 14);
+        println!("{first}\n{later}");
+        assert_ne!(first, later, "the name should have moved on");
+        // Every row still ends where it started: sliding never widens a row.
+        let width = |out: &str| out.lines().map(|l| l.chars().count()).max().unwrap();
+        assert_eq!(width(&first), width(&later));
+    }
+
+    #[test]
+    fn resizing_the_sidebar_widens_the_pane_and_is_remembered() {
+        use crossterm::event::{KeyCode, KeyEvent};
+
+        let mut app = demo_app();
+        let before = app.repos.width;
+        app.sync_sidebar(120);
+        app.handle_key(KeyEvent::from(KeyCode::Char('>')));
+        app.handle_key(KeyEvent::from(KeyCode::Char('>')));
+        assert!(app.repos.width > before);
+        assert_eq!(app.repos.uses.sidebar_width(), Some(app.repos.width));
+
+        let out = screen(&mut app, 120, 14);
+        println!("{out}");
+        let title: Vec<char> = out.lines().find(|l| l.contains("Repos 1/")).unwrap().chars().collect();
+        let corner = |c: char| title.iter().position(|x| *x == c).unwrap();
+        assert_eq!(corner('╮') - corner('╭') + 1, app.repos.width as usize);
+
+        // And it can't be dragged past the room the runs and detail panes need.
+        for _ in 0..40 {
+            app.handle_key(KeyEvent::from(KeyCode::Char('>')));
+        }
+        assert!(app.repos.width <= 120 - crate::app::MIN_BODY_WIDTH);
+        assert!(app.repos.shown, "widening must not push it off screen");
+    }
+
+    #[test]
+    fn a_narrow_terminal_drops_the_sidebar() {
+        let mut app = demo_app();
+        let out = screen(&mut app, 80, 14);
+        println!("{out}");
+
+        assert!(!out.contains("All repos"), "no room for a third pane");
+        assert!(!app.repos.shown, "so it must not scope the runs list either");
+        assert!(out.contains("Repository"));
     }
 
     #[test]

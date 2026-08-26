@@ -1,0 +1,240 @@
+//! The repos sidebar: every watched repo, ordered by how much you use it, plus
+//! the scope it puts on the runs list. Row 0 of the pane is "All repos", so a
+//! repo in `rows` sits at pane index + 1.
+
+use crate::config::Config;
+use crate::github::{Run, RunState};
+use crate::state::State;
+use chrono::{DateTime, Utc};
+use ratatui::widgets::ListState;
+use std::collections::{HashMap, HashSet};
+
+/// UI ticks per column of marquee movement (the tick is 120ms).
+const SLIDE_TICKS: u8 = 2;
+
+/// How wide the sidebar can be dragged, and what it starts at.
+pub const MIN_WIDTH: u16 = 16;
+pub const MAX_WIDTH: u16 = 60;
+pub const DEFAULT_WIDTH: u16 = 28;
+
+/// The runs and detail panes need at least this much between them; below it the
+/// sidebar isn't drawn at all.
+pub const MIN_BODY_WIDTH: u16 = 68;
+
+/// One repo row: the repo plus a rollup of its runs.
+pub struct RepoRow {
+    pub name: String,
+    pub pinned: bool,
+    /// Runs queued or in progress.
+    pub active: usize,
+    pub failed: usize,
+    /// Latest run activity, for the age column.
+    pub last: Option<DateTime<Utc>>,
+}
+
+pub struct ReposPane {
+    /// What the user asked for (config `sidebar`, toggled with `p`).
+    pub visible: bool,
+    /// How wide you've dragged it, remembered between sessions.
+    pub width: u16,
+    /// True while a name is too long for the pane and is sliding past. Set at
+    /// draw time; it's what tells the clock there's an animation to run.
+    pub sliding: bool,
+    /// The marquee's position, in columns.
+    pub step: usize,
+    /// Sub-counter, so the marquee moves slower than the 120ms UI tick.
+    ticks: u8,
+    /// Whether it actually made it on screen — a narrow terminal drops it, and
+    /// a pane you can't see must not filter the runs list. Set while drawing.
+    pub shown: bool,
+    pub rows: Vec<RepoRow>,
+    pub state: ListState,
+    /// Repos to keep at the top, in the order the config lists them.
+    pinned: Vec<String>,
+    /// Every repo the sweep watches, including those with no recent runs.
+    known: Vec<String>,
+    /// Use history, which decides the order below the pinned repos.
+    pub uses: State,
+}
+
+impl ReposPane {
+    pub fn new(cfg: &Config) -> Self {
+        let mut state = ListState::default();
+        state.select(Some(0)); // "All repos"
+        let uses = State::load();
+        let width = uses.sidebar_width().unwrap_or(DEFAULT_WIDTH).clamp(MIN_WIDTH, MAX_WIDTH);
+        Self {
+            visible: cfg.sidebar,
+            width,
+            sliding: false,
+            step: 0,
+            ticks: 0,
+            shown: false,
+            rows: Vec::new(),
+            state,
+            pinned: cfg.pinned.clone(),
+            known: Vec::new(),
+            uses,
+        }
+    }
+
+    /// Widen or narrow the pane, within the bounds and whatever room the
+    /// terminal leaves for the runs and detail panes. Remembered on the way out.
+    pub fn resize(&mut self, delta: i32, term_width: u16) {
+        let room = term_width.saturating_sub(MIN_BODY_WIDTH).max(MIN_WIDTH);
+        let max = MAX_WIDTH.min(room);
+        let width = (self.width as i32 + delta).clamp(MIN_WIDTH as i32, max as i32) as u16;
+        if width != self.width {
+            self.width = width;
+            self.uses.set_sidebar_width(width);
+        }
+    }
+
+    /// Advance the marquee. Returns true when the screen needs a repaint —
+    /// only while a name is actually mid-slide, so an idle sidebar costs
+    /// nothing.
+    pub fn tick(&mut self) -> bool {
+        if !self.shown || !self.sliding {
+            self.ticks = 0;
+            return false;
+        }
+        self.ticks += 1;
+        if self.ticks < SLIDE_TICKS {
+            return false;
+        }
+        self.ticks = 0;
+        self.step += 1;
+        true
+    }
+
+    /// Rows plus the leading "All repos" row.
+    pub fn len(&self) -> usize {
+        self.rows.len() + 1
+    }
+
+    /// The repo the cursor is on; `None` on the "All repos" row.
+    pub fn selected_repo(&self) -> Option<&str> {
+        let i = self.state.selected()?;
+        Some(self.rows.get(i.checked_sub(1)?)?.name.as_str())
+    }
+
+    /// The repo the runs list is limited to, if any.
+    pub fn scope(&self) -> Option<&str> {
+        self.shown.then(|| self.selected_repo()).flatten()
+    }
+
+    pub fn in_scope(&self, repo: &str) -> bool {
+        self.scope().is_none_or(|s| s == repo)
+    }
+
+    pub fn move_sel(&mut self, delta: i32) {
+        let cur = self.state.selected().unwrap_or(0) as i32;
+        let next = (cur + delta).clamp(0, self.len() as i32 - 1) as usize;
+        self.state.select(Some(next));
+    }
+
+    pub fn jump(&mut self, top: bool) {
+        self.state.select(Some(if top { 0 } else { self.len() - 1 }));
+    }
+
+    pub fn select(&mut self, i: usize) {
+        self.state.select(Some(i.min(self.len() - 1)));
+    }
+
+    /// Back to "All repos".
+    pub fn clear_scope(&mut self) {
+        self.state.select(Some(0));
+    }
+
+    pub fn record_use(&mut self, repo: &str) {
+        self.uses.record(repo);
+    }
+
+    /// Repos the sweep is watching, whether or not they have runs to show. This
+    /// is what lets you reach a repo that hasn't built in weeks.
+    pub fn set_known(&mut self, names: Vec<String>) {
+        self.known = names;
+    }
+
+    /// Rebuild the rows from the current runs. Order: pinned repos first, in the
+    /// order they're configured, then the ones you use most, then whatever ran
+    /// most recently. The cursor stays on the same repo across a reorder.
+    ///
+    /// Only a refresh re-sorts (`resort`). Using a repo raises its score, and
+    /// re-sorting on every keystroke would shuffle the list under the cursor
+    /// while you're moving through it; the counts still update every time.
+    pub fn rebuild(&mut self, runs: &[Run], resort: bool) {
+        let mut rollup: HashMap<&str, (usize, usize, Option<DateTime<Utc>>)> = HashMap::new();
+        for r in runs {
+            let e = rollup.entry(r.repository.full_name.as_str()).or_default();
+            match r.state() {
+                RunState::Queued | RunState::Running => e.0 += 1,
+                RunState::Failure => e.1 += 1,
+                _ => {}
+            }
+            e.2 = e.2.max(Some(r.updated_at));
+        }
+
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut names: Vec<&str> = Vec::new();
+        let sources = self
+            .pinned
+            .iter()
+            .chain(self.known.iter())
+            .map(String::as_str)
+            .chain(rollup.keys().copied());
+        for name in sources {
+            if seen.insert(name) {
+                names.push(name);
+            }
+        }
+
+        let mut rows: Vec<RepoRow> = names
+            .into_iter()
+            .map(|name| {
+                let (active, failed, last) = rollup.get(name).copied().unwrap_or_default();
+                RepoRow {
+                    name: name.to_string(),
+                    pinned: self.pin_rank(name).is_some(),
+                    active,
+                    failed,
+                    last,
+                }
+            })
+            .collect();
+        if resort || self.rows.is_empty() {
+            rows.sort_by(|a, b| {
+                self.pin_rank(&a.name)
+                    .unwrap_or(usize::MAX)
+                    .cmp(&self.pin_rank(&b.name).unwrap_or(usize::MAX))
+                    .then_with(|| {
+                        self.uses
+                            .score(&b.name)
+                            .total_cmp(&self.uses.score(&a.name))
+                    })
+                    .then_with(|| b.last.cmp(&a.last))
+                    .then_with(|| a.name.cmp(&b.name))
+            });
+        } else {
+            // Hold the order you're looking at; repos we haven't shown yet go last.
+            let at: HashMap<String, usize> = self
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (r.name.clone(), i))
+                .collect();
+            rows.sort_by_key(|r| at.get(&r.name).copied().unwrap_or(usize::MAX));
+        }
+
+        let keep = self.selected_repo().map(str::to_string);
+        self.rows = rows;
+        let at = keep
+            .and_then(|name| self.rows.iter().position(|r| r.name == name))
+            .map_or(0, |i| i + 1);
+        self.state.select(Some(at));
+    }
+
+    fn pin_rank(&self, name: &str) -> Option<usize> {
+        self.pinned.iter().position(|p| p.eq_ignore_ascii_case(name))
+    }
+}

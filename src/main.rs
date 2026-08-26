@@ -3,6 +3,7 @@
 mod app;
 mod config;
 mod github;
+mod state;
 mod ui;
 
 use anyhow::Result;
@@ -50,7 +51,7 @@ fn resolve_theme(cfg: &Config) -> ui::Theme {
 }
 
 async fn run(terminal: &mut ratatui::DefaultTerminal, gh: Github, cfg: Config) -> Result<()> {
-    let mut app = App::new();
+    let mut app = App::new(&cfg);
     ui::set_theme(resolve_theme(&cfg));
     let (tx, mut rx) = mpsc::unbounded_channel::<DataMsg>();
 
@@ -98,6 +99,8 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, gh: Github, cfg: Config) -
     let mut redraw = true;
     loop {
         if redraw {
+            let width = terminal.size().map(|s| s.width).unwrap_or(u16::MAX);
+            app.sync_sidebar(width);
             terminal.draw(|f| ui::draw(f, &mut app))?;
             redraw = false;
         }
@@ -211,6 +214,8 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, gh: Github, cfg: Config) -
 
         dispatch_commands(&mut app, &gh, &cfg, &tx);
     }
+    // Keep the repo use history for the next session.
+    app.save_state();
     Ok(())
 }
 
@@ -548,7 +553,8 @@ fn spawn_refresh(gh: &Github, cfg: &Config, tx: &UnboundedSender<DataMsg>) {
             repos.truncate(cfg.max_repos);
         }
 
-        let _ = tx.send(DataMsg::Repos(repos.len()));
+        let names = repos.iter().map(|r| r.full_name.clone()).collect();
+        let _ = tx.send(DataMsg::Repos(names));
         if repos.is_empty() {
             let _ = tx.send(DataMsg::RefreshDone);
             return;

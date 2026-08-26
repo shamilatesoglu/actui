@@ -7,12 +7,15 @@ mod input;
 mod logs;
 mod overlays;
 mod protocol;
+mod repos;
 
 pub use logs::{LogsView, StepsView};
 pub use overlays::*;
+pub use repos::{ReposPane, MIN_BODY_WIDTH};
 pub use protocol::{AnnJob, Command, DataMsg};
 pub(crate) use logs::{is_error_line, log_content};
 
+use crate::config::Config;
 use crate::github::{Actor, Job, RateLimit, Run, RunRepo, RunState, Step};
 use chrono::{DateTime, Utc};
 use ratatui::layout::Rect;
@@ -72,6 +75,7 @@ impl Filter {
 /// Which pane the keyboard drives in normal mode.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
+    Repos,
     Runs,
     Jobs,
 }
@@ -82,6 +86,8 @@ pub enum Focus {
 pub struct HitMap {
     /// Filter tabs row.
     pub tabs: Rect,
+    /// Repos sidebar content (empty when the sidebar isn't drawn).
+    pub repos: Rect,
     /// Runs table content (its first row is the column header).
     pub runs: Rect,
     /// Jobs list content within the detail pane.
@@ -118,6 +124,9 @@ pub struct App {
     pub mode: Mode,
     pub focus: Focus,
     pub errors: Vec<String>,
+
+    /// The repos sidebar, and the repo scope it puts on the runs list.
+    pub repos: ReposPane,
 
     pub jobs: Vec<Job>,
     pub jobs_state: ListState,
@@ -178,10 +187,14 @@ pub struct App {
     pending_dispatches: Vec<Run>,
     /// Source of the synthetic, never-colliding ids given to placeholders.
     next_placeholder_id: u64,
+    /// Set when the next view rebuild should also re-order the repos sidebar.
+    resort_repos: bool,
+    /// Terminal width at the last frame, so a resize can be bounded by it.
+    term_width: u16,
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(cfg: &Config) -> Self {
         Self {
             user: String::new(),
             runs: Vec::new(),
@@ -192,6 +205,7 @@ impl App {
             mode: Mode::Normal,
             focus: Focus::Runs,
             errors: Vec::new(),
+            repos: ReposPane::new(cfg),
             jobs: Vec::new(),
             jobs_state: ListState::default(),
             jobs_run_id: None,
@@ -226,6 +240,8 @@ impl App {
             jobs_fetch_due: None,
             pending_dispatches: Vec::new(),
             next_placeholder_id: 0,
+            resort_repos: true,
+            term_width: u16::MAX,
         }
     }
 
@@ -255,8 +271,10 @@ impl App {
     pub fn apply(&mut self, msg: DataMsg) {
         match msg {
             DataMsg::User(u) => self.user = u,
-            DataMsg::Repos(n) => {
-                self.repos_total = n;
+            DataMsg::Repos(names) => {
+                self.repos_total = names.len();
+                self.repos.set_known(names);
+                self.resort_repos = true;
                 self.repos_done = 0;
                 self.loading = true;
                 self.errors.clear(); // errors reflect the latest sweep only
@@ -450,6 +468,7 @@ impl App {
 
     fn finish_refresh(&mut self) {
         self.loading = false;
+        self.resort_repos = true;
         self.last_refresh = Some(Utc::now());
         // Drop cached jobs for runs that fell out of the latest sweep so the
         // cache can't grow without bound over a long session.
@@ -575,11 +594,14 @@ impl App {
 
     pub fn recompute_view(&mut self) {
         let prev_id = self.selected_run().map(|r| r.id);
+        let resort = std::mem::take(&mut self.resort_repos);
+        self.repos.rebuild(&self.runs, resort);
         let q = self.search.to_lowercase();
         self.view = self
             .runs
             .iter()
             .enumerate()
+            .filter(|(_, r)| self.repos.in_scope(&r.repository.full_name))
             .filter(|(_, r)| self.filter.matches(r.state()))
             .filter(|(_, r)| {
                 if q.is_empty() {
@@ -644,8 +666,30 @@ impl App {
     /// e.g. the user drilled into the jobs pane or opened logs).
     pub(crate) fn flush_jobs_fetch(&mut self) {
         if let Some((_, repo, run_id)) = self.jobs_fetch_due.take() {
+            // The selection settled on this repo — that counts as using it.
+            self.repos.record_use(&repo);
             self.pending.push(Command::FetchJobs { repo, run_id });
         }
+    }
+
+    /// Settle whether the sidebar is on screen at this terminal width, keeping
+    /// the runs list in step: a pane you can't see must not scope anything.
+    pub fn sync_sidebar(&mut self, term_width: u16) {
+        self.term_width = term_width;
+        let shown = self.repos.visible && term_width >= self.repos.width + MIN_BODY_WIDTH;
+        if shown == self.repos.shown {
+            return;
+        }
+        self.repos.shown = shown;
+        if !shown && self.focus == Focus::Repos {
+            self.focus = Focus::Runs;
+        }
+        self.recompute_view();
+    }
+
+    /// Persist the repo use history (called once, on the way out).
+    pub fn save_state(&self) {
+        self.repos.uses.save();
     }
 
     pub fn counts(&self) -> (usize, usize, usize, usize) {
@@ -698,6 +742,10 @@ impl App {
                 self.status_msg = None;
                 dirty = true;
             }
+        }
+        // A repo name too long for the sidebar slides past; that needs frames.
+        if self.repos.tick() {
+            dirty = true;
         }
         // Fire the debounced jobs fetch once the selection has settled.
         if self
@@ -863,6 +911,10 @@ fn list_jump(state: &mut ListState, len: usize, top: bool) {
 mod tests {
     use super::*;
 
+    fn run_in(repo: &str, id: u64) -> Run {
+        Run { repository: crate::github::RunRepo { full_name: repo.into() }, ..run_with(id, "completed", Some("success")) }
+    }
+
     fn run_with(id: u64, status: &str, conclusion: Option<&str>) -> Run {
         Run {
             id,
@@ -884,7 +936,7 @@ mod tests {
 
     #[test]
     fn notifies_only_on_active_to_terminal_transition() {
-        let mut app = App::new();
+        let mut app = App::new(&Config::default());
         // First sweep: run is in progress — establishes the baseline, no notify.
         app.runs = vec![run_with(1, "in_progress", None)];
         app.detect_run_completions();
@@ -918,11 +970,71 @@ mod tests {
 
     #[test]
     fn no_notification_for_run_already_finished_when_first_seen() {
-        let mut app = App::new();
+        let mut app = App::new(&Config::default());
         // A run we never watched as active appears already-successful: stay quiet.
         app.runs = vec![run_with(2, "completed", Some("success"))];
         app.detect_run_completions();
         assert!(app.pending.is_empty());
+    }
+
+    #[test]
+    fn repo_scope_limits_the_runs_view() {
+        let mut app = App::new(&Config::default());
+        app.repos.shown = true;
+        app.runs = vec![run_in("org/api", 1), run_in("org/web", 2)];
+        app.recompute_view();
+        assert_eq!(app.view.len(), 2, "the All repos row shows everything");
+
+        let at = app.repos.rows.iter().position(|r| r.name == "org/web").unwrap();
+        app.repos.select(at + 1);
+        app.recompute_view();
+        assert_eq!(app.view.len(), 1);
+        assert_eq!(app.runs[app.view[0]].repository.full_name, "org/web");
+
+        // A hidden sidebar must not filter the list.
+        app.repos.shown = false;
+        app.recompute_view();
+        assert_eq!(app.view.len(), 2);
+    }
+
+    #[test]
+    fn sidebar_lists_watched_repos_that_have_no_runs() {
+        let mut app = App::new(&Config::default());
+        app.apply(DataMsg::Repos(vec!["org/api".into(), "org/quiet".into()]));
+        app.runs = vec![run_in("org/api", 1)];
+        app.recompute_view();
+        assert!(app.repos.rows.iter().any(|r| r.name == "org/quiet"));
+    }
+
+    #[test]
+    fn pinned_repos_lead_then_the_ones_used_most() {
+        let cfg = Config { pinned: vec!["org/pinned".into()], ..Config::default() };
+        let mut app = App::new(&cfg);
+        // Ignore whatever history this machine happens to have.
+        app.repos.uses = crate::state::State::default();
+        app.repos
+            .set_known(vec!["org/api".into(), "org/web".into(), "org/pinned".into()]);
+        app.repos.record_use("org/web");
+        app.recompute_view();
+
+        let order: Vec<&str> = app.repos.rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(order, ["org/pinned", "org/web", "org/api"]);
+    }
+
+    #[test]
+    fn dispatch_from_the_sidebar_targets_a_repo_with_no_runs() {
+        use crossterm::event::{KeyCode, KeyEvent};
+
+        let mut app = App::new(&Config::default());
+        app.repos.shown = true;
+        app.apply(DataMsg::Repos(vec!["org/quiet".into()]));
+        app.recompute_view();
+        app.focus = Focus::Repos;
+        app.repos.select(1);
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('d')));
+        assert!(matches!(app.mode, Mode::Dispatch));
+        assert_eq!(app.dispatch.as_ref().map(|d| d.repo.as_str()), Some("org/quiet"));
     }
 
     #[test]
@@ -954,7 +1066,7 @@ mod tests {
 
     #[test]
     fn recompute_view_preserves_selection_by_run_id() {
-        let mut app = App::new();
+        let mut app = App::new(&Config::default());
         app.runs = vec![
             run_with(1, "in_progress", None),         // Running
             run_with(2, "completed", Some("success")), // Success
@@ -986,7 +1098,7 @@ mod tests {
     fn sync_jobs_serves_cache_on_hit_and_clears_on_miss() {
         // Hit: a cached run shows its jobs immediately and still queues a
         // refetch — debounced until the selection settles (or is flushed).
-        let mut hit = App::new();
+        let mut hit = App::new(&Config::default());
         hit.runs = vec![run_with(1, "in_progress", None)];
         hit.jobs_cache.insert(1, vec![job(10)]);
         hit.recompute_view();
@@ -1003,7 +1115,7 @@ mod tests {
             .any(|c| matches!(c, Command::FetchJobs { run_id: 1, .. })));
 
         // Miss: an uncached run clears the list but still queues a refetch.
-        let mut miss = App::new();
+        let mut miss = App::new(&Config::default());
         miss.runs = vec![run_with(2, "in_progress", None)];
         miss.recompute_view();
         assert!(miss.jobs.is_empty());
@@ -1023,7 +1135,7 @@ mod tests {
 
     #[test]
     fn drilling_into_a_failed_run_preselects_the_failed_job() {
-        let mut app = App::new();
+        let mut app = App::new(&Config::default());
         app.runs = vec![run_with(1, "completed", Some("failure"))];
         app.jobs_cache.insert(
             1,
@@ -1041,7 +1153,7 @@ mod tests {
         );
 
         // With nothing failed, the first job is selected as before.
-        let mut ok = App::new();
+        let mut ok = App::new(&Config::default());
         ok.runs = vec![run_with(2, "completed", Some("success"))];
         ok.jobs_cache.insert(2, vec![job(20), job(21)]);
         ok.recompute_view();
@@ -1050,7 +1162,7 @@ mod tests {
 
     #[test]
     fn finish_refresh_prunes_jobs_cache_to_live_runs() {
-        let mut app = App::new();
+        let mut app = App::new(&Config::default());
         app.jobs_cache.insert(1, vec![job(1)]);
         app.jobs_cache.insert(2, vec![job(2)]);
         app.jobs_cache.insert(3, vec![job(3)]);
@@ -1067,7 +1179,7 @@ mod tests {
 
     #[test]
     fn annotation_targets_prefer_failed_jobs_then_fall_back_to_all() {
-        let mut app = App::new();
+        let mut app = App::new(&Config::default());
         app.runs = vec![run_with(1, "completed", Some("failure"))];
         app.recompute_view();
         app.jobs_run_id = Some(1);
@@ -1093,7 +1205,7 @@ mod tests {
 
     #[test]
     fn logs_message_applies_pending_search() {
-        let mut app = App::new();
+        let mut app = App::new(&Config::default());
         app.pending_open_log_id = Some(1);
         app.pending_log_search = Some("boom".into());
         app.apply(DataMsg::Logs {
@@ -1109,7 +1221,7 @@ mod tests {
 
     #[test]
     fn cycle_filter_wraps_both_directions() {
-        let mut app = App::new();
+        let mut app = App::new(&Config::default());
         assert_eq!(app.filter, Filter::All);
         app.cycle_filter(-1);
         assert_eq!(app.filter, Filter::Success); // wrap backward past the start
@@ -1144,7 +1256,7 @@ mod tests {
 
     #[test]
     fn submit_dispatch_omits_empty_optionals_and_includes_the_rest() {
-        let mut app = App::new();
+        let mut app = App::new(&Config::default());
         app.dispatch = Some(loaded_dispatch(
             vec![
                 dispatch_field("required_field", true, FieldKind::Text { value: "val".into(), numeric: false }),
@@ -1174,7 +1286,7 @@ mod tests {
     #[test]
     fn submit_dispatch_rejects_missing_required_and_blank_ref() {
         // A blank required field is rejected with a per-field message; nothing queued.
-        let mut app = App::new();
+        let mut app = App::new(&Config::default());
         app.dispatch = Some(loaded_dispatch(
             vec![dispatch_field("token", true, FieldKind::Text { value: String::new(), numeric: false })],
             "main",
@@ -1186,7 +1298,7 @@ mod tests {
         assert!(is_err && msg.contains("token"));
 
         // A blank ref is rejected too.
-        let mut app = App::new();
+        let mut app = App::new(&Config::default());
         app.dispatch = Some(loaded_dispatch(Vec::new(), "   "));
         app.submit_dispatch();
         assert!(!app.pending.iter().any(|c| matches!(c, Command::Dispatch { .. })));
@@ -1196,7 +1308,7 @@ mod tests {
 
     #[test]
     fn submit_dispatch_shows_an_immediate_active_placeholder() {
-        let mut app = App::new();
+        let mut app = App::new(&Config::default());
         app.dispatch = Some(loaded_dispatch(Vec::new(), "main"));
         app.submit_dispatch();
 
@@ -1216,7 +1328,7 @@ mod tests {
 
     #[test]
     fn dispatch_failure_removes_the_placeholder() {
-        let mut app = App::new();
+        let mut app = App::new(&Config::default());
         let id = app.push_dispatch_placeholder("org/api", "CI", "main");
         assert!(app.runs.iter().any(|r| r.id == id));
 
@@ -1229,7 +1341,7 @@ mod tests {
 
     #[test]
     fn placeholder_survives_refresh_then_yields_to_the_real_run() {
-        let mut app = App::new();
+        let mut app = App::new(&Config::default());
         let id = app.push_dispatch_placeholder("org/api", "CI", "main");
 
         // A refresh that doesn't yet include the real run keeps the placeholder.

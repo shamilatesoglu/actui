@@ -66,7 +66,9 @@ impl App {
             Mode::Normal | Mode::Search => {
                 // Scroll the pane under the pointer; elsewhere, the focused one.
                 let pos = Position::new(x, y);
-                if self.hit.jobs.contains(pos) {
+                if self.hit.repos.contains(pos) {
+                    self.move_repo_sel(delta);
+                } else if self.hit.jobs.contains(pos) {
                     self.cycle_job(delta);
                 } else if self.hit.runs.contains(pos) {
                     self.move_sel(delta);
@@ -149,6 +151,14 @@ impl App {
                         x0 += w;
                     }
                     false
+                } else if self.hit.repos.contains(pos) {
+                    self.focus = Focus::Repos;
+                    let row = self.repos.state.offset() + (y - self.hit.repos.y) as usize;
+                    if row < self.repos.len() {
+                        self.repos.select(row);
+                        self.recompute_view();
+                    }
+                    true
                 } else if self.hit.runs.contains(pos) {
                     self.focus = Focus::Runs;
                     let row = (y - self.hit.runs.y) as usize;
@@ -178,6 +188,7 @@ impl App {
     /// One page of the focused pane, from the rect recorded at draw time.
     fn page_focused(&self) -> i32 {
         let h = match self.focus {
+            Focus::Repos => self.hit.repos.height,
             Focus::Runs => self.hit.runs.height.saturating_sub(1), // header row
             Focus::Jobs => self.hit.jobs.height,
         };
@@ -196,14 +207,18 @@ impl App {
             KeyCode::Char('g') | KeyCode::Home => self.jump_focused(true),
             KeyCode::Char('G') | KeyCode::End => self.jump_focused(false),
             // Pane focus.
-            KeyCode::Tab => self.toggle_focus(),
-            KeyCode::BackTab => self.toggle_focus(),
-            KeyCode::Right => self.focus_jobs(),
-            KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => self.focus = Focus::Runs,
-            // Esc dismisses progressively: a kept search filter first, then focus.
+            KeyCode::Tab => self.cycle_focus(1),
+            KeyCode::BackTab => self.cycle_focus(-1),
+            KeyCode::Right => self.focus_right(),
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => self.focus_left(),
+            // Esc dismisses progressively: a kept search filter, then the repo
+            // scope, then focus.
             KeyCode::Esc => {
                 if !self.search.is_empty() {
                     self.search.clear();
+                    self.recompute_view();
+                } else if self.repos.scope().is_some() {
+                    self.repos.clear_scope();
                     self.recompute_view();
                 } else {
                     self.focus = Focus::Runs;
@@ -229,6 +244,7 @@ impl App {
             KeyCode::Char('?') => self.mode = Mode::Help,
             // Enter / l: drill from runs into jobs, or open the focused job's logs.
             KeyCode::Enter | KeyCode::Char('l') => match self.focus {
+                Focus::Repos => self.focus = Focus::Runs,
                 Focus::Runs => self.focus_jobs(),
                 Focus::Jobs => self.open_logs(),
             },
@@ -244,12 +260,16 @@ impl App {
             KeyCode::Char('v') => self.open_annotations(),
             KeyCode::Char('d') => self.open_dispatch(),
             KeyCode::Char('s') => self.open_runners(),
+            KeyCode::Char('p') => self.toggle_repos_pane(),
+            KeyCode::Char('>') => self.resize_repos_pane(2),
+            KeyCode::Char('<') => self.resize_repos_pane(-2),
             _ => {}
         }
     }
 
     fn move_focused(&mut self, delta: i32) {
         match self.focus {
+            Focus::Repos => self.move_repo_sel(delta),
             Focus::Runs => self.move_sel(delta),
             Focus::Jobs => self.cycle_job(delta),
         }
@@ -257,6 +277,10 @@ impl App {
 
     fn jump_focused(&mut self, top: bool) {
         match self.focus {
+            Focus::Repos => {
+                self.repos.jump(top);
+                self.recompute_view();
+            }
             Focus::Runs => {
                 if !self.view.is_empty() {
                     self.select_idx(if top { 0 } else { self.view.len() - 1 });
@@ -271,15 +295,65 @@ impl App {
         }
     }
 
-    fn toggle_focus(&mut self) {
-        self.focus = match self.focus {
-            Focus::Runs => Focus::Jobs,
-            Focus::Jobs => Focus::Runs,
+    /// Moving the repo cursor re-scopes the runs list under it.
+    fn move_repo_sel(&mut self, delta: i32) {
+        self.repos.move_sel(delta);
+        self.recompute_view();
+    }
+
+    /// Show or hide the repos sidebar. Hiding it drops the repo scope too, so
+    /// the runs list is never filtered by a pane you can't see.
+    fn toggle_repos_pane(&mut self) {
+        self.repos.visible = !self.repos.visible;
+        if !self.repos.visible {
+            self.repos.shown = false;
+            if self.focus == Focus::Repos {
+                self.focus = Focus::Runs;
+            }
+        }
+        self.recompute_view();
+    }
+
+    /// Widen or narrow the sidebar. A no-op while it's off screen — there's
+    /// nothing to resize.
+    fn resize_repos_pane(&mut self, delta: i32) {
+        if self.repos.shown {
+            self.repos.resize(delta, self.term_width);
+        }
+    }
+
+    /// Move focus one pane along, skipping the sidebar while it's off screen.
+    fn cycle_focus(&mut self, delta: i32) {
+        let order: &[Focus] = if self.repos.shown {
+            &[Focus::Repos, Focus::Runs, Focus::Jobs]
+        } else {
+            &[Focus::Runs, Focus::Jobs]
         };
+        let n = order.len() as i32;
+        let cur = order.iter().position(|f| *f == self.focus).unwrap_or(0) as i32;
+        self.focus = order[(((cur + delta) % n + n) % n) as usize];
         if self.focus == Focus::Jobs {
             self.flush_jobs_fetch();
             self.ensure_job_selected();
         }
+    }
+
+    /// Drill one pane inwards: Repos to Runs to Jobs.
+    fn focus_right(&mut self) {
+        if self.focus == Focus::Repos {
+            self.focus = Focus::Runs;
+        } else {
+            self.focus_jobs();
+        }
+    }
+
+    /// Back out one pane: Jobs to Runs to Repos.
+    fn focus_left(&mut self) {
+        self.focus = match self.focus {
+            Focus::Jobs => Focus::Runs,
+            Focus::Runs if self.repos.shown => Focus::Repos,
+            f => f,
+        };
     }
 
     fn focus_jobs(&mut self) {
@@ -707,6 +781,7 @@ impl App {
             Some(r) => r.repository.full_name.clone(),
             None => return,
         };
+        self.repos.record_use(&repo);
         if running {
             // Text logs 404 until the job completes; show the live step view
             // instead (auto-switches to full logs on completion).
@@ -1137,13 +1212,43 @@ impl App {
         self.pending.push(Command::FetchArtifacts { repo, run_id });
     }
 
+    /// The repo a dispatch targets, and the ref to pre-fill: the sidebar's repo
+    /// when it holds focus or scopes the list, else the selected run's. Going
+    /// through the sidebar is what lets you dispatch in a repo with no runs
+    /// loaded at all.
+    fn dispatch_target(&self) -> Option<(String, String)> {
+        let from_pane = match (self.focus, self.selected_run()) {
+            (Focus::Repos, _) => self.repos.selected_repo(),
+            // Nothing selected — a scope on a repo with no runs still targets it.
+            (_, None) => self.repos.scope(),
+            _ => None,
+        };
+        if let Some(repo) = from_pane {
+            let git_ref = self.latest_branch(repo).unwrap_or_else(|| "main".into());
+            return Some((repo.to_string(), git_ref));
+        }
+        let run = self.selected_run()?;
+        Some((
+            run.repository.full_name.clone(),
+            run.head_branch.clone().unwrap_or_else(|| "main".into()),
+        ))
+    }
+
+    /// The branch of a repo's most recent run, if we have seen one.
+    fn latest_branch(&self, repo: &str) -> Option<String> {
+        self.runs
+            .iter()
+            .filter(|r| r.repository.full_name == repo)
+            .max_by_key(|r| r.updated_at)
+            .and_then(|r| r.head_branch.clone())
+    }
+
     fn open_dispatch(&mut self) {
-        let Some(run) = self.selected_run() else {
-            self.set_status("Select a run first (its repo is used for dispatch)", true);
+        let Some((repo, default_branch)) = self.dispatch_target() else {
+            self.set_status("Select a run or a repo first", true);
             return;
         };
-        let repo = run.repository.full_name.clone();
-        let default_branch = run.head_branch.clone().unwrap_or_else(|| "main".into());
+        self.repos.record_use(&repo);
         self.dispatch = Some(DispatchState {
             repo: repo.clone(),
             workflows: Vec::new(),

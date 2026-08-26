@@ -33,6 +33,10 @@ pub struct Config {
     /// Color theme: "auto" (follow the system light/dark setting), "dark", or
     /// "light".
     pub theme: String,
+    /// Show the repos sidebar on start (`p` toggles it at runtime).
+    pub sidebar: bool,
+    /// Repos kept at the top of the sidebar, in this order.
+    pub pinned: Vec<String>,
 }
 
 impl Default for Config {
@@ -50,6 +54,8 @@ impl Default for Config {
             notify: true,
             bell: true,
             theme: "auto".to_string(),
+            sidebar: true,
+            pinned: Vec::new(),
         }
     }
 }

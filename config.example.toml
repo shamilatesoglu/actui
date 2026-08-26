@@ -10,6 +10,13 @@ concurrency         = 3   # repos fetched in parallel (kept low to avoid bursts)
 max_repos           = 60  # cap, from most-recently-pushed repos (0 = no cap)
 skip_archived       = true # ignore archived repos
 
+# Repos sidebar: on by default, `p` toggles it, `<` / `>` resize it (the width
+# is remembered in state.toml), and a narrow terminal drops it.
+sidebar = true
+# Repos kept at the top of it, in this order. Everything else is ordered by how
+# much you use it (recorded in ~/.config/actui/state.toml).
+pinned  = []            # e.g. ["nodos-dev/api", "shamilatesoglu/actui"]
+
 # Only watch repos whose full_name contains one of these substrings.
 # Empty = every repo you own or are an org member of.
 include = []            # e.g. ["nodos-dev/", "shamilatesoglu/actui"]

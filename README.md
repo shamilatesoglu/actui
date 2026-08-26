@@ -3,27 +3,28 @@
 A fast, beautiful terminal UI for viewing and managing **GitHub Actions** across all the repos and orgs your account can see — without leaving the keyboard or opening a browser tab.
 
 ```
-╭ actui @you  ● 3  ○ 1  ● 2  ● 44   48 runs ──────────────── api 4982/5000 · updated 12s ╮
- Runs › Jobs › Logs
+╭ actui @you  ● 3  ○ 1  ● 2  ● 44   48 runs ──────────────────────────────── api 99% · updated 12s ╮
+ Repos › Runs › Jobs › Logs
  All  Running  Queued  Failed  Success
-╭ Runs ────────────────────────────────────╮╭ Detail ───────────────────╮
-▌● org/api      CI #296   main push 1m12s   ││ ● success  #296            │
- ● org/web      Deploy#88 main push  42s…   ││     repo  org/api          │
- ● you/dotfiles lint #5   main PR    18s    ││     flow  CI               │
- ◌ org/mobile   Release#3 v1.2 manual 3s    ││── Jobs ────────────────────│
-                                             ││▌● build        1m12s       │
-                                             ││ ● test         48s         │
-╰─────────────────────────────────────────╯╰────────────────────────────╯
- j/k move · Tab focus · / search · ⏎/o open · l logs · d dispatch · c cancel · x/X rerun · v failures · A artifacts · r refresh · ? help · q quit
+╭ Repos 1/6 ───────────────╮╭ Runs 1/48 ─────────────────────────────────╮╭ Detail ────────────────╮
+│   All repos        ●3 ●2 ││     Repository    Workflow    Branch  Age  ││● success  #296         │
+│ ★ org/api             ●3 ││▌●  org/api       CI #296     main   1m12s  ││    repo  org/api       │
+│   org/web             ●1 ││ ●  org/web       Deploy #88  main    42s   ││    flow  CI            │
+│   you/dotfiles       12m ││ ●  you/dotfiles  lint #5     main    18s   ││ Jobs ──────────────────│
+│   org/mobile          ○1 ││ ○  org/mobile    Release #3  v1.2     3s   ││▌● build        1m12s   │
+│   org/infra              ││                                            ││ ● test           48s   │
+╰──────────────────────────╯╰────────────────────────────────────────────╯╰────────────────────────╯
+ j/k move · Tab focus · / search · ⏎ jobs · l logs · d dispatch · c cancel · x/X rerun · v failures · p repos · ? help · q quit
 ```
 
 ## Features
 
 - **Aggregated view** of recent workflow runs across the repos you own and your org repos, sorted by latest activity. Each row shows the repo, workflow + run number, branch, trigger event, who triggered it, run **duration** (live-ticking while active), and age.
+- **Repos sidebar** — the repos you actually work in, at the top, so you don't scroll a mixed list to find one. Ordered by **how much you use each repo** (selecting its runs, opening its logs, dispatching in it — decayed so a repo you've dropped drifts down), with any `pinned` repos above that, marked `★`. Each row rolls up the repo's active and failed runs, or how long ago it last ran. Moving the cursor **scopes the runs list** to that repo (the now-redundant repository column makes way for the rest of the table); `Esc` goes back to *All repos*, `p` hides the sidebar, `<` / `>` resize it (remembered between sessions), and a narrow terminal drops it on its own. A name too long for the pane **slides past** rather than being cut off. Because it lists **every watched repo — including ones with no recent runs** — `d` there dispatches a workflow in a repo you'd otherwise have to go to github.com for. The history lives in `~/.config/actui/state.toml`.
 - **Live status** with color-coded states: running, queued, failed, success, cancelled, skipped. lazyactions-style panes: the focused pane gets an accent border and a highlighted (inverted) title tab; the unfocused pane dims its border and keeps a dimmed selection so you never lose your place. Popups float on a filled background.
 - **Completion notifications** — a terminal bell plus a desktop toast the moment a watched run flips to success/failure/cancelled, so you can leave it running in the background. Configurable (`notify` / `bell`).
 - **Automatic light/dark theme** — follows your OS appearance setting and switches live when you flip it. Pin it with `theme = "dark"` / `"light"` if you'd rather not auto-detect.
-- **Two-pane navigation** (Runs ⟷ Jobs) with a `Runs › Jobs › Logs` breadcrumb; `Tab` moves focus, `j`/`k` move within the focused pane.
+- **Three-pane navigation** (Repos ⟷ Runs ⟷ Jobs) with a `Repos › Runs › Jobs › Logs` breadcrumb; `Tab` moves focus, `j`/`k` move within the focused pane.
 - **Filter** by status (`1`–`5`) and **fuzzy search** (`/`) across repo, workflow, and branch.
 - **Job detail pane** that auto-loads the selected run's jobs with per-job durations.
 - **Rich logs viewer**:
@@ -82,6 +83,11 @@ skip_archived       = true
 notify              = true  # desktop notification when a watched run finishes
 bell                = true  # ring the terminal bell when a watched run finishes
 theme               = "auto"  # "auto" follows the OS light/dark setting; or "dark" / "light"
+sidebar             = true  # show the repos sidebar (`p` toggles it, `<`/`>` resize it)
+
+# Repos kept at the top of the sidebar, in this order. The rest are ordered by
+# how much you use them:
+pinned = []             # e.g. ["my-org/api", "you/dotfiles"]
 
 # Only watch repos whose full name contains one of these (empty = all):
 include = []            # e.g. ["my-org/", "you/important-repo"]
@@ -93,20 +99,23 @@ exclude = []            # e.g. ["fork-of-"]
 
 ## Keys
 
-**Runs / Jobs panes**
+**Repos / Runs / Jobs panes**
 
 | Key | Action |
 |-----|--------|
 | `j` / `k`, `↑` / `↓` | move within the focused pane |
 | `g` / `G` | top / bottom |
-| `Tab` | switch focus between Runs and Jobs |
-| `Enter` / `l` / `→` | drill Runs → Jobs, or open a job's logs |
-| `h` / `←` / `Backspace` / `Esc` | back to Runs (`Backspace`/`Esc` also close any popup or the logs viewer) |
+| `Tab` | move focus one pane along (`Shift-Tab` goes back) |
+| `p` | show / hide the repos sidebar |
+| `<` / `>` | narrow / widen the repos sidebar |
+| `Enter` / `l` / `→` | drill in: Repos → Runs → Jobs, or open a job's logs |
+| `h` / `←` / `Backspace` | back out: Jobs → Runs → Repos (`Backspace` also closes any popup or the logs viewer) |
+| `Esc` | clear the search, then the repo scope, then focus (also closes popups) |
 | `1`–`5`, `[` / `]` | status filter |
 | `/` | fuzzy search runs (repo, workflow, branch) |
 | `o` | open in browser — the selected job's page when Jobs is focused, otherwise the run |
 | `L` | open the selected job's logs (works anywhere) |
-| `d` | dispatch a workflow |
+| `d` | dispatch a workflow — in the repo the sidebar is on, else the selected run's |
 | `c` | cancel run |
 | `x` / `X` | re-run failed / all jobs |
 | `R` | re-run the selected job |
@@ -132,9 +141,9 @@ Auto-refresh is always on; `r` / `F5` force an immediate sweep.
 
 **Mouse**
 
-The wheel scrolls whichever pane is under the pointer (runs, jobs, logs, or
-any open picker). Clicking selects a run or job row, switches pane focus,
-and picks a filter tab; a click also dismisses the help and error popups.
+The wheel scrolls whichever pane is under the pointer (repos, runs, jobs, logs,
+or any open picker). Clicking selects a repo, run, or job row, switches pane
+focus, and picks a filter tab; a click also dismisses the help and error popups.
 
 ## License
 
