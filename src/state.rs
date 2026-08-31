@@ -1,6 +1,6 @@
-//! What actui remembers between sessions, saved next to the config: which repos
-//! you actually work in (so the sidebar can put those first instead of making
-//! you hunt for them) and how wide you dragged the sidebar.
+//! What actui remembers between sessions, saved next to the config: the layout
+//! you dragged the panes and columns into, and which repos you actually work in
+//! (which orders the sidebar under `sort = "used"`).
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -19,10 +19,15 @@ pub struct RepoUse {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct State {
-    /// Sidebar width, once you've changed it. Declared before `repo`: TOML
-    /// wants plain values ahead of tables.
+    /// Pane widths, once you've changed them. Declared before the tables below:
+    /// TOML wants plain values ahead of them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sidebar_width: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail_width: Option<u16>,
+    /// Runs-table columns you've resized, by column name.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    columns: HashMap<String, u16>,
     /// Keyed by repo full name (`owner/name`).
     #[serde(default)]
     repo: HashMap<String, RepoUse>,
@@ -50,14 +55,40 @@ impl State {
         self.dirty = true;
     }
 
-    /// The sidebar width you last set, if you ever did.
+    /// The pane widths you last set, if you ever did.
     pub fn sidebar_width(&self) -> Option<u16> {
         self.sidebar_width
     }
 
+    pub fn detail_width(&self) -> Option<u16> {
+        self.detail_width
+    }
+
+    pub fn columns(&self) -> &HashMap<String, u16> {
+        &self.columns
+    }
+
+    /// The setters only mark the file dirty when something actually changed, so
+    /// a session that touched nothing doesn't rewrite it.
     pub fn set_sidebar_width(&mut self, width: u16) {
-        self.sidebar_width = Some(width);
-        self.dirty = true;
+        if self.sidebar_width != Some(width) {
+            self.sidebar_width = Some(width);
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_detail_width(&mut self, width: u16) {
+        if self.detail_width != Some(width) {
+            self.detail_width = Some(width);
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_columns(&mut self, columns: HashMap<String, u16>) {
+        if self.columns != columns {
+            self.columns = columns;
+            self.dirty = true;
+        }
     }
 
     /// How strongly a repo ranks: its uses, halved for every week since the last.
@@ -114,10 +145,14 @@ mod tests {
         let mut s = State::default();
         s.record("org/api");
         s.set_sidebar_width(34);
+        s.set_detail_width(30);
+        s.set_columns(HashMap::from([("repo".to_string(), 18)]));
         let text = toml::to_string_pretty(&s).unwrap();
         let back: State = toml::from_str(&text).unwrap();
         assert!(back.score("org/api") > 0.0, "wrote: {text}");
         assert_eq!(back.sidebar_width(), Some(34), "wrote: {text}");
+        assert_eq!(back.detail_width(), Some(30), "wrote: {text}");
+        assert_eq!(back.columns().get("repo"), Some(&18), "wrote: {text}");
     }
 
     #[test]

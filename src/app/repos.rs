@@ -1,6 +1,6 @@
-//! The repos sidebar: every watched repo, ordered by how much you use it, plus
-//! the scope it puts on the runs list. Row 0 of the pane is "All repos", so a
-//! repo in `rows` sits at pane index + 1.
+//! The repos sidebar: every watched repo, in a predictable order, plus the
+//! scope it puts on the runs list. Row 0 of the pane is "All repos", so a repo
+//! in `rows` sits at pane index + 1.
 
 use crate::config::Config;
 use crate::github::{Run, RunState};
@@ -12,14 +12,24 @@ use std::collections::{HashMap, HashSet};
 /// UI ticks per column of marquee movement (the tick is 120ms).
 const SLIDE_TICKS: u8 = 2;
 
-/// How wide the sidebar can be dragged, and what it starts at.
-pub const MIN_WIDTH: u16 = 16;
-pub const MAX_WIDTH: u16 = 60;
-pub const DEFAULT_WIDTH: u16 = 28;
+/// What decides the order below the pinned repos.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Sort {
+    /// A→Z, so a repo is always where you last saw it.
+    Alpha,
+    /// The repos you work in most, decayed week by week.
+    Used,
+}
 
-/// The runs and detail panes need at least this much between them; below it the
-/// sidebar isn't drawn at all.
-pub const MIN_BODY_WIDTH: u16 = 68;
+impl Sort {
+    /// Anything unrecognised reads as the predictable one.
+    fn from_config(name: &str) -> Self {
+        match name {
+            "used" | "frecency" => Sort::Used,
+            _ => Sort::Alpha,
+        }
+    }
+}
 
 /// One repo row: the repo plus a rollup of its runs.
 pub struct RepoRow {
@@ -35,8 +45,6 @@ pub struct RepoRow {
 pub struct ReposPane {
     /// What the user asked for (config `sidebar`, toggled with `p`).
     pub visible: bool,
-    /// How wide you've dragged it, remembered between sessions.
-    pub width: u16,
     /// True while a name is too long for the pane and is sliding past. Set at
     /// draw time; it's what tells the clock there's an animation to run.
     pub sliding: bool,
@@ -47,25 +55,23 @@ pub struct ReposPane {
     /// Whether it actually made it on screen — a narrow terminal drops it, and
     /// a pane you can't see must not filter the runs list. Set while drawing.
     pub shown: bool,
+    /// What orders the rows below the pinned repos.
+    pub sort: Sort,
     pub rows: Vec<RepoRow>,
     pub state: ListState,
     /// Repos to keep at the top, in the order the config lists them.
     pinned: Vec<String>,
     /// Every repo the sweep watches, including those with no recent runs.
     known: Vec<String>,
-    /// Use history, which decides the order below the pinned repos.
-    pub uses: State,
 }
 
 impl ReposPane {
     pub fn new(cfg: &Config) -> Self {
         let mut state = ListState::default();
         state.select(Some(0)); // "All repos"
-        let uses = State::load();
-        let width = uses.sidebar_width().unwrap_or(DEFAULT_WIDTH).clamp(MIN_WIDTH, MAX_WIDTH);
         Self {
             visible: cfg.sidebar,
-            width,
+            sort: Sort::from_config(&cfg.sort),
             sliding: false,
             step: 0,
             ticks: 0,
@@ -74,19 +80,6 @@ impl ReposPane {
             state,
             pinned: cfg.pinned.clone(),
             known: Vec::new(),
-            uses,
-        }
-    }
-
-    /// Widen or narrow the pane, within the bounds and whatever room the
-    /// terminal leaves for the runs and detail panes. Remembered on the way out.
-    pub fn resize(&mut self, delta: i32, term_width: u16) {
-        let room = term_width.saturating_sub(MIN_BODY_WIDTH).max(MIN_WIDTH);
-        let max = MAX_WIDTH.min(room);
-        let width = (self.width as i32 + delta).clamp(MIN_WIDTH as i32, max as i32) as u16;
-        if width != self.width {
-            self.width = width;
-            self.uses.set_sidebar_width(width);
         }
     }
 
@@ -146,24 +139,22 @@ impl ReposPane {
         self.state.select(Some(0));
     }
 
-    pub fn record_use(&mut self, repo: &str) {
-        self.uses.record(repo);
-    }
-
     /// Repos the sweep is watching, whether or not they have runs to show. This
     /// is what lets you reach a repo that hasn't built in weeks.
     pub fn set_known(&mut self, names: Vec<String>) {
         self.known = names;
     }
 
-    /// Rebuild the rows from the current runs. Order: pinned repos first, in the
-    /// order they're configured, then the ones you use most, then whatever ran
-    /// most recently. The cursor stays on the same repo across a reorder.
+    /// Rebuild the rows from the current runs. Pinned repos come first, in the
+    /// order they're configured; the rest are alphabetical, or ordered by use
+    /// under `sort = "used"`. The cursor stays on the same repo across a
+    /// reorder.
     ///
-    /// Only a refresh re-sorts (`resort`). Using a repo raises its score, and
-    /// re-sorting on every keystroke would shuffle the list under the cursor
-    /// while you're moving through it; the counts still update every time.
-    pub fn rebuild(&mut self, runs: &[Run], resort: bool) {
+    /// Under `used`, only a refresh re-sorts (`resort`): working in a repo
+    /// raises its score, and re-sorting on every keystroke would shuffle the
+    /// list under the cursor while you're moving through it. Alphabetical order
+    /// can't shift under you, so it always sorts. The counts update either way.
+    pub fn rebuild(&mut self, runs: &[Run], resort: bool, uses: &State) {
         let mut rollup: HashMap<&str, (usize, usize, Option<DateTime<Utc>>)> = HashMap::new();
         for r in runs {
             let e = rollup.entry(r.repository.full_name.as_str()).or_default();
@@ -202,18 +193,20 @@ impl ReposPane {
                 }
             })
             .collect();
-        if resort || self.rows.is_empty() {
+        if self.sort == Sort::Alpha || resort || self.rows.is_empty() {
             rows.sort_by(|a, b| {
-                self.pin_rank(&a.name)
+                let pins = self
+                    .pin_rank(&a.name)
                     .unwrap_or(usize::MAX)
-                    .cmp(&self.pin_rank(&b.name).unwrap_or(usize::MAX))
-                    .then_with(|| {
-                        self.uses
-                            .score(&b.name)
-                            .total_cmp(&self.uses.score(&a.name))
-                    })
-                    .then_with(|| b.last.cmp(&a.last))
-                    .then_with(|| a.name.cmp(&b.name))
+                    .cmp(&self.pin_rank(&b.name).unwrap_or(usize::MAX));
+                let alpha = || a.name.to_lowercase().cmp(&b.name.to_lowercase());
+                match self.sort {
+                    Sort::Alpha => pins.then_with(alpha),
+                    Sort::Used => pins
+                        .then_with(|| uses.score(&b.name).total_cmp(&uses.score(&a.name)))
+                        .then_with(|| b.last.cmp(&a.last))
+                        .then_with(alpha),
+                }
             });
         } else {
             // Hold the order you're looking at; repos we haven't shown yet go last.

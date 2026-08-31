@@ -43,9 +43,39 @@ impl App {
         match m.kind {
             MouseEventKind::ScrollDown => self.mouse_scroll(WHEEL_STEP, m.column, m.row),
             MouseEventKind::ScrollUp => self.mouse_scroll(-WHEEL_STEP, m.column, m.row),
-            MouseEventKind::Down(MouseButton::Left) => self.mouse_click(m.column, m.row),
+            MouseEventKind::Down(MouseButton::Left) => self.mouse_down(m.column, m.row),
+            MouseEventKind::Drag(MouseButton::Left) => self.mouse_drag(m.column),
+            // Letting go ends the drag; that's not a click on whatever is under
+            // the pointer.
+            MouseEventKind::Up(MouseButton::Left) => self.panes.dragging.take().is_some(),
+            // A move with no button held means we missed the release.
+            MouseEventKind::Moved => {
+                self.panes.dragging = None;
+                false
+            }
             _ => false,
         }
+    }
+
+    /// A press on a divider grabs it; anywhere else is an ordinary click.
+    fn mouse_down(&mut self, x: u16, y: u16) -> bool {
+        if matches!(self.mode, Mode::Normal | Mode::Search) {
+            let grabbed = self.panes.divider_at(x, y, self.hit.body, self.repos.shown);
+            if grabbed.is_some() {
+                self.panes.dragging = grabbed;
+                return true;
+            }
+        }
+        self.mouse_click(x, y)
+    }
+
+    /// Move the grabbed divider to the pointer.
+    fn mouse_drag(&mut self, x: u16) -> bool {
+        if self.panes.dragging.is_none() {
+            return false;
+        }
+        self.panes.drag_to(x, self.hit.body, self.repos.shown);
+        true
     }
 
     fn mouse_scroll(&mut self, delta: i32, x: u16, y: u16) -> bool {
@@ -263,6 +293,7 @@ impl App {
             KeyCode::Char('p') => self.toggle_repos_pane(),
             KeyCode::Char('>') => self.resize_repos_pane(2),
             KeyCode::Char('<') => self.resize_repos_pane(-2),
+            KeyCode::Char('=') => self.reset_layout(),
             _ => {}
         }
     }
@@ -317,9 +348,19 @@ impl App {
     /// Widen or narrow the sidebar. A no-op while it's off screen — there's
     /// nothing to resize.
     fn resize_repos_pane(&mut self, delta: i32) {
-        if self.repos.shown {
-            self.repos.resize(delta, self.term_width);
+        if !self.repos.shown {
+            return;
         }
+        self.panes.sidebar = (self.panes.sidebar as i32 + delta).max(0) as u16;
+        self.panes.clamp(self.term_width, true);
+    }
+
+    /// Put the panes and the table's columns back to the widths actui ships
+    /// with, for when a drag has left the layout somewhere unhelpful.
+    fn reset_layout(&mut self) {
+        self.panes.reset();
+        self.panes.clamp(self.term_width, self.repos.shown);
+        self.set_status("Layout reset", false);
     }
 
     /// Move focus one pane along, skipping the sidebar while it's off screen.
@@ -781,7 +822,7 @@ impl App {
             Some(r) => r.repository.full_name.clone(),
             None => return,
         };
-        self.repos.record_use(&repo);
+        self.state.record(&repo);
         if running {
             // Text logs 404 until the job completes; show the live step view
             // instead (auto-switches to full logs on completion).
@@ -1248,7 +1289,7 @@ impl App {
             self.set_status("Select a run or a repo first", true);
             return;
         };
-        self.repos.record_use(&repo);
+        self.state.record(&repo);
         self.dispatch = Some(DispatchState {
             repo: repo.clone(),
             workflows: Vec::new(),

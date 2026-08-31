@@ -6,17 +6,20 @@
 mod input;
 mod logs;
 mod overlays;
+mod panes;
 mod protocol;
 mod repos;
 
 pub use logs::{LogsView, StepsView};
 pub use overlays::*;
-pub use repos::{ReposPane, MIN_BODY_WIDTH};
+pub use panes::{Column, Panes, MIN_BODY_WIDTH};
+pub use repos::ReposPane;
 pub use protocol::{AnnJob, Command, DataMsg};
 pub(crate) use logs::{is_error_line, log_content};
 
 use crate::config::Config;
 use crate::github::{Actor, Job, RateLimit, Run, RunRepo, RunState, Step};
+use crate::state::State;
 use chrono::{DateTime, Utc};
 use ratatui::layout::Rect;
 use ratatui::widgets::{ListState, TableState};
@@ -88,6 +91,9 @@ pub struct HitMap {
     pub tabs: Rect,
     /// Repos sidebar content (empty when the sidebar isn't drawn).
     pub repos: Rect,
+    /// The whole body, spanning every pane — what a divider drag measures
+    /// against. Empty in the views that don't draw the panes.
+    pub body: Rect,
     /// Runs table content (its first row is the column header).
     pub runs: Rect,
     /// Jobs list content within the detail pane.
@@ -127,6 +133,10 @@ pub struct App {
 
     /// The repos sidebar, and the repo scope it puts on the runs list.
     pub repos: ReposPane,
+    /// Pane and column widths, and whatever divider the mouse is dragging.
+    pub panes: Panes,
+    /// What we remember between sessions: the layout, and repo use history.
+    pub state: State,
 
     pub jobs: Vec<Job>,
     pub jobs_state: ListState,
@@ -195,6 +205,7 @@ pub struct App {
 
 impl App {
     pub fn new(cfg: &Config) -> Self {
+        let state = State::load();
         Self {
             user: String::new(),
             runs: Vec::new(),
@@ -206,6 +217,8 @@ impl App {
             focus: Focus::Runs,
             errors: Vec::new(),
             repos: ReposPane::new(cfg),
+            panes: Panes::new(&state),
+            state,
             jobs: Vec::new(),
             jobs_state: ListState::default(),
             jobs_run_id: None,
@@ -595,7 +608,7 @@ impl App {
     pub fn recompute_view(&mut self) {
         let prev_id = self.selected_run().map(|r| r.id);
         let resort = std::mem::take(&mut self.resort_repos);
-        self.repos.rebuild(&self.runs, resort);
+        self.repos.rebuild(&self.runs, resort, &self.state);
         let q = self.search.to_lowercase();
         self.view = self
             .runs
@@ -667,16 +680,18 @@ impl App {
     pub(crate) fn flush_jobs_fetch(&mut self) {
         if let Some((_, repo, run_id)) = self.jobs_fetch_due.take() {
             // The selection settled on this repo — that counts as using it.
-            self.repos.record_use(&repo);
+            self.state.record(&repo);
             self.pending.push(Command::FetchJobs { repo, run_id });
         }
     }
 
-    /// Settle whether the sidebar is on screen at this terminal width, keeping
-    /// the runs list in step: a pane you can't see must not scope anything.
-    pub fn sync_sidebar(&mut self, term_width: u16) {
+    /// Settle the layout for a terminal this wide: whether the sidebar is on
+    /// screen, and pane widths that still leave the runs table room. Keeps the
+    /// runs list in step too — a pane you can't see must not scope anything.
+    pub fn sync_layout(&mut self, term_width: u16) {
         self.term_width = term_width;
-        let shown = self.repos.visible && term_width >= self.repos.width + MIN_BODY_WIDTH;
+        let shown = self.repos.visible && term_width >= self.panes.sidebar + MIN_BODY_WIDTH;
+        self.panes.clamp(term_width, shown);
         if shown == self.repos.shown {
             return;
         }
@@ -687,9 +702,10 @@ impl App {
         self.recompute_view();
     }
 
-    /// Persist the repo use history (called once, on the way out).
-    pub fn save_state(&self) {
-        self.repos.uses.save();
+    /// Save the layout and the repo use history (called once, on the way out).
+    pub fn save_state(&mut self) {
+        self.panes.store(&mut self.state);
+        self.state.save();
     }
 
     pub fn counts(&self) -> (usize, usize, usize, usize) {
@@ -1007,18 +1023,40 @@ mod tests {
     }
 
     #[test]
-    fn pinned_repos_lead_then_the_ones_used_most() {
-        let cfg = Config { pinned: vec!["org/pinned".into()], ..Config::default() };
+    fn pinned_repos_lead_and_the_rest_are_alphabetical() {
+        let cfg = Config { pinned: vec!["org/zeta".into()], ..Config::default() };
         let mut app = App::new(&cfg);
-        // Ignore whatever history this machine happens to have.
-        app.repos.uses = crate::state::State::default();
-        app.repos
-            .set_known(vec!["org/api".into(), "org/web".into(), "org/pinned".into()]);
-        app.repos.record_use("org/web");
+        app.state = State::default(); // ignore this machine's history
+        app.repos.set_known(vec![
+            "org/web".into(),
+            "org/Api".into(),
+            "org/zeta".into(),
+            "org/infra".into(),
+        ]);
+        // Using a repo must not move it: the order is the same either way.
+        app.state.record("org/web");
         app.recompute_view();
 
         let order: Vec<&str> = app.repos.rows.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(order, ["org/pinned", "org/web", "org/api"]);
+        assert_eq!(order, ["org/zeta", "org/Api", "org/infra", "org/web"]);
+    }
+
+    #[test]
+    fn sort_used_puts_the_repos_you_work_in_on_top() {
+        let cfg = Config { sort: "used".into(), ..Config::default() };
+        let mut app = App::new(&cfg);
+        app.state = State::default();
+        app.repos.set_known(vec!["org/api".into(), "org/web".into()]);
+        app.state.record("org/web");
+        app.recompute_view();
+        assert_eq!(app.repos.rows[0].name, "org/web");
+
+        // Under `used` the order settles on refresh, not mid-scroll.
+        app.state.record("org/api");
+        app.recompute_view();
+        assert_eq!(app.repos.rows[0].name, "org/web", "it holds while you navigate");
+        app.finish_refresh();
+        assert_eq!(app.repos.rows[0].name, "org/api");
     }
 
     #[test]

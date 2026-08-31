@@ -37,6 +37,9 @@ pub struct Config {
     pub sidebar: bool,
     /// Repos kept at the top of the sidebar, in this order.
     pub pinned: Vec<String>,
+    /// Sidebar order below the pinned repos: "alpha" (A→Z, the default) or
+    /// "used" (the repos you work in most, decayed over time).
+    pub sort: String,
 }
 
 impl Default for Config {
@@ -56,6 +59,7 @@ impl Default for Config {
             theme: "auto".to_string(),
             sidebar: true,
             pinned: Vec::new(),
+            sort: "alpha".to_string(),
         }
     }
 }

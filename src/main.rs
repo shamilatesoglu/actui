@@ -100,7 +100,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, gh: Github, cfg: Config) -
     loop {
         if redraw {
             let width = terminal.size().map(|s| s.width).unwrap_or(u16::MAX);
-            app.sync_sidebar(width);
+            app.sync_layout(width);
             terminal.draw(|f| ui::draw(f, &mut app))?;
             redraw = false;
         }
