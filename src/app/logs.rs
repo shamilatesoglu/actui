@@ -195,30 +195,24 @@ impl LogsView {
         if self.preview_only {
             let n = self.lines.len();
             let mut should_include = vec![false; n];
-            for i in 0..n {
-                let content = log_content(&self.lines[i]);
-                if is_error_line(content) {
-                    let start = i.saturating_sub(3);
-                    let end = (i + 3).min(n.saturating_sub(1));
-                    for j in start..=end {
-                        should_include[j] = true;
-                    }
+            for (i, line) in self.lines.iter().enumerate() {
+                if is_error_line(log_content(line)) {
+                    // The error line, plus three lines of context either side.
+                    should_include[i.saturating_sub(3)..(i + 4).min(n)].fill(true);
                 }
             }
 
             self.visible.clear();
             let mut in_gap = false;
-            for i in 0..n {
-                if should_include[i] {
+            for (i, keep) in should_include.iter().enumerate() {
+                if *keep {
                     if in_gap {
                         self.visible.push(usize::MAX);
                         in_gap = false;
                     }
                     self.visible.push(i);
-                } else {
-                    if !self.visible.is_empty() {
-                        in_gap = true;
-                    }
+                } else if !self.visible.is_empty() {
+                    in_gap = true;
                 }
             }
         } else {

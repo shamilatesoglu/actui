@@ -12,7 +12,7 @@ mod repos;
 
 pub use logs::{LogsView, StepsView};
 pub use overlays::*;
-pub use panes::{min_body, Column, Divider, Panes, MIN_BODY_WIDTH};
+pub use panes::{min_body, Column, Divider, Panes};
 pub use repos::ReposPane;
 pub use protocol::{AnnJob, Command, DataMsg};
 pub(crate) use logs::{is_error_line, log_content};

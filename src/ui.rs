@@ -566,7 +566,7 @@ fn draw_jobs(f: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(jobs_len.min(6).max(3) as u16),
+            Constraint::Length(jobs_len.clamp(3, 6) as u16),
             Constraint::Min(3),
         ])
         .split(inner);
@@ -629,6 +629,16 @@ fn draw_jobs(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// One preview line: its number in the log, dim, then the highlighted text.
+fn numbered_log_line(index: usize, line: &str) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        format!("{:>4} │ ", index + 1),
+        Style::default().fg(dim()),
+    )];
+    spans.extend(highlight_log(line).spans);
+    Line::from(spans)
+}
+
 /// Build the job-log preview lines, returning them alongside the count of
 /// error/fail lines found (0 → a clean log, so the caller keeps the plain
 /// "Log Preview" title).
@@ -639,14 +649,10 @@ fn get_error_preview_lines(log_text: &str, conclusion: Option<&str>) -> (Vec<Lin
     let mut error_count = 0usize;
 
     for (idx, line) in lines.iter().enumerate() {
-        let content = log_content(line);
-        if is_error_line(content) {
+        if is_error_line(log_content(line)) {
             error_count += 1;
-            let start = idx.saturating_sub(3);
-            let end = (idx + 3).min(n.saturating_sub(1));
-            for j in start..=end {
-                should_include[j] = true;
-            }
+            // The error line, plus three lines of context either side.
+            should_include[idx.saturating_sub(3)..(idx + 4).min(n)].fill(true);
         }
     }
 
@@ -656,12 +662,8 @@ fn get_error_preview_lines(log_text: &str, conclusion: Option<&str>) -> (Vec<Lin
             let mut preview = vec![Line::from(vec![
                 Span::styled("No error/fail lines found. Showing end of log:", Style::default().fg(dim()))
             ])];
-            for i in start..n {
-                let line_num_str = format!("{:>4} │ ", i + 1);
-                let highlighted = highlight_log(lines[i]);
-                let mut spans = vec![Span::styled(line_num_str, Style::default().fg(dim()))];
-                spans.extend(highlighted.spans);
-                preview.push(Line::from(spans));
+            for (i, line) in lines.iter().enumerate().skip(start) {
+                preview.push(numbered_log_line(i, line));
             }
             return (preview, 0);
         } else {
@@ -678,23 +680,17 @@ fn get_error_preview_lines(log_text: &str, conclusion: Option<&str>) -> (Vec<Lin
     let mut preview = Vec::new();
     let mut in_gap = false;
 
-    for i in 0..n {
-        if should_include[i] {
+    for (i, keep) in should_include.iter().enumerate() {
+        if *keep {
             if in_gap {
                 preview.push(Line::from(vec![
                     Span::styled("  ...", Style::default().fg(dim()))
                 ]));
                 in_gap = false;
             }
-            let line_num_str = format!("{:>4} │ ", i + 1);
-            let highlighted = highlight_log(lines[i]);
-            let mut spans = vec![Span::styled(line_num_str, Style::default().fg(dim()))];
-            spans.extend(highlighted.spans);
-            preview.push(Line::from(spans));
-        } else {
-            if !preview.is_empty() {
-                in_gap = true;
-            }
+            preview.push(numbered_log_line(i, lines[i]));
+        } else if !preview.is_empty() {
+            in_gap = true;
         }
     }
 
@@ -909,7 +905,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     }
     let hint: String = match (app.mode == Mode::Logs, app.focus) {
         (true, _) => {
-            let preview_only = app.logs.as_ref().map_or(false, |lv| lv.preview_only);
+            let preview_only = app.logs.as_ref().is_some_and(|lv| lv.preview_only);
             let mode_str = if preview_only { " [errors]" } else { "" };
             format!(" j/k move · ←/→ scroll · ⏎ fold · e/f all · p preview{mode_str} · / search · n/N · s save · Esc close")
         }
@@ -1592,7 +1588,7 @@ mod tests {
         for _ in 0..40 {
             app.handle_key(KeyEvent::from(KeyCode::Char('>')));
         }
-        assert!(app.panes.sidebar <= 120 - crate::app::MIN_BODY_WIDTH);
+        assert!(app.panes.sidebar <= 120 - crate::app::min_body(false));
         assert!(app.repos.shown, "widening must not push it off screen");
     }
 
