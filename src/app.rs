@@ -12,7 +12,7 @@ mod repos;
 
 pub use logs::{LogsView, StepsView};
 pub use overlays::*;
-pub use panes::{Column, Panes, MIN_BODY_WIDTH};
+pub use panes::{min_body, Column, Divider, Panes, MIN_BODY_WIDTH};
 pub use repos::ReposPane;
 pub use protocol::{AnnJob, Command, DataMsg};
 pub(crate) use logs::{is_error_line, log_content};
@@ -690,8 +690,12 @@ impl App {
     /// runs list in step too — a pane you can't see must not scope anything.
     pub fn sync_layout(&mut self, term_width: u16) {
         self.term_width = term_width;
-        let shown = self.repos.visible && term_width >= self.panes.sidebar + MIN_BODY_WIDTH;
-        self.panes.clamp(term_width, shown);
+        // The live-steps pane is a fourth column, so it counts towards the room
+        // the sidebar needs to earn its place — at its narrowest, since the
+        // clamp below will squeeze it to fit.
+        let steps = self.steps_pane_open();
+        let shown = self.repos.visible && term_width >= self.panes.sidebar + min_body(steps);
+        self.panes.clamp(term_width, shown, steps);
         if shown == self.repos.shown {
             return;
         }
@@ -700,6 +704,11 @@ impl App {
             self.focus = Focus::Runs;
         }
         self.recompute_view();
+    }
+
+    /// Whether the live-steps pane is up, which changes how the body splits.
+    pub fn steps_pane_open(&self) -> bool {
+        self.mode == Mode::Logs && self.steps_view.is_some()
     }
 
     /// Save the layout and the repo use history (called once, on the way out).

@@ -11,8 +11,9 @@ max_repos           = 60  # cap, from most-recently-pushed repos (0 = no cap)
 skip_archived       = true # ignore archived repos
 
 # Repos sidebar: on by default, `p` toggles it, and a narrow terminal drops it.
-# Drag its border (or press `<` / `>`) to resize; drag a column header's edge to
-# size that column. Widths live in state.toml; `=` puts them back.
+# Drag any pane's border (or press `<` / `>` for the sidebar) to resize; drag a
+# column header's edge to size that column. Widths live in state.toml; `=` puts
+# them back.
 sidebar = true
 # Repos kept at the top of it, in this order.
 pinned  = []            # e.g. ["nodos-dev/api", "shamilatesoglu/actui"]

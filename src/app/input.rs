@@ -57,10 +57,11 @@ impl App {
         }
     }
 
-    /// A press on a divider grabs it; anywhere else is an ordinary click.
+    /// A press on a divider grabs it; anywhere else is an ordinary click. The
+    /// live-steps view has panes to drag too, so it counts as well.
     fn mouse_down(&mut self, x: u16, y: u16) -> bool {
-        if matches!(self.mode, Mode::Normal | Mode::Search) {
-            let grabbed = self.panes.divider_at(x, y, self.hit.body, self.repos.shown);
+        if matches!(self.mode, Mode::Normal | Mode::Search) || self.steps_pane_open() {
+            let grabbed = self.panes.divider_at(x, y, self.hit.body);
             if grabbed.is_some() {
                 self.panes.dragging = grabbed;
                 return true;
@@ -74,7 +75,8 @@ impl App {
         if self.panes.dragging.is_none() {
             return false;
         }
-        self.panes.drag_to(x, self.hit.body, self.repos.shown);
+        let (sidebar, steps) = (self.repos.shown, self.steps_pane_open());
+        self.panes.drag_to(x, self.hit.body, sidebar, steps);
         true
     }
 
@@ -352,14 +354,14 @@ impl App {
             return;
         }
         self.panes.sidebar = (self.panes.sidebar as i32 + delta).max(0) as u16;
-        self.panes.clamp(self.term_width, true);
+        self.panes.clamp(self.term_width, true, self.steps_pane_open());
     }
 
     /// Put the panes and the table's columns back to the widths actui ships
     /// with, for when a drag has left the layout somewhere unhelpful.
     fn reset_layout(&mut self) {
         self.panes.reset();
-        self.panes.clamp(self.term_width, self.repos.shown);
+        self.panes.clamp(self.term_width, self.repos.shown, self.steps_pane_open());
         self.set_status("Layout reset", false);
     }
 

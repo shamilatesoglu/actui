@@ -6,7 +6,7 @@ mod overlays;
 mod repos;
 
 use crate::app::{
-    is_error_line, log_content, App, Column, Filter, Focus, Mode, RunnerRow, RunnerStatus,
+    is_error_line, log_content, App, Column, Divider, Filter, Focus, Mode, RunnerRow, RunnerStatus,
 };
 use crate::github::{Job, Run, RunState, Step};
 use ansi_to_tui::IntoText;
@@ -163,6 +163,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // panes; draw_repos and draw_body set them again when they draw.
     app.hit.repos = Rect::default();
     app.hit.body = Rect::default();
+    app.panes.record_dividers(&[]);
 
     draw_header(f, app, chunks[0]);
     draw_tabs(f, app, chunks[1]);
@@ -323,18 +324,23 @@ fn draw_body(f: &mut Frame, app: &mut App, area: Rect) {
     }
     // Live steps open as a third pane so the run detail + jobs list stay
     // visible — you keep your place in the jobs list while watching steps.
-    if app.mode == Mode::Logs && app.steps_view.is_some() {
+    if app.steps_pane_open() {
+        app.hit.body = area;
+        let (rest, mut dividers) = draw_sidebar(f, app, area);
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(36),
-                Constraint::Percentage(28),
-                Constraint::Percentage(36),
+                Constraint::Min(20),
+                Constraint::Length(app.panes.detail),
+                Constraint::Length(app.panes.steps),
             ])
-            .split(area);
+            .split(rest);
         draw_table(f, app, cols[0]);
         draw_detail(f, app, cols[1]);
         draw_steps_pane(f, app, cols[2]);
+        dividers.push((Divider::Detail, cols[1].x, cols[1].right()));
+        dividers.push((Divider::Steps, cols[2].x, cols[2].right()));
+        app.panes.record_dividers(&dividers);
         return;
     }
     // Text logs take the full width: CI log lines are long, and the runs list
@@ -345,22 +351,33 @@ fn draw_body(f: &mut Frame, app: &mut App, area: Rect) {
     }
     // Recorded before the split: a divider drag measures against the whole body.
     app.hit.body = area;
-    let body = if app.repos.shown {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(app.panes.sidebar), Constraint::Min(20)])
-            .split(area);
-        draw_repos(f, app, cols[0]);
-        cols[1]
-    } else {
-        area
-    };
+    let (body, mut dividers) = draw_sidebar(f, app, area);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(20), Constraint::Length(app.panes.detail)])
         .split(body);
     draw_table(f, app, cols[0]);
     draw_detail(f, app, cols[1]);
+    dividers.push((Divider::Detail, cols[1].x, cols[1].right()));
+    app.panes.record_dividers(&dividers);
+}
+
+/// Draw the repos sidebar, when it's on screen, and hand back what's left of
+/// the body for the other panes — plus the divider it put there.
+fn draw_sidebar(
+    f: &mut Frame,
+    app: &mut App,
+    area: Rect,
+) -> (Rect, Vec<(Divider, u16, u16)>) {
+    if !app.repos.shown {
+        return (area, Vec::new());
+    }
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(app.panes.sidebar), Constraint::Min(20)])
+        .split(area);
+    draw_repos(f, app, cols[0]);
+    (cols[1], vec![(Divider::Sidebar, cols[1].x, area.x)])
 }
 
 fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
@@ -1681,6 +1698,78 @@ mod tests {
             app.selected_run().map(|r| r.repository.full_name.as_str()),
             Some("org/web")
         );
+    }
+
+    #[test]
+    fn the_live_steps_view_still_draws() {
+        use crate::app::StepsView;
+
+        let mut app = demo_app();
+        app.jobs = vec![crate::github::Job {
+            id: 9,
+            name: "build".into(),
+            status: "in_progress".into(),
+            html_url: String::new(),
+            check_run_url: String::new(),
+            conclusion: None,
+            started_at: None,
+            completed_at: None,
+            steps: Vec::new(),
+        }];
+        app.jobs_run_id = Some(1);
+        app.steps_view = Some(StepsView {
+            job_id: 9,
+            job_name: "build".into(),
+            repo: "org/api".into(),
+            cursor: 0,
+        });
+        app.mode = crate::app::Mode::Logs;
+
+        let out = screen(&mut app, 120, 14);
+        println!("{out}");
+        assert!(out.contains("Live steps · build"), "the steps pane is drawn");
+        assert!(out.contains("live steps · updates automatically"), "and its footer hint");
+        assert!(out.contains("Runs 1/3"), "beside the runs table it drills from");
+        assert!(out.contains("All repos"), "and the sidebar stays alongside it");
+
+        // Four panes don't fit on a narrow terminal; the sidebar is what goes.
+        let out = screen(&mut app, 100, 14);
+        println!("{out}");
+        assert!(!out.contains("All repos"));
+        assert!(out.contains("Live steps · build"), "the steps pane stays");
+    }
+
+    #[test]
+    fn dragging_the_steps_border_resizes_that_pane() {
+        use crate::app::StepsView;
+
+        let mut app = demo_app();
+        app.steps_view = Some(StepsView {
+            job_id: 9,
+            job_name: "build".into(),
+            repo: "org/api".into(),
+            cursor: 0,
+        });
+        app.mode = crate::app::Mode::Logs;
+
+        let out = screen(&mut app, 160, 14);
+        let row = row_of(&out, "All repos");
+        let was = app.panes.steps;
+        let border = 160 - was;
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), border, row));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), border - 10, row));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), border - 10, row));
+        assert_eq!(app.panes.steps, was + 10);
+
+        let out = screen(&mut app, 160, 14);
+        println!("{out}");
+        let title = out.lines().find(|l| l.contains("Live steps")).unwrap();
+        assert_eq!(column_of(title, "╭ Live steps") as u16, border - 10);
+
+        let mut saved = crate::state::State::default();
+        app.panes.store(&mut saved);
+        assert_eq!(saved.steps_width(), Some(app.panes.steps));
     }
 
     #[test]

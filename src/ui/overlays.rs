@@ -325,7 +325,7 @@ pub(super) fn draw_help(f: &mut Frame) {
         help_row("g / G", "jump to top / bottom"),
         help_row("PgUp / PgDn", "page up / down"),
         help_row("mouse", "wheel scroll · click selects / focuses"),
-        help_row("drag a border", "resize a pane; a header edge sizes a column"),
+        help_row("drag a border", "resize any pane; a header edge sizes a column"),
         help_row("=", "put the panes and columns back to defaults"),
         Line::raw(""),
         hl("Repos sidebar  (★ = pinned in config)"),

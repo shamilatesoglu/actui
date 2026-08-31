@@ -25,6 +25,8 @@ pub struct State {
     sidebar_width: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     detail_width: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    steps_width: Option<u16>,
     /// Runs-table columns you've resized, by column name.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     columns: HashMap<String, u16>,
@@ -64,6 +66,10 @@ impl State {
         self.detail_width
     }
 
+    pub fn steps_width(&self) -> Option<u16> {
+        self.steps_width
+    }
+
     pub fn columns(&self) -> &HashMap<String, u16> {
         &self.columns
     }
@@ -80,6 +86,13 @@ impl State {
     pub fn set_detail_width(&mut self, width: u16) {
         if self.detail_width != Some(width) {
             self.detail_width = Some(width);
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_steps_width(&mut self, width: u16) {
+        if self.steps_width != Some(width) {
+            self.steps_width = Some(width);
             self.dirty = true;
         }
     }

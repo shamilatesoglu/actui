@@ -11,16 +11,26 @@ pub const MIN_SIDEBAR: u16 = 16;
 pub const MAX_SIDEBAR: u16 = 60;
 pub const DEFAULT_SIDEBAR: u16 = 28;
 
-/// Likewise for the detail pane on the right.
+/// Likewise for the detail pane, and for the live-steps pane beside it.
 pub const MIN_DETAIL: u16 = 26;
 pub const MAX_DETAIL: u16 = 80;
 pub const DEFAULT_DETAIL: u16 = 34;
+
+pub const MIN_STEPS: u16 = 24;
+pub const MAX_STEPS: u16 = 80;
+pub const DEFAULT_STEPS: u16 = 36;
 
 /// What the runs table keeps for itself: the sidebar is dropped, and the detail
 /// pane refuses to grow, rather than squeezing the runs below this.
 pub const MIN_RUNS: u16 = 42;
 /// Runs plus detail — below this there's no room for a sidebar at all.
 pub const MIN_BODY_WIDTH: u16 = MIN_RUNS + MIN_DETAIL;
+
+/// What the panes beside the sidebar need at their narrowest. The sidebar earns
+/// its place when the terminal can hold this much besides it.
+pub fn min_body(steps_shown: bool) -> u16 {
+    MIN_BODY_WIDTH + if steps_shown { MIN_STEPS } else { 0 }
+}
 
 /// A resizable column of the runs table, in the order they're drawn. The status
 /// glyph isn't here: it's one character wide either way.
@@ -97,6 +107,8 @@ pub enum Divider {
     Sidebar,
     /// Between the runs table and the detail pane.
     Detail,
+    /// Between the detail pane and the live-steps pane.
+    Steps,
     /// A table column's right edge; carries where that column starts on screen.
     Column(Column, u16),
 }
@@ -104,6 +116,7 @@ pub enum Divider {
 pub struct Panes {
     pub sidebar: u16,
     pub detail: u16,
+    pub steps: u16,
     /// Only the columns you've actually resized; the rest use their default.
     columns: HashMap<Column, u16>,
     /// The divider a drag is moving, if any.
@@ -113,6 +126,10 @@ pub struct Panes {
     edges: Vec<(Column, u16, u16)>,
     /// Screen row of the table's header.
     header_y: u16,
+    /// The pane borders on screen: (divider, the border's column, and the edge
+    /// its pane is measured from). Recorded while drawing, so which dividers
+    /// exist follows whichever panes are actually up.
+    borders: Vec<(Divider, u16, u16)>,
 }
 
 impl Panes {
@@ -120,6 +137,7 @@ impl Panes {
         Self {
             sidebar: state.sidebar_width().unwrap_or(DEFAULT_SIDEBAR).clamp(MIN_SIDEBAR, MAX_SIDEBAR),
             detail: state.detail_width().unwrap_or(DEFAULT_DETAIL).clamp(MIN_DETAIL, MAX_DETAIL),
+            steps: state.steps_width().unwrap_or(DEFAULT_STEPS).clamp(MIN_STEPS, MAX_STEPS),
             columns: state
                 .columns()
                 .iter()
@@ -128,6 +146,7 @@ impl Panes {
             dragging: None,
             edges: Vec::new(),
             header_y: 0,
+            borders: Vec::new(),
         }
     }
 
@@ -135,6 +154,7 @@ impl Panes {
     pub fn store(&self, state: &mut State) {
         state.set_sidebar_width(self.sidebar);
         state.set_detail_width(self.detail);
+        state.set_steps_width(self.steps);
         state.set_columns(self.columns.iter().map(|(c, w)| (c.key().to_string(), *w)).collect());
     }
 
@@ -142,6 +162,7 @@ impl Panes {
     pub fn reset(&mut self) {
         self.sidebar = DEFAULT_SIDEBAR;
         self.detail = DEFAULT_DETAIL;
+        self.steps = DEFAULT_STEPS;
         self.columns.clear();
     }
 
@@ -173,6 +194,12 @@ impl Panes {
         widths
     }
 
+    /// Record the pane borders that are on screen this frame.
+    pub fn record_dividers(&mut self, borders: &[(Divider, u16, u16)]) {
+        self.borders.clear();
+        self.borders.extend_from_slice(borders);
+    }
+
     /// Record where the drawn columns landed, for hit-testing a drag.
     pub fn record_columns(&mut self, first_x: u16, header_y: u16, drawn: &[(Column, u16)]) {
         self.header_y = header_y;
@@ -185,8 +212,9 @@ impl Panes {
     }
 
     /// The divider under a press, if it landed on one. Column separators sit on
-    /// the table's header row; the pane dividers are the borders between panes.
-    pub fn divider_at(&self, x: u16, y: u16, body: Rect, sidebar_shown: bool) -> Option<Divider> {
+    /// the table's header row; the pane dividers are the borders recorded while
+    /// drawing, so only the panes actually up have one.
+    pub fn divider_at(&self, x: u16, y: u16, body: Rect) -> Option<Divider> {
         if y == self.header_y {
             if let Some((col, start, _)) = self
                 .edges
@@ -199,41 +227,55 @@ impl Panes {
         if y < body.y || y >= body.bottom() {
             return None;
         }
-        if sidebar_shown {
-            let edge = body.x + self.sidebar;
-            if x + 1 == edge || x == edge {
-                return Some(Divider::Sidebar);
-            }
-        }
-        let edge = body.right().saturating_sub(self.detail);
-        if x + 1 == edge || x == edge {
-            return Some(Divider::Detail);
-        }
-        None
+        self.borders
+            .iter()
+            .find(|(_, at, _)| x == *at || x + 1 == *at)
+            .map(|(divider, _, _)| *divider)
     }
 
-    /// Move whatever is being dragged to the pointer.
-    pub fn drag_to(&mut self, x: u16, body: Rect, sidebar_shown: bool) {
-        match self.dragging {
-            Some(Divider::Sidebar) => self.sidebar = x.saturating_sub(body.x) + 1,
-            Some(Divider::Detail) => self.detail = body.right().saturating_sub(x),
-            Some(Divider::Column(col, start)) => {
+    /// Move whatever is being dragged to the pointer. The sidebar grows to the
+    /// right of where it starts; the panes on the right grow leftwards from
+    /// their far edge.
+    pub fn drag_to(&mut self, x: u16, body: Rect, sidebar_shown: bool, steps_shown: bool) {
+        let Some(dragging) = self.dragging else { return };
+        let anchor = self
+            .borders
+            .iter()
+            .find(|(divider, _, _)| *divider == dragging)
+            .map(|(_, _, anchor)| *anchor);
+        match dragging {
+            Divider::Sidebar => {
+                self.sidebar = x.saturating_sub(anchor.unwrap_or(body.x)) + 1;
+            }
+            Divider::Detail => {
+                self.detail = anchor.unwrap_or(body.right()).saturating_sub(x);
+            }
+            Divider::Steps => {
+                self.steps = anchor.unwrap_or(body.right()).saturating_sub(x);
+            }
+            Divider::Column(col, start) => {
                 let width = x.saturating_sub(start) + 1;
                 self.columns.insert(col, width.clamp(Column::MIN, Column::MAX));
             }
-            None => return,
         }
-        self.clamp(body.width, sidebar_shown);
+        self.clamp(body.width, sidebar_shown, steps_shown);
     }
 
     /// Keep the pane widths inside their bounds and inside the terminal, so a
-    /// drag — or a resize of the window — can't starve the runs table.
-    pub fn clamp(&mut self, body_width: u16, sidebar_shown: bool) {
+    /// drag — or a resize of the window, or the steps pane opening — can't
+    /// starve the runs table.
+    pub fn clamp(&mut self, body_width: u16, sidebar_shown: bool, steps_shown: bool) {
         let side = if sidebar_shown { self.sidebar } else { 0 };
-        let detail_room = body_width.saturating_sub(side + MIN_RUNS);
+        if steps_shown {
+            let room = body_width.saturating_sub(side + MIN_RUNS + MIN_DETAIL);
+            self.steps = self.steps.clamp(MIN_STEPS, MAX_STEPS.min(room).max(MIN_STEPS));
+        }
+        let steps = if steps_shown { self.steps } else { 0 };
+
+        let detail_room = body_width.saturating_sub(side + steps + MIN_RUNS);
         self.detail = self.detail.clamp(MIN_DETAIL, MAX_DETAIL.min(detail_room).max(MIN_DETAIL));
 
-        let sidebar_room = body_width.saturating_sub(MIN_BODY_WIDTH);
+        let sidebar_room = body_width.saturating_sub(MIN_BODY_WIDTH + steps);
         self.sidebar = self
             .sidebar
             .clamp(MIN_SIDEBAR, MAX_SIDEBAR.min(sidebar_room).max(MIN_SIDEBAR));
@@ -265,19 +307,27 @@ mod tests {
     fn a_press_on_a_pane_border_finds_its_divider() {
         let mut panes = Panes::new(&State::default());
         let b = body();
-        // The sidebar's right border and the runs pane's left border.
-        assert_eq!(panes.divider_at(b.x + panes.sidebar, 8, b, true), Some(Divider::Sidebar));
-        assert_eq!(panes.divider_at(b.x + panes.sidebar - 1, 8, b, true), Some(Divider::Sidebar));
-        // Nothing there when the sidebar isn't drawn.
-        assert_eq!(panes.divider_at(b.x + panes.sidebar, 8, b, false), None);
-        // The detail pane's left border.
+        let side = b.x + panes.sidebar;
         let edge = b.right() - panes.detail;
-        assert_eq!(panes.divider_at(edge, 8, b, true), Some(Divider::Detail));
+        panes.record_dividers(&[
+            (Divider::Sidebar, side, b.x),
+            (Divider::Detail, edge, b.right()),
+        ]);
+
+        // Either column of the border between two panes grabs it.
+        assert_eq!(panes.divider_at(side, 8, b), Some(Divider::Sidebar));
+        assert_eq!(panes.divider_at(side - 1, 8, b), Some(Divider::Sidebar));
+        assert_eq!(panes.divider_at(edge, 8, b), Some(Divider::Detail));
         // Not on a row outside the body.
-        assert_eq!(panes.divider_at(edge, 2, b, true), None);
+        assert_eq!(panes.divider_at(edge, 2, b), None);
+
         panes.dragging = Some(Divider::Detail);
-        panes.drag_to(edge - 10, b, true);
+        panes.drag_to(edge - 10, b, true, false);
         assert_eq!(panes.detail, DEFAULT_DETAIL + 10);
+
+        // A pane that isn't drawn has no border to grab.
+        panes.record_dividers(&[]);
+        assert_eq!(panes.divider_at(side, 8, b), None);
     }
 
     #[test]
@@ -286,13 +336,13 @@ mod tests {
         // Well clear of the pane borders, so only the column check can match.
         panes.record_columns(40, 6, &[(Column::Repo, 24), (Column::Workflow, 23)]);
         // Repo runs 40..=63, so its separator is at 63 and the gap at 64.
-        assert_eq!(panes.divider_at(63, 6, body(), true), Some(Divider::Column(Column::Repo, 40)));
-        assert_eq!(panes.divider_at(64, 6, body(), true), Some(Divider::Column(Column::Repo, 40)));
+        assert_eq!(panes.divider_at(63, 6, body()), Some(Divider::Column(Column::Repo, 40)));
+        assert_eq!(panes.divider_at(64, 6, body()), Some(Divider::Column(Column::Repo, 40)));
         // Only on the header row.
-        assert_eq!(panes.divider_at(63, 7, body(), true), None);
+        assert_eq!(panes.divider_at(63, 7, body()), None);
 
         panes.dragging = Some(Divider::Column(Column::Repo, 40));
-        panes.drag_to(55, body(), true);
+        panes.drag_to(55, body(), true, false);
         assert_eq!(panes.column_width(Column::Repo), 16);
         assert_eq!(panes.column_width(Column::Workflow), 23, "the others are untouched");
     }
@@ -301,12 +351,20 @@ mod tests {
     fn panes_never_squeeze_the_runs_table() {
         let mut panes = Panes::new(&State::default());
         let b = Rect::new(0, 5, 100, 10);
+        panes.record_dividers(&[(Divider::Sidebar, b.x + panes.sidebar, b.x)]);
         panes.dragging = Some(Divider::Sidebar);
-        panes.drag_to(90, b, true);
+        panes.drag_to(90, b, true, false);
         assert!(panes.sidebar <= 100 - MIN_BODY_WIDTH);
 
+        panes.record_dividers(&[(Divider::Detail, b.right() - panes.detail, b.right())]);
         panes.dragging = Some(Divider::Detail);
-        panes.drag_to(0, b, true);
+        panes.drag_to(0, b, true, false);
         assert!(panes.sidebar + panes.detail + MIN_RUNS <= 100);
+
+        // The live-steps pane is a fourth column: on a terminal this narrow the
+        // sidebar has to go (App::sync_layout drops it), and the three left
+        // still fit.
+        panes.clamp(100, false, true);
+        assert!(panes.detail + panes.steps + MIN_RUNS <= 100);
     }
 }
