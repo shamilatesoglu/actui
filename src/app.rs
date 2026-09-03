@@ -781,7 +781,9 @@ impl App {
     /// so the main loop can skip redrawing on idle ticks.
     pub fn tick(&mut self) -> bool {
         let mut dirty = false;
-        if self.loading {
+        // A dispatch we haven't seen come back spins in the runs list, so the
+        // frames have to keep coming even when nothing is loading.
+        if self.loading || self.any_pending() {
             self.spinner = (self.spinner + 1) % 10;
             dirty = true;
         }
@@ -860,6 +862,11 @@ impl App {
         }
         self.pending.push(Command::Refresh { deep: self.repos.scope().map(str::to_string) });
         self.queue_selected_jobs();
+    }
+
+    /// True while a dispatch is still waiting for GitHub to register its run.
+    pub fn any_pending(&self) -> bool {
+        self.runs.iter().any(Run::is_pending)
     }
 
     /// True when any run (not just the selected one) is queued/in progress.

@@ -481,6 +481,7 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     widths.push(Constraint::Min(0));
     let header = Row::new(head).style(Style::default().fg(accent()).add_modifier(Modifier::BOLD));
 
+    let spin = SPINNER[app.spinner];
     // Collected (owned), so the table can render against the real
     // `table_state` — keeping its scroll offset is what lets mouse clicks
     // map back to rows.
@@ -488,7 +489,7 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
         let r = &app.runs[i];
         let (icon, color) = state_glyph(r.state());
         let mut cells = vec![Cell::from(Span::styled(icon, Style::default().fg(color)))];
-        cells.extend(shown.iter().zip(&drawn).map(|(col, w)| cell(r, *col, *w as usize)));
+        cells.extend(shown.iter().zip(&drawn).map(|(col, w)| cell(r, *col, *w as usize, spin)));
         cells.push(Cell::from("")); // the trailing spacer
         Row::new(cells)
     }).collect();
@@ -539,15 +540,23 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
 
     let (icon, color) = state_glyph(run.state());
     // Held-for-approval runs read as "queued"; call it out so `a` makes sense.
-    let (label, label_color) = if run.needs_approval() {
+    // A dispatch we're still waiting on says so rather than claiming progress.
+    let (label, label_color) = if run.is_pending() {
+        ("dispatching", Color::Yellow)
+    } else if run.needs_approval() {
         ("awaiting approval", Color::Yellow)
     } else {
         (state_label(run.state()), color)
     };
+    let number = if run.is_pending() {
+        format!("  {}", SPINNER[app.spinner])
+    } else {
+        format!("  #{}", run.run_number)
+    };
     let mut first = vec![
         Span::styled(format!("{icon} "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
         Span::styled(label, Style::default().fg(label_color).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("  #{}", run.run_number), Style::default().fg(dim())),
+        Span::styled(number, Style::default().fg(dim())),
     ];
     if run.needs_approval() {
         first.push(Span::styled("  · press a", Style::default().fg(dim())));
@@ -1424,13 +1433,19 @@ fn fmt_dt(ts: DateTime<Utc>) -> String {
 const LEAD: u16 = 4;
 
 /// One table cell, cut to the width its column is actually drawn at.
-fn cell(r: &Run, col: Column, w: usize) -> Cell<'static> {
+fn cell(r: &Run, col: Column, w: usize, spin: &str) -> Cell<'static> {
     let dimmed = Style::default().fg(dim());
     match col {
         Column::Repo => Cell::from(truncate(&r.repository.full_name, w)),
         // The workflow's name, with its run number kept dim and always visible.
+        // A run GitHub hasn't numbered yet spins there instead: #0 would be a
+        // number that doesn't exist.
         Column::Workflow => {
-            let number = format!("  #{}", r.run_number);
+            let number = if r.is_pending() {
+                format!("  {spin}")
+            } else {
+                format!("  #{}", r.run_number)
+            };
             Cell::from(Line::from(vec![
                 Span::raw(truncate(r.workflow_name(), w.saturating_sub(number.chars().count()))),
                 Span::styled(number, dimmed),
@@ -1987,6 +2002,37 @@ mod tests {
         // The wheel over the bar scrolls it too.
         app.handle_mouse(mouse(MouseEventKind::ScrollDown, x, thumb));
         assert!(app.repos.state.offset() > 0);
+    }
+
+    #[test]
+    fn a_dispatch_waiting_on_github_spins_instead_of_showing_a_number() {
+        let mut app = demo_app();
+        let id = app.push_dispatch_placeholder("org/api", "Release", "main");
+        app.recompute_view();
+        // The placeholder is what the runs list is looking at.
+        let at = app.view.iter().position(|&i| app.runs[i].id == id).unwrap();
+        app.table_state.select(Some(at));
+
+        let out = screen(&mut app, 120, 14);
+        println!("{out}");
+        assert!(!out.contains("#0"), "there is no run #0 to show");
+        assert!(out.contains("dispatching"), "the detail pane says what's happening");
+        // Both the row and the detail pane spin while we wait.
+        let frames = SPINNER.iter().filter(|f| out.contains(**f)).count();
+        assert!(frames > 0, "a spinner stands in for the number");
+
+        // And the spinner keeps turning even though nothing is loading.
+        assert!(!app.loading);
+        let was = app.spinner;
+        assert!(app.tick(), "a pending dispatch keeps the frames coming");
+        assert_ne!(app.spinner, was);
+
+        // Opening it in a browser would go nowhere, so it says so instead.
+        app.handle_key(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('o')));
+        assert_eq!(
+            app.status().map(|(m, _)| m),
+            Some("That run hasn't appeared on GitHub yet")
+        );
     }
 
     #[test]

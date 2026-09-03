@@ -955,6 +955,12 @@ pub enum RunState {
 }
 
 impl Run {
+    /// A run we've asked GitHub for but it hasn't registered yet: the number
+    /// and the page belong to the real run, and it doesn't have one yet.
+    pub fn is_pending(&self) -> bool {
+        self.run_number == 0
+    }
+
     pub fn state(&self) -> RunState {
         match self.status.as_str() {
             "queued" | "pending" | "waiting" | "requested" => RunState::Queued,

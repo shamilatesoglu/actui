@@ -888,8 +888,14 @@ impl App {
         };
         // Fall back to the run page (also when no job is selected).
         let url = url.or_else(|| self.selected_run().map(|r| r.html_url.clone()));
-        if let Some(url) = url {
-            self.pending.push(Command::OpenUrl(url));
+        match url {
+            // A dispatch GitHub hasn't registered has no page yet, and an empty
+            // URL would open nothing at all.
+            Some(url) if url.is_empty() => {
+                self.set_status("That run hasn't appeared on GitHub yet", true);
+            }
+            Some(url) => self.pending.push(Command::OpenUrl(url)),
+            None => {}
         }
     }
 
