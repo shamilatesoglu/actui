@@ -301,7 +301,9 @@ impl Github {
         struct Resp {
             workflow_runs: Vec<Run>,
         }
-        let key = format!("runs:{full_name}");
+        // Keyed by size too: a deep read and a sweep read of the same repo are
+        // different responses, and would otherwise fight over one ETag.
+        let key = format!("runs:{full_name}:{per_page}");
         let url = format!("{API}/repos/{full_name}/actions/runs");
         match self
             .cond_get::<Resp>(&key, url, &[("per_page", per_page.to_string())])

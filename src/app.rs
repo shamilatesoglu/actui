@@ -38,6 +38,10 @@ const STATUS_TTL: Duration = Duration::from_secs(4);
 /// so skimming the list doesn't issue one API request per row passed.
 const JOBS_FETCH_DEBOUNCE: Duration = Duration::from_millis(250);
 
+/// Likewise for the deeper read of a repo you've scoped to — walking down the
+/// sidebar shouldn't pull a hundred runs for every repo you pass.
+const SCOPE_FETCH_DEBOUNCE: Duration = Duration::from_millis(400);
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Filter {
     All,
@@ -192,6 +196,11 @@ pub struct App {
     /// Debounced jobs fetch for the selected run: (selected at, repo, run id).
     /// Fired by `tick` once the selection has rested for `JOBS_FETCH_DEBOUNCE`.
     jobs_fetch_due: Option<(Instant, String, u64)>,
+    /// The repo the runs list is scoped to, and a debounced deeper read of it —
+    /// the sweep only keeps a page or so per repo, which isn't much history
+    /// once you're looking at one.
+    scoped_repo: Option<String>,
+    runs_fetch_due: Option<(Instant, String)>,
 
     /// Optimistic placeholder runs for freshly-dispatched workflows, shown until
     /// GitHub registers the real run (or the dispatch fails / the placeholder
@@ -253,6 +262,8 @@ impl App {
             hit: HitMap::default(),
             run_states: HashMap::new(),
             jobs_fetch_due: None,
+            scoped_repo: None,
+            runs_fetch_due: None,
             pending_dispatches: Vec::new(),
             next_placeholder_id: 0,
             resort_repos: true,
@@ -296,16 +307,12 @@ impl App {
             }
             DataMsg::Runs { repo, runs } => {
                 self.repos_done += 1;
-                // Replace any existing runs for this repo with the fresh set.
-                self.runs.retain(|r| r.repository.full_name != repo);
-                self.runs.extend(runs);
-                self.reconcile_pending_dispatches(&repo);
-                self.resort();
-                self.recompute_view();
+                self.ingest_runs(repo, runs);
                 if self.repos_done >= self.repos_total {
                     self.finish_refresh();
                 }
             }
+            DataMsg::RunsOnly { repo, runs } => self.ingest_runs(repo, runs),
             DataMsg::RunsUnchanged => {
                 self.repos_done += 1;
                 if self.repos_done >= self.repos_total {
@@ -481,6 +488,15 @@ impl App {
         }
     }
 
+    /// Replace a repo's runs with a freshly read set.
+    fn ingest_runs(&mut self, repo: String, runs: Vec<Run>) {
+        self.runs.retain(|r| r.repository.full_name != repo);
+        self.runs.extend(runs);
+        self.reconcile_pending_dispatches(&repo);
+        self.resort();
+        self.recompute_view();
+    }
+
     fn finish_refresh(&mut self) {
         self.loading = false;
         self.resort_repos = true;
@@ -608,6 +624,12 @@ impl App {
     }
 
     pub fn recompute_view(&mut self) {
+        // Landing on a repo asks for more of its history than the sweep keeps.
+        let scope = self.repos.scope().map(str::to_string);
+        if scope != self.scoped_repo {
+            self.scoped_repo.clone_from(&scope);
+            self.runs_fetch_due = scope.map(|repo| (Instant::now(), repo));
+        }
         let prev_id = self.selected_run().map(|r| r.id);
         let resort = std::mem::take(&mut self.resort_repos);
         self.repos.rebuild(&self.runs, resort, &self.state);
@@ -774,6 +796,18 @@ impl App {
         if self.repos.tick() {
             dirty = true;
         }
+        // Fire the debounced deeper read once the scope has settled.
+        if self
+            .runs_fetch_due
+            .as_ref()
+            .is_some_and(|(at, _)| at.elapsed() >= SCOPE_FETCH_DEBOUNCE)
+        {
+            if let Some((_, repo)) = self.runs_fetch_due.take() {
+                self.set_status(format!("Reading more of {repo}…"), false);
+                self.pending.push(Command::FetchRuns { repo });
+                dirty = true;
+            }
+        }
         // Fire the debounced jobs fetch once the selection has settled.
         if self
             .jobs_fetch_due
@@ -824,7 +858,7 @@ impl App {
         if self.loading {
             return;
         }
-        self.pending.push(Command::Refresh);
+        self.pending.push(Command::Refresh { deep: self.repos.scope().map(str::to_string) });
         self.queue_selected_jobs();
     }
 
@@ -1021,6 +1055,35 @@ mod tests {
         app.repos.shown = false;
         app.recompute_view();
         assert_eq!(app.view.len(), 2);
+    }
+
+    #[test]
+    fn scoping_to_a_repo_asks_for_more_of_its_history() {
+        let mut app = App::new(&Config::default());
+        app.repos.shown = true;
+        app.runs = vec![run_in("org/api", 1), run_in("org/web", 2)];
+        app.recompute_view();
+        assert!(app.pending.is_empty());
+
+        assert!(app.repos.select_repo("org/web"));
+        app.recompute_view();
+        // Debounced: walking down the sidebar mustn't pull a page per repo.
+        assert!(app.pending.is_empty(), "not until the scope settles");
+        app.runs_fetch_due = Some((Instant::now() - SCOPE_FETCH_DEBOUNCE, "org/web".into()));
+        app.tick();
+        assert!(matches!(
+            app.pending.last(),
+            Some(Command::FetchRuns { repo }) if repo == "org/web"
+        ));
+
+        // And the sweep keeps reading that repo deeper than the rest.
+        app.pending.clear();
+        app.loading = false; // a sweep is only queued when one isn't running
+        app.queue_broad_refresh();
+        assert!(matches!(
+            app.pending.first(),
+            Some(Command::Refresh { deep: Some(repo) }) if repo == "org/web"
+        ));
     }
 
     #[test]

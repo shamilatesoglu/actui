@@ -20,6 +20,9 @@ pub enum DataMsg {
     /// The repos this sweep watches, whether or not they have runs.
     Repos(Vec<String>),
     Runs { repo: String, runs: Vec<Run> },
+    /// One repo's runs, read on its own rather than as part of a sweep — so it
+    /// carries no progress with it.
+    RunsOnly { repo: String, runs: Vec<Run> },
     /// A repo's runs were unchanged (304) — count it done, keep existing data.
     RunsUnchanged,
     RepoError { repo: String, err: String },
@@ -45,7 +48,11 @@ pub enum DataMsg {
 
 /// Work requested by the UI, executed by the main loop on the async runtime.
 pub enum Command {
-    Refresh,
+    /// Sweep every watched repo. `deep` names the one the sidebar is scoped to,
+    /// which is read further back than the rest.
+    Refresh { deep: Option<String> },
+    /// Re-read one repo's runs on its own, as deeply as the scoped read goes.
+    FetchRuns { repo: String },
     FetchJobs { repo: String, run_id: u64 },
     FetchLogs { repo: String, job_id: u64, title: String },
     /// Fetch check-run annotations for the given jobs of a run, concurrently.

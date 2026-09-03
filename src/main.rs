@@ -77,7 +77,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, gh: Github, cfg: Config) -
             let _ = gh.rate_limit().await;
         });
     }
-    spawn_refresh(&gh, &cfg, &tx);
+    spawn_refresh(&gh, &cfg, &tx, None);
 
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(120));
@@ -261,9 +261,25 @@ fn spawn_action<F, Fut>(
 fn dispatch_commands(app: &mut App, gh: &Github, cfg: &Config, tx: &UnboundedSender<DataMsg>) {
     for cmd in app.pending.drain(..).collect::<Vec<_>>() {
         match cmd {
-            Command::Refresh => {
+            Command::FetchRuns { repo } => {
+                let (gh, tx) = (gh.clone(), tx.clone());
+                let per_page = cfg.runs_for(&repo, Some(&repo));
+                tokio::spawn(async move {
+                    match gh.list_runs(&repo, per_page).await {
+                        // NotModified → we already have this repo's deep list.
+                        Ok(Cond::Modified(runs)) => {
+                            let _ = tx.send(DataMsg::RunsOnly { repo, runs });
+                        }
+                        Ok(Cond::NotModified) => {}
+                        Err(e) => {
+                            let _ = tx.send(DataMsg::Error(format!("{repo}: {e}")));
+                        }
+                    }
+                });
+            }
+            Command::Refresh { deep } => {
                 app.loading = true;
-                spawn_refresh(gh, cfg, tx);
+                spawn_refresh(gh, cfg, tx, deep);
             }
             Command::FetchJobs { repo, run_id } => {
                 let (gh, tx) = (gh.clone(), tx.clone());
@@ -527,7 +543,12 @@ fn dispatch_commands(app: &mut App, gh: &Github, cfg: &Config, tx: &UnboundedSen
 }
 
 /// Discover repos, then stream their recent runs back as they arrive.
-fn spawn_refresh(gh: &Github, cfg: &Config, tx: &UnboundedSender<DataMsg>) {
+fn spawn_refresh(
+    gh: &Github,
+    cfg: &Config,
+    tx: &UnboundedSender<DataMsg>,
+    deep: Option<String>,
+) {
     let gh = gh.clone();
     let cfg = cfg.clone();
     let tx = tx.clone();
@@ -560,11 +581,11 @@ fn spawn_refresh(gh: &Github, cfg: &Config, tx: &UnboundedSender<DataMsg>) {
             return;
         }
 
-        let per_page = cfg.runs_per_repo;
         futures::stream::iter(repos)
             .for_each_concurrent(cfg.concurrency.max(1), |repo| {
                 let gh = gh.clone();
                 let tx = tx.clone();
+                let per_page = cfg.runs_for(&repo.full_name, deep.as_deref());
                 async move {
                     match gh.list_runs(&repo.full_name, per_page).await {
                         Ok(Cond::Modified(runs)) => {

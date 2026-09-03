@@ -14,6 +14,9 @@ pub struct Config {
     pub live_refresh_secs: u64,
     /// How many recent runs to pull per repo.
     pub runs_per_repo: u32,
+    /// How many to pull for the one repo the sidebar is scoped to, where you're
+    /// actually reading its history. Capped at GitHub's 100 per page.
+    pub scoped_runs: u32,
     /// Max repos fetched concurrently.
     pub concurrency: usize,
     /// Cap on how many repos to scan, taken from the most-recently-pushed first.
@@ -49,6 +52,7 @@ impl Default for Config {
             active_refresh_secs: 15,
             live_refresh_secs: 2,
             runs_per_repo: 15,
+            scoped_runs: 100,
             concurrency: 3,
             max_repos: 60,
             skip_archived: true,
@@ -74,6 +78,15 @@ impl Config {
             return Self::default();
         };
         toml::from_str(&text).unwrap_or_default()
+    }
+
+    /// Runs to request for a repo: the deeper read for the scoped one.
+    pub fn runs_for(&self, full_name: &str, scoped: Option<&str>) -> u32 {
+        if scoped == Some(full_name) {
+            self.scoped_runs.clamp(self.runs_per_repo, 100)
+        } else {
+            self.runs_per_repo
+        }
     }
 
     pub fn keep_repo(&self, full_name: &str) -> bool {

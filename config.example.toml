@@ -5,7 +5,9 @@
 refresh_secs        = 60
 # focused poll of just the SELECTED run's jobs, while it's still running
 active_refresh_secs = 15
-runs_per_repo       = 15  # recent runs pulled per repo
+runs_per_repo       = 15  # recent runs pulled per repo, across the sweep
+scoped_runs         = 100 # …and for the one repo the sidebar is scoped to,
+                          # where you're reading its history (max 100)
 concurrency         = 3   # repos fetched in parallel (kept low to avoid bursts)
 max_repos           = 60  # cap, from most-recently-pushed repos (0 = no cap)
 skip_archived       = true # ignore archived repos
