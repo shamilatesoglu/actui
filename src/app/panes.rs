@@ -144,17 +144,17 @@ impl Bar {
         (self.area.y + 1, self.area.height.saturating_sub(2))
     }
 
-    /// Where the thumb sits within that track, and how long it is. This is the
-    /// widget's own arithmetic — keep the two in step or a grab misses.
+    /// Where the thumb sits within that track, and how long it is: the slice of
+    /// the content on screen, scaled to the track. This is the widget's own
+    /// arithmetic — keep the two in step or a grab misses the thumb.
     fn thumb(&self, position: usize) -> (u16, u16) {
         let (_, track_len) = self.track();
         let track = f64::from(track_len);
-        let max_position = self.len.saturating_sub(1) as f64;
-        let start = (position as f64).clamp(0.0, max_position);
-        let span = max_position + self.viewport as f64;
-        if span <= 0.0 || track <= 0.0 {
+        if self.len == 0 || track <= 0.0 {
             return (0, track_len.max(1));
         }
+        let span = self.len as f64;
+        let start = (position.min(self.max_offset())) as f64;
         let thumb_start = (start * track / span).round().clamp(0.0, track - 1.0) as u16;
         let thumb_end = ((start + self.viewport as f64) * track / span)
             .round()
@@ -183,18 +183,18 @@ impl Bar {
     }
 
     /// Where the content scrolls to when the thumb is dragged to this row,
-    /// held `grab` rows below its top.
+    /// held `grab` rows below its top. The inverse of `thumb`, so the thumb
+    /// stays under the pointer all the way down.
     pub fn offset_at(&self, y: u16, grab: u16) -> usize {
         let (track_y, track_len) = self.track();
         let (_, thumb_len) = self.thumb(self.position);
         let travel = track_len.saturating_sub(thumb_len);
-        if travel == 0 {
+        if travel == 0 || track_len == 0 {
             return 0;
         }
-        let at = y
-            .saturating_sub(track_y)
-            .saturating_sub(grab)
-            .min(travel);
+        // Across the thumb's travel, not the whole track: that way the far end
+        // of the travel is the far end of the list, exactly.
+        let at = y.saturating_sub(track_y).saturating_sub(grab).min(travel);
         let offset = f64::from(at) * self.max_offset() as f64 / f64::from(travel);
         (offset.round() as usize).min(self.max_offset())
     }

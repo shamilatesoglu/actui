@@ -680,7 +680,10 @@ fn scrollbar(
     if len <= viewport || area.height < 3 {
         return;
     }
-    let mut state = ScrollbarState::new(len)
+    // The widget counts scroll positions, not rows: given the row count its
+    // thumb stops short of the end of the track, and a drag can't reach the
+    // bottom of the list.
+    let mut state = ScrollbarState::new(len - viewport + 1)
         .viewport_content_length(viewport)
         .position(position);
     f.render_stateful_widget(
@@ -2033,6 +2036,44 @@ mod tests {
             app.status().map(|(m, _)| m),
             Some("That run hasn't appeared on GitHub yet")
         );
+    }
+
+    #[test]
+    fn a_dragged_thumb_stays_under_the_pointer() {
+        let mut app = demo_app();
+        let many: Vec<String> = (0..60).map(|i| format!("org/repo-{i:02}")).collect();
+        app.apply(crate::app::DataMsg::Repos(many));
+        app.recompute_view();
+
+        // A tall pane, so the track is long enough to drag down properly.
+        let out = screen(&mut app, 120, 30);
+        let x = app.panes.sidebar - 1;
+        let (top, bottom) = (bar_row(&out, x, '▲'), bar_row(&out, x, '▼'));
+        let thumb = bar_row(&out, x, '█');
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, thumb));
+        let mut offsets = vec![app.repos.state.offset()];
+        let mut reached = None;
+        for y in (thumb + 1)..bottom {
+            app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), x, y));
+            let out = screen(&mut app, 120, 30);
+            let offset = app.repos.state.offset();
+            let at = bar_row(&out, x, '█');
+            offsets.push(offset);
+            if offset == app.repos.len() - app.hit.repos.height as usize && reached.is_none() {
+                reached = Some(y);
+            }
+            // Until the thumb runs out of track, its top follows the pointer.
+            if reached.is_none() {
+                assert_eq!(at, y, "the thumb should sit where the pointer is");
+            }
+        }
+
+        assert!(reached.is_some(), "the end of the list is reachable by dragging");
+        // Even, forward steps the whole way — no sticking, no jumping back.
+        let steps: Vec<usize> = offsets.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(steps.iter().all(|s| *s <= 5), "no lurching: {steps:?}");
+        assert!(offsets.windows(2).all(|w| w[1] >= w[0]), "never backwards: {offsets:?}");
     }
 
     #[test]
