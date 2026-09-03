@@ -1,9 +1,9 @@
-//! The repos sidebar. Row 0 is "All repos" (no scope); below it come the repos
-//! you use most, each with a rollup of its runs. Borrows the palette accessors
-//! and the `pane` primitive from the parent `ui` module.
+//! The repos sidebar: "All repos" (no scope), then the repos themselves, each
+//! with a rollup of its runs. Borrows the palette accessors and the `pane`
+//! primitive from the parent `ui` module.
 
 use super::*;
-use crate::app::{App, Focus};
+use crate::app::{App, Focus, Scrollable};
 
 pub(super) fn draw_repos(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Repos;
@@ -33,14 +33,16 @@ pub(super) fn draw_repos(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol(if focused { "▌" } else { " " });
     f.render_stateful_widget(list, content, &mut app.repos.state);
 
-    if app.repos.len() > content.height as usize {
-        let mut sb = ScrollbarState::new(app.repos.len()).position(app.repos.state.offset());
-        f.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight),
-            area.inner(Margin { vertical: 1, horizontal: 0 }),
-            &mut sb,
-        );
-    }
+    let (rows, offset) = (app.repos.len(), app.repos.state.offset());
+    scrollbar(
+        f,
+        &mut app.panes,
+        Scrollable::Repos,
+        area.inner(Margin { vertical: 1, horizontal: 0 }),
+        rows,
+        content.height as usize,
+        offset,
+    );
 }
 
 /// One row: a pin marker, the repo, and its rollup right-aligned — active and

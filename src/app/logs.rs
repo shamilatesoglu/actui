@@ -254,6 +254,18 @@ impl LogsView {
         self.cursor = c as usize;
     }
 
+    /// Put the cursor on an absolute row of the visible lines — what dragging
+    /// the scrollbar asks for.
+    pub fn cursor_to_index(&mut self, at: usize) {
+        if self.visible.is_empty() {
+            return;
+        }
+        self.cursor = at.min(self.visible.len() - 1);
+        if self.visible[self.cursor] == usize::MAX {
+            self.move_cursor(1); // never rest on a gap marker
+        }
+    }
+
     pub fn cursor_to(&mut self, top: bool) {
         self.cursor = if top {
             0

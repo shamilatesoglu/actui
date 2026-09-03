@@ -44,22 +44,36 @@ impl App {
             MouseEventKind::ScrollDown => self.mouse_scroll(WHEEL_STEP, m.column, m.row),
             MouseEventKind::ScrollUp => self.mouse_scroll(-WHEEL_STEP, m.column, m.row),
             MouseEventKind::Down(MouseButton::Left) => self.mouse_down(m.column, m.row),
-            MouseEventKind::Drag(MouseButton::Left) => self.mouse_drag(m.column),
+            MouseEventKind::Drag(MouseButton::Left) => self.mouse_drag(m.column, m.row),
             // Letting go ends the drag; that's not a click on whatever is under
             // the pointer.
-            MouseEventKind::Up(MouseButton::Left) => self.panes.dragging.take().is_some(),
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.panes.scrolling.take().is_some() | self.panes.dragging.take().is_some()
+            }
             // A move with no button held means we missed the release.
             MouseEventKind::Moved => {
                 self.panes.dragging = None;
+                self.panes.scrolling = None;
                 false
             }
             _ => false,
         }
     }
 
-    /// A press on a divider grabs it; anywhere else is an ordinary click. The
-    /// live-steps view has panes to drag too, so it counts as well.
+    /// A press on a scrollbar or a divider grabs it; anywhere else is an
+    /// ordinary click. The live-steps view has panes to drag too, so it counts
+    /// as well.
     fn mouse_down(&mut self, x: u16, y: u16) -> bool {
+        if let Some(bar) = self.panes.scrollbar_at(x, y) {
+            match bar.press_at(y) {
+                // The arrows step a row, the track pages, and the thumb is
+                // held for as long as the button is.
+                Press::Step(rows) => self.scroll_by(bar, rows),
+                Press::Page(pages) => self.scroll_by(bar, pages * bar.viewport as i32),
+                Press::Grab(grab) => self.panes.scrolling = Some((bar, grab)),
+            }
+            return true;
+        }
         if matches!(self.mode, Mode::Normal | Mode::Search) || self.steps_pane_open() {
             let grabbed = self.panes.divider_at(x, y, self.hit.body);
             if grabbed.is_some() {
@@ -70,8 +84,13 @@ impl App {
         self.mouse_click(x, y)
     }
 
-    /// Move the grabbed divider to the pointer.
-    fn mouse_drag(&mut self, x: u16) -> bool {
+    /// Move whatever was grabbed to the pointer.
+    fn mouse_drag(&mut self, x: u16, y: u16) -> bool {
+        if let Some((bar, grab)) = self.panes.scrolling {
+            let to = bar.offset_at(y, grab);
+            self.scroll_to(bar.target, to, bar.viewport);
+            return true;
+        }
         if self.panes.dragging.is_none() {
             return false;
         }
@@ -80,7 +99,55 @@ impl App {
         true
     }
 
+    /// Scroll a list by rows from where its scrollbar was drawn.
+    fn scroll_by(&mut self, bar: Bar, rows: i32) {
+        let to = (bar.position as i32 + rows).clamp(0, bar.max_offset() as i32) as usize;
+        self.scroll_to(bar.target, to, bar.viewport);
+    }
+
+    /// Put a list's viewport at `offset`. The selection comes along only when
+    /// it would otherwise scroll out of sight — the widgets would drag the
+    /// viewport back to it if we let them.
+    fn scroll_to(&mut self, target: Scrollable, offset: usize, viewport: usize) {
+        let last = offset + viewport.saturating_sub(1);
+        match target {
+            Scrollable::Runs => {
+                *self.table_state.offset_mut() = offset;
+                let at = self.table_state.selected().unwrap_or(0).clamp(offset, last);
+                self.select_idx(at);
+                *self.table_state.offset_mut() = offset;
+            }
+            Scrollable::Repos => {
+                *self.repos.state.offset_mut() = offset;
+                let at = self.repos.state.selected().unwrap_or(0).clamp(offset, last);
+                self.repos.select(at);
+                *self.repos.state.offset_mut() = offset;
+                self.recompute_view();
+            }
+            Scrollable::Runners => {
+                if let Some(rv) = &mut self.runners {
+                    *rv.state.offset_mut() = offset;
+                    let at = rv.state.selected().unwrap_or(0).clamp(offset, last);
+                    rv.select_index(at);
+                    *rv.state.offset_mut() = offset;
+                }
+            }
+            Scrollable::Logs => {
+                // The log view centres its cursor, so that's what decides the
+                // scroll: aim the cursor at the middle of where we're going.
+                if let Some(lv) = &mut self.logs {
+                    lv.cursor_to_index(offset + viewport / 2);
+                }
+            }
+        }
+    }
+
     fn mouse_scroll(&mut self, delta: i32, x: u16, y: u16) -> bool {
+        // The wheel over a scrollbar scrolls what that bar belongs to.
+        if let Some(bar) = self.panes.scrollbar_at(x, y) {
+            self.scroll_by(bar, delta);
+            return true;
+        }
         match self.mode {
             Mode::Logs => {
                 if let Some(lv) = &mut self.logs {
@@ -161,7 +228,14 @@ impl App {
             }
             Mode::Runners => {
                 let pos = Position::new(x, y);
-                if self.hit.runners_pane.contains(pos) {
+                if self.hit.runners_tab.contains(pos) {
+                    self.close_runners();
+                } else if self.hit.repos.contains(pos) {
+                    // The sidebar is still up beside the runners list, so a
+                    // click there takes you back to the runs.
+                    self.click_repo_row(y);
+                    self.close_runners();
+                } else if self.hit.runners_pane.contains(pos) {
                     let row = (y - self.hit.runners_pane.y) as usize;
                     if let Some(rv) = &mut self.runners {
                         rv.click_row(row);
@@ -171,7 +245,10 @@ impl App {
             }
             Mode::Normal | Mode::Search => {
                 let pos = Position::new(x, y);
-                if self.hit.tabs.contains(pos) {
+                if self.hit.runners_tab.contains(pos) {
+                    self.open_runners();
+                    true
+                } else if self.hit.tabs.contains(pos) {
                     // Map the click to a filter tab by cumulative label width.
                     let mut x0 = self.hit.tabs.x;
                     for filt in Filter::ALL {
@@ -184,12 +261,7 @@ impl App {
                     }
                     false
                 } else if self.hit.repos.contains(pos) {
-                    self.focus = Focus::Repos;
-                    let row = self.repos.state.offset() + (y - self.hit.repos.y) as usize;
-                    if row < self.repos.len() {
-                        self.repos.select(row);
-                        self.recompute_view();
-                    }
+                    self.click_repo_row(y);
                     true
                 } else if self.hit.runs.contains(pos) {
                     self.focus = Focus::Runs;
@@ -214,6 +286,16 @@ impl App {
                 }
             }
             _ => false,
+        }
+    }
+
+    /// Select the sidebar row under the pointer.
+    fn click_repo_row(&mut self, y: u16) {
+        self.focus = Focus::Repos;
+        let row = self.repos.state.offset() + (y - self.hit.repos.y) as usize;
+        if row < self.repos.len() {
+            self.repos.select(row);
+            self.recompute_view();
         }
     }
 
@@ -1318,24 +1400,25 @@ impl App {
         self.pending.push(Command::FetchRunners { orgs: self.candidate_orgs() });
     }
 
+    fn close_runners(&mut self) {
+        self.runners = None;
+        self.mode = Mode::Normal;
+    }
+
     fn key_runners(&mut self, key: KeyEvent) {
         // Move several runners at a time for paging keys.
         const PAGE: i32 = 10;
         match key.code {
             // Esc/← back out of the detail pane first, then close the view; `q`
             // always closes the whole view.
-            KeyCode::Char('q') => {
-                self.runners = None;
-                self.mode = Mode::Normal;
-            }
+            KeyCode::Char('q') => self.close_runners(),
             KeyCode::Esc | KeyCode::Backspace | KeyCode::Left => {
                 if self.runners.as_ref().is_some_and(|rv| rv.detail_open) {
                     if let Some(rv) = &mut self.runners {
                         rv.detail_open = false;
                     }
                 } else {
-                    self.runners = None;
-                    self.mode = Mode::Normal;
+                    self.close_runners();
                 }
             }
             // Open the detail pane for the selected runner (in-app).

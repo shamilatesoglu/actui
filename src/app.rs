@@ -12,7 +12,7 @@ mod repos;
 
 pub use logs::{LogsView, StepsView};
 pub use overlays::*;
-pub use panes::{min_body, Column, Divider, Panes};
+pub use panes::{min_body, Bar, Column, Divider, Panes, Press, Scrollable};
 pub use repos::ReposPane;
 pub use protocol::{AnnJob, Command, DataMsg};
 pub(crate) use logs::{is_error_line, log_content};
@@ -89,6 +89,8 @@ pub enum Focus {
 pub struct HitMap {
     /// Filter tabs row.
     pub tabs: Rect,
+    /// The runners switcher, right-aligned on that same row.
+    pub runners_tab: Rect,
     /// Repos sidebar content (empty when the sidebar isn't drawn).
     pub repos: Rect,
     /// The whole body, spanning every pane — what a divider drag measures
@@ -1010,8 +1012,7 @@ mod tests {
         app.recompute_view();
         assert_eq!(app.view.len(), 2, "the All repos row shows everything");
 
-        let at = app.repos.rows.iter().position(|r| r.name == "org/web").unwrap();
-        app.repos.select(at + 1);
+        assert!(app.repos.select_repo("org/web"));
         app.recompute_view();
         assert_eq!(app.view.len(), 1);
         assert_eq!(app.runs[app.view[0]].repository.full_name, "org/web");
@@ -1077,7 +1078,7 @@ mod tests {
         app.apply(DataMsg::Repos(vec!["org/quiet".into()]));
         app.recompute_view();
         app.focus = Focus::Repos;
-        app.repos.select(1);
+        assert!(app.repos.select_repo("org/quiet"));
 
         app.handle_key(KeyEvent::from(KeyCode::Char('d')));
         assert!(matches!(app.mode, Mode::Dispatch));

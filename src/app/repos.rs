@@ -1,6 +1,6 @@
 //! The repos sidebar: every watched repo, in a predictable order, plus the
-//! scope it puts on the runs list. Row 0 of the pane is "All repos", so a repo
-//! in `rows` sits at pane index + 1.
+//! scope it puts on the runs list. Row 0 of the pane is "All repos" — no scope
+//! at all — so a repo in `rows` sits at pane index + 1.
 
 use crate::config::Config;
 use crate::github::{Run, RunState};
@@ -100,7 +100,7 @@ impl ReposPane {
         true
     }
 
-    /// Rows plus the leading "All repos" row.
+    /// The repos, plus the "All repos" row above them.
     pub fn len(&self) -> usize {
         self.rows.len() + 1
     }
@@ -109,6 +109,18 @@ impl ReposPane {
     pub fn selected_repo(&self) -> Option<&str> {
         let i = self.state.selected()?;
         Some(self.rows.get(i.checked_sub(1)?)?.name.as_str())
+    }
+
+    /// Put the cursor on a repo by name, scoping the runs list to it. False
+    /// when that repo isn't listed.
+    pub fn select_repo(&mut self, name: &str) -> bool {
+        match self.rows.iter().position(|r| r.name == name) {
+            Some(at) => {
+                self.select(at + 1);
+                true
+            }
+            None => false,
+        }
     }
 
     /// The repo the runs list is limited to, if any.
@@ -221,10 +233,11 @@ impl ReposPane {
 
         let keep = self.selected_repo().map(str::to_string);
         self.rows = rows;
-        let at = keep
-            .and_then(|name| self.rows.iter().position(|r| r.name == name))
-            .map_or(0, |i| i + 1);
-        self.state.select(Some(at));
+        // Keep the cursor on the same repo, or back at "All repos" when that
+        // repo is no longer listed.
+        if !keep.is_some_and(|name| self.select_repo(&name)) {
+            self.clear_scope();
+        }
     }
 
     fn pin_rank(&self, name: &str) -> Option<usize> {

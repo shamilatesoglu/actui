@@ -333,6 +333,14 @@ impl RunnersView {
         }
     }
 
+    /// Select the runner nearest an absolute row — what dragging the scrollbar
+    /// asks for, landing on a real runner rather than a header between orgs.
+    pub(crate) fn select_index(&mut self, at: usize) {
+        if let Some(&pick) = self.runner_indices().iter().min_by_key(|&&i| i.abs_diff(at)) {
+            self.state.select(Some(pick));
+        }
+    }
+
     /// The org the selected runner belongs to (nearest header above it).
     pub fn selected_org(&self) -> Option<&str> {
         let sel = self.state.selected()?;

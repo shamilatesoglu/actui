@@ -1,6 +1,6 @@
-//! Widths of the body's panes and of the runs table's columns, plus the divider
-//! a mouse drag is moving. Everything here is remembered between sessions, so a
-//! layout you set stays set.
+//! Where things are on screen for the mouse to grab: the widths of the body's
+//! panes and of the runs table's columns (both remembered between sessions, so
+//! a layout you set stays set), and the dividers and scrollbars a drag moves.
 
 use crate::state::State;
 use ratatui::layout::Rect;
@@ -100,6 +100,106 @@ impl Column {
     }
 }
 
+/// A list with a scrollbar the mouse can drive.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Scrollable {
+    Repos,
+    Runs,
+    Runners,
+    Logs,
+}
+
+/// What a press on a scrollbar means, the way any scrollbar behaves: the
+/// arrows step, the track pages, and the thumb is dragged.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Press {
+    Step(i32),
+    Page(i32),
+    /// Grabbed the thumb, this far down from its top.
+    Grab(u16),
+}
+
+/// A scrollbar as drawn: what it scrolls, the area it was drawn in, and the
+/// numbers it was drawn from. Its geometry mirrors the widget's own, so a press
+/// lands on the part of the bar you can see.
+#[derive(Clone, Copy, Debug)]
+pub struct Bar {
+    pub target: Scrollable,
+    pub area: Rect,
+    /// Rows of content, and how many of them are on screen at once.
+    pub len: usize,
+    pub viewport: usize,
+    /// The row the viewport started at when this was drawn.
+    pub position: usize,
+}
+
+impl Bar {
+    /// The furthest the content can be scrolled.
+    pub fn max_offset(&self) -> usize {
+        self.len.saturating_sub(self.viewport)
+    }
+
+    /// The track between the two arrows: where it starts, and how long it is.
+    fn track(&self) -> (u16, u16) {
+        (self.area.y + 1, self.area.height.saturating_sub(2))
+    }
+
+    /// Where the thumb sits within that track, and how long it is. This is the
+    /// widget's own arithmetic — keep the two in step or a grab misses.
+    fn thumb(&self, position: usize) -> (u16, u16) {
+        let (_, track_len) = self.track();
+        let track = f64::from(track_len);
+        let max_position = self.len.saturating_sub(1) as f64;
+        let start = (position as f64).clamp(0.0, max_position);
+        let span = max_position + self.viewport as f64;
+        if span <= 0.0 || track <= 0.0 {
+            return (0, track_len.max(1));
+        }
+        let thumb_start = (start * track / span).round().clamp(0.0, track - 1.0) as u16;
+        let thumb_end = ((start + self.viewport as f64) * track / span)
+            .round()
+            .clamp(0.0, track) as u16;
+        (thumb_start, thumb_end.saturating_sub(thumb_start).max(1))
+    }
+
+    /// What a press at this row does.
+    pub fn press_at(&self, y: u16) -> Press {
+        if y == self.area.y {
+            return Press::Step(-1);
+        }
+        if y + 1 == self.area.bottom() {
+            return Press::Step(1);
+        }
+        let (track_y, _) = self.track();
+        let (thumb_start, thumb_len) = self.thumb(self.position);
+        let at = y.saturating_sub(track_y);
+        if at < thumb_start {
+            Press::Page(-1)
+        } else if at < thumb_start + thumb_len {
+            Press::Grab(at - thumb_start)
+        } else {
+            Press::Page(1)
+        }
+    }
+
+    /// Where the content scrolls to when the thumb is dragged to this row,
+    /// held `grab` rows below its top.
+    pub fn offset_at(&self, y: u16, grab: u16) -> usize {
+        let (track_y, track_len) = self.track();
+        let (_, thumb_len) = self.thumb(self.position);
+        let travel = track_len.saturating_sub(thumb_len);
+        if travel == 0 {
+            return 0;
+        }
+        let at = y
+            .saturating_sub(track_y)
+            .saturating_sub(grab)
+            .min(travel);
+        let offset = f64::from(at) * self.max_offset() as f64 / f64::from(travel);
+        (offset.round() as usize).min(self.max_offset())
+    }
+}
+
 /// What a drag is moving.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Divider {
@@ -130,6 +230,11 @@ pub struct Panes {
     /// its pane is measured from). Recorded while drawing, so which dividers
     /// exist follows whichever panes are actually up.
     borders: Vec<(Divider, u16, u16)>,
+    /// The scrollbars on screen, likewise.
+    bars: Vec<Bar>,
+    /// The thumb a drag is moving, and where it was grabbed. Once held it keeps
+    /// following the pointer's row, even off the track.
+    pub scrolling: Option<(Bar, u16)>,
 }
 
 impl Panes {
@@ -147,6 +252,8 @@ impl Panes {
             edges: Vec::new(),
             header_y: 0,
             borders: Vec::new(),
+            bars: Vec::new(),
+            scrolling: None,
         }
     }
 
@@ -198,6 +305,24 @@ impl Panes {
     pub fn record_dividers(&mut self, borders: &[(Divider, u16, u16)]) {
         self.borders.clear();
         self.borders.extend_from_slice(borders);
+    }
+
+    /// Forget last frame's scrollbars; each one records itself as it draws.
+    pub fn clear_scrollbars(&mut self) {
+        self.bars.clear();
+    }
+
+    pub fn record_scrollbar(&mut self, bar: Bar) {
+        self.bars.push(bar);
+    }
+
+    /// The scrollbar under a press. They're one column wide, drawn down the
+    /// right edge of the area they were given.
+    pub fn scrollbar_at(&self, x: u16, y: u16) -> Option<Bar> {
+        self.bars
+            .iter()
+            .find(|bar| x + 1 == bar.area.right() && y >= bar.area.y && y < bar.area.bottom())
+            .copied()
     }
 
     /// Record where the drawn columns landed, for hit-testing a drag.

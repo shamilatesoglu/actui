@@ -6,7 +6,8 @@ mod overlays;
 mod repos;
 
 use crate::app::{
-    is_error_line, log_content, App, Column, Divider, Filter, Focus, Mode, RunnerRow, RunnerStatus,
+    is_error_line, log_content, App, Bar, Column, Divider, Filter, Focus, Mode, Panes, RunnerRow,
+    RunnerStatus, Scrollable,
 };
 use crate::github::{Job, Run, RunState, Step};
 use ansi_to_tui::IntoText;
@@ -159,11 +160,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .split(f.area());
 
     app.hit.tabs = chunks[1];
+    app.hit.runners_tab = Rect::default();
     // Cleared here so stale rects can't take clicks in the views that drop the
     // panes; draw_repos and draw_body set them again when they draw.
     app.hit.repos = Rect::default();
     app.hit.body = Rect::default();
     app.panes.record_dividers(&[]);
+    app.panes.clear_scrollbars();
 
     draw_header(f, app, chunks[0]);
     draw_tabs(f, app, chunks[1]);
@@ -297,29 +300,52 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
     out
 }
 
-fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
+/// The tabs row: which runs you're filtering to on the left, and which screen
+/// you're on over on the right.
+fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
+    let elsewhere = app.mode == Mode::Runners;
     let titles: Vec<Line> = Filter::ALL
         .iter()
         .map(|filt| Line::from(format!(" {} ", filt.label())))
         .collect();
     let sel = Filter::ALL.iter().position(|x| *x == app.filter).unwrap_or(0);
+    // The filter belongs to the runs list, so it stops shouting while another
+    // screen is up.
+    let selected = if elsewhere {
+        Style::default().fg(dim()).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Black).bg(accent()).add_modifier(Modifier::BOLD)
+    };
     let tabs = Tabs::new(titles)
         .select(sel)
         .style(Style::default().fg(dim()))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(accent())
-                .add_modifier(Modifier::BOLD),
-        )
+        .highlight_style(selected)
         .divider("");
     f.render_widget(tabs, area);
+
+    let label = " ⚙ Runners  s ";
+    let width = label.chars().count() as u16;
+    if area.width <= width {
+        app.hit.runners_tab = Rect::default();
+        return;
+    }
+    let at = Rect { x: area.right() - width, width, ..area };
+    app.hit.runners_tab = at;
+    let style = if elsewhere {
+        Style::default().fg(Color::Black).bg(accent()).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(dim())
+    };
+    f.render_widget(Paragraph::new(Span::styled(label, style)), at);
 }
 
 fn draw_body(f: &mut Frame, app: &mut App, area: Rect) {
-    // The org-runners view takes over the body as its own dedicated pane.
+    // The org-runners view keeps the sidebar it's reached from beside it.
     if app.mode == Mode::Runners {
-        draw_runners_pane(f, app, area);
+        app.hit.body = area;
+        let (rest, dividers) = draw_sidebar(f, app, area);
+        draw_runners_pane(f, app, rest);
+        app.panes.record_dividers(&dividers);
         return;
     }
     // Live steps open as a third pane so the run detail + jobs list stay
@@ -483,14 +509,15 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     // Scroll position feedback once the list outgrows the viewport. Rendered
     // after the table so the offset reflects this frame.
     let viewport = content.height.saturating_sub(1) as usize; // header row
-    if app.view.len() > viewport {
-        let mut sb = ScrollbarState::new(app.view.len()).position(app.table_state.offset());
-        f.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight),
-            area.inner(Margin { vertical: 1, horizontal: 0 }),
-            &mut sb,
-        );
-    }
+    scrollbar(
+        f,
+        &mut app.panes,
+        Scrollable::Runs,
+        area.inner(Margin { vertical: 1, horizontal: 0 }),
+        app.view.len(),
+        viewport,
+        app.table_state.offset(),
+    );
 }
 
 fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
@@ -629,6 +656,32 @@ fn draw_jobs(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// Draw a scrollbar for a list that has outgrown its pane, and record where it
+/// landed so a press on it can drive the list. Nothing is drawn — and nothing
+/// recorded — while everything fits.
+fn scrollbar(
+    f: &mut Frame,
+    panes: &mut Panes,
+    target: Scrollable,
+    area: Rect,
+    len: usize,
+    viewport: usize,
+    position: usize,
+) {
+    if len <= viewport || area.height < 3 {
+        return;
+    }
+    let mut state = ScrollbarState::new(len)
+        .viewport_content_length(viewport)
+        .position(position);
+    f.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight),
+        area,
+        &mut state,
+    );
+    panes.record_scrollbar(Bar { target, area, len, viewport, position });
+}
+
 /// One preview line: its number in the log, dim, then the highlighted text.
 fn numbered_log_line(index: usize, line: &str) -> Line<'static> {
     let mut spans = vec![Span::styled(
@@ -752,14 +805,16 @@ fn draw_runners_pane(f: &mut Frame, app: &mut App, area: Rect) {
     let mut state = rv.state.clone();
     f.render_stateful_widget(list, list_area, &mut state);
 
-    if rv.rows.len() > list_area.height as usize {
-        let mut sb = ScrollbarState::new(rv.rows.len()).position(state.offset());
-        f.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight),
-            list_area,
-            &mut sb,
-        );
-    }
+    let (rows, offset) = (rv.rows.len(), state.offset());
+    scrollbar(
+        f,
+        &mut app.panes,
+        Scrollable::Runners,
+        list_area,
+        rows,
+        list_area.height as usize,
+        offset,
+    );
 
     if let Some(da) = detail_area {
         draw_runner_detail(f, rv, da);
@@ -893,54 +948,116 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(Paragraph::new(Span::styled(format!(" {msg}"), style)), area);
         return;
     }
-    if app.mode == Mode::Runners {
-        let hint = " org self-hosted runners · j/k move · ⏎ details · o open on GitHub · r refresh · Esc back";
-        f.render_widget(Paragraph::new(Span::styled(hint, Style::default().fg(dim()))), area);
-        return;
-    }
-    if app.mode == Mode::Logs && app.steps_view.is_some() {
-        let hint = " live steps · updates automatically · ⏎ try logs · j/k move · Esc close";
-        f.render_widget(Paragraph::new(Span::styled(hint, Style::default().fg(dim()))), area);
-        return;
-    }
-    let hint: String = match (app.mode == Mode::Logs, app.focus) {
-        (true, _) => {
-            let preview_only = app.logs.as_ref().is_some_and(|lv| lv.preview_only);
-            let mode_str = if preview_only { " [errors]" } else { "" };
-            format!(" j/k move · ←/→ scroll · ⏎ fold · e/f all · p preview{mode_str} · / search · n/N · s save · Esc close")
-        }
-        (false, Focus::Runs) => {
-            // Only advertise `a approve` when the selected run is actually held.
-            let approve = if app.selected_run().is_some_and(|r| r.needs_approval()) {
-                " · a approve"
-            } else {
-                ""
-            };
-            // Offer `v failures` once the selected run has failed.
-            let fails = if app.selected_run().is_some_and(|r| r.state() == RunState::Failure) {
-                " · v failures"
-            } else {
-                ""
-            };
-            format!(" j/k move · ⏎/l jobs · / search · o open · d dispatch · c cancel · x/X rerun{approve}{fails} · A artifacts · p repos · ? help · q quit")
-        }
-        (false, Focus::Jobs) => {
-            " j/k job · ⏎/l logs · R rerun job · v failures · A artifacts · s runners · ←/Esc back · o open · ? help · q quit".into()
-        }
-        (false, Focus::Repos) => {
-            " j/k repo · ⏎/→ runs · d dispatch here · < > resize · = reset · Esc all repos · p hide · ? quit".into()
+    // Hints in priority order, and the ones to keep whatever the width.
+    let (mut hints, keep): (Vec<String>, Vec<&str>) = if app.mode == Mode::Runners {
+        (
+            owned(&["org self-hosted runners", "j/k move", "⏎ details", "o open on GitHub", "r refresh"]),
+            vec!["Esc back"],
+        )
+    } else if app.steps_pane_open() {
+        (
+            owned(&["live steps", "updates automatically", "⏎ try logs", "j/k move"]),
+            vec!["Esc close"],
+        )
+    } else if app.mode == Mode::Logs {
+        let errors = if app.logs.as_ref().is_some_and(|lv| lv.preview_only) { " [errors]" } else { "" };
+        (
+            vec![
+                "j/k move".into(),
+                "←/→ scroll".into(),
+                "⏎ fold".into(),
+                "e/f all".into(),
+                format!("p preview{errors}"),
+                "/ search".into(),
+                "n/N".into(),
+                "s save".into(),
+            ],
+            vec!["Esc close"],
+        )
+    } else {
+        match app.focus {
+            Focus::Runs => {
+                let mut hints = owned(&["j/k move", "⏎/l jobs", "/ search", "o open", "d dispatch"]);
+                // Only advertise `a approve` when the selected run is actually held.
+                if app.selected_run().is_some_and(|r| r.needs_approval()) {
+                    hints.push("a approve".into());
+                }
+                // Offer `v failures` once the selected run has failed.
+                if app.selected_run().is_some_and(|r| r.state() == RunState::Failure) {
+                    hints.push("v failures".into());
+                }
+                hints.extend(owned(&["c cancel", "x/X rerun", "A artifacts", "s runners", "p repos"]));
+                (hints, vec!["? help", "q quit"])
+            }
+            Focus::Jobs => (
+                owned(&[
+                    "j/k job",
+                    "⏎/l logs",
+                    "R rerun job",
+                    "v failures",
+                    "A artifacts",
+                    "s runners",
+                    "←/Esc back",
+                    "o open",
+                ]),
+                vec!["? help", "q quit"],
+            ),
+            Focus::Repos => (
+                owned(&[
+                    "j/k repo",
+                    "⏎/→ runs",
+                    "d dispatch here",
+                    "< > resize",
+                    "= reset",
+                    "Esc all repos",
+                    "p hide",
+                ]),
+                vec!["? help", "q quit"],
+            ),
         }
     };
     // A kept search filter stays visible (and dismissable) while it's active.
-    let hint = if app.mode != Mode::Logs && !app.search.is_empty() {
-        format!(" /{} · Esc clear ·{hint}", app.search)
-    } else {
-        hint
-    };
+    if app.mode != Mode::Logs && !app.search.is_empty() {
+        hints.insert(0, format!("/{} · Esc clear", app.search));
+    }
+    let line = hint_line(&hints, &keep, area.width as usize);
     f.render_widget(
-        Paragraph::new(Span::styled(hint, Style::default().fg(dim()))),
+        Paragraph::new(Span::styled(line, Style::default().fg(dim()))),
         area,
     );
+}
+
+fn owned(hints: &[&str]) -> Vec<String> {
+    hints.iter().map(|h| (*h).to_string()).collect()
+}
+
+/// Fit as many hints as the footer has room for, most important first, so a
+/// narrow terminal drops the ones it can't hold instead of cutting a key in
+/// half. `keep` always makes it: those are how you find everything else.
+fn hint_line(hints: &[String], keep: &[&str], width: usize) -> String {
+    const SEP: &str = " · ";
+    let tail = keep.join(SEP);
+    // A leading space, and the separator before the tail.
+    let room = width.saturating_sub(tail.chars().count() + if tail.is_empty() { 1 } else { 4 });
+
+    let mut line = String::new();
+    for hint in hints {
+        let sep = if line.is_empty() { 0 } else { SEP.chars().count() };
+        if line.chars().count() + sep + hint.chars().count() > room {
+            break;
+        }
+        if !line.is_empty() {
+            line.push_str(SEP);
+        }
+        line.push_str(hint);
+    }
+    if !tail.is_empty() {
+        if !line.is_empty() {
+            line.push_str(SEP);
+        }
+        line.push_str(&tail);
+    }
+    format!(" {line}")
 }
 
 // -- overlays ---------------------------------------------------------------
@@ -1031,14 +1148,15 @@ fn draw_logs_pane(f: &mut Frame, app: &mut App, area: Rect) {
     // Horizontal scroll for lines wider than the pane (Left/Right adjust it).
     f.render_widget(Paragraph::new(text).scroll((0, lv.hscroll)), body);
 
-    if shown > height {
-        let mut sb = ScrollbarState::new(shown).position(scroll);
-        f.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight),
-            area.inner(Margin { vertical: 1, horizontal: 0 }),
-            &mut sb,
-        );
-    }
+    scrollbar(
+        f,
+        &mut app.panes,
+        Scrollable::Logs,
+        area.inner(Margin { vertical: 1, horizontal: 0 }),
+        shown,
+        height,
+        scroll,
+    );
 
     let by = Rect { x: inner.x, y: inner.y + inner.height - 1, width: inner.width, height: 1 };
     if lv.searching {
@@ -1501,8 +1619,7 @@ mod tests {
     fn scoping_to_a_repo_drops_the_repository_column() {
         let mut app = demo_app();
         app.sync_layout(120);
-        let at = app.repos.rows.iter().position(|r| r.name == "org/web").unwrap();
-        app.repos.select(at + 1);
+        assert!(app.repos.select_repo("org/web"));
         app.recompute_view();
         let out = screen(&mut app, 120, 14);
         println!("{out}");
@@ -1539,8 +1656,7 @@ mod tests {
     fn a_repo_with_no_runs_points_at_dispatch() {
         let mut app = demo_app();
         app.sync_layout(120);
-        let at = app.repos.rows.iter().position(|r| r.name == "org/quiet-one").unwrap();
-        app.repos.select(at + 1);
+        assert!(app.repos.select_repo("org/quiet-one"));
         app.recompute_view();
         let out = screen(&mut app, 120, 14);
         println!("{out}");
@@ -1766,6 +1882,111 @@ mod tests {
         let mut saved = crate::state::State::default();
         app.panes.store(&mut saved);
         assert_eq!(saved.steps_width(), Some(app.panes.steps));
+    }
+
+    #[test]
+    fn the_tabs_row_switches_to_the_runners_view() {
+        let mut app = demo_app();
+        let out = screen(&mut app, 120, 14);
+        println!("{out}");
+        assert!(out.contains("⚙ Runners"), "the switcher sits beside the filters");
+        assert!(out.contains("s runners"), "and the footer names its key again");
+        assert!(!out.contains("│   Runners"), "it is not a row in the repos list");
+
+        // Scope to a repo, then click the switcher.
+        assert!(app.repos.select_repo("org/web"));
+        app.recompute_view();
+        let row = row_of(&out, "Running");
+        let at = column_of(out.lines().nth(row as usize).unwrap(), "⚙ Runners") as u16;
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), at, row));
+        assert!(matches!(app.mode, crate::app::Mode::Runners));
+
+        let out = screen(&mut app, 120, 14);
+        println!("{out}");
+        assert!(out.contains("Org runners"), "the view opens");
+        assert!(out.contains("All repos"), "beside the sidebar, which stays put");
+
+        // Clicking it again comes back, with the repo scope untouched.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), at, row));
+        assert!(matches!(app.mode, crate::app::Mode::Normal));
+        assert_eq!(app.repos.selected_repo(), Some("org/web"));
+
+        // And `s` still opens it from the keyboard.
+        use crossterm::event::{KeyCode, KeyEvent};
+        app.handle_key(KeyEvent::from(KeyCode::Char('s')));
+        assert!(matches!(app.mode, crate::app::Mode::Runners));
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.repos.selected_repo(), Some("org/web"));
+    }
+
+    /// A sidebar with far more repos than fit, and where its scrollbar landed.
+    fn app_with_a_long_sidebar() -> (App, String, u16) {
+        let mut app = demo_app();
+        let many: Vec<String> = (0..40).map(|i| format!("org/repo-{i:02}")).collect();
+        app.apply(crate::app::DataMsg::Repos(many));
+        app.recompute_view();
+        let out = screen(&mut app, 120, 14);
+        let track_x = app.panes.sidebar - 1;
+        (app, out, track_x)
+    }
+
+    /// The row a scrollbar glyph is drawn on: ▲ and ▼ are the arrows, █ the thumb.
+    fn bar_row(out: &str, x: u16, glyph: char) -> u16 {
+        out.lines()
+            .position(|l| l.chars().nth(x as usize) == Some(glyph))
+            .unwrap_or_else(|| panic!("no {glyph} in the bar")) as u16
+    }
+
+    #[test]
+    fn a_scrollbars_arrows_step_and_its_track_pages() {
+        let (mut app, out, x) = app_with_a_long_sidebar();
+        println!("{out}");
+        let (up, down) = (bar_row(&out, x, '▲'), bar_row(&out, x, '▼'));
+        assert_eq!(app.repos.state.offset(), 0);
+
+        // The bottom arrow steps one row; the top one steps back.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, down));
+        assert_eq!(app.repos.state.offset(), 1);
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), x, down));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, up));
+        assert_eq!(app.repos.state.offset(), 0);
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), x, up));
+
+        // The track below the thumb pages down by a viewport.
+        let out = screen(&mut app, 120, 14);
+        let thumb = bar_row(&out, x, '█');
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, thumb + 1));
+        let paged = app.repos.state.offset();
+        assert!(paged > 1, "a press on the track pages rather than stepping, got {paged}");
+        assert!(paged <= app.repos.len(), "and never past the end");
+    }
+
+    #[test]
+    fn dragging_a_scrollbars_thumb_scrolls_the_list_under_it() {
+        let (mut app, out, x) = app_with_a_long_sidebar();
+        let (thumb, down) = (bar_row(&out, x, '█'), bar_row(&out, x, '▼'));
+
+        // Grab the thumb and pull it to the bottom of the track.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, thumb));
+        assert_eq!(app.repos.state.offset(), 0, "grabbing the thumb doesn't move it");
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), x, down));
+        let bottom = app.repos.state.offset();
+        assert_eq!(bottom, app.repos.len() - app.hit.repos.height as usize);
+
+        let out = screen(&mut app, 120, 14);
+        println!("{out}");
+        assert!(out.contains("org/repo-39"), "the end of the list is on screen");
+        assert!(!out.contains("All repos"), "and the start has scrolled off");
+
+        // Dragging back up follows the pointer, even once it leaves the track.
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 0, 0));
+        assert_eq!(app.repos.state.offset(), 0);
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 0, 0));
+        assert!(app.panes.scrolling.is_none(), "letting go lets go");
+
+        // The wheel over the bar scrolls it too.
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, x, thumb));
+        assert!(app.repos.state.offset() > 0);
     }
 
     #[test]
