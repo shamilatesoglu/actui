@@ -2048,7 +2048,7 @@ mod tests {
         // A tall pane, so the track is long enough to drag down properly.
         let out = screen(&mut app, 120, 30);
         let x = app.panes.sidebar - 1;
-        let (top, bottom) = (bar_row(&out, x, '▲'), bar_row(&out, x, '▼'));
+        let bottom = bar_row(&out, x, '▼');
         let thumb = bar_row(&out, x, '█');
 
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, thumb));
