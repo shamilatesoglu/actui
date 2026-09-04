@@ -64,6 +64,8 @@ pub struct Github {
     etags: Arc<Mutex<HashMap<String, String>>>,
     /// Last assembled repo list, returned when `/user/repos` is unchanged.
     repos_cache: Arc<Mutex<Vec<Repo>>>,
+    /// Last tag list per repo, returned when that repo's `/tags` is unchanged.
+    tags_cache: Arc<Mutex<HashMap<String, Vec<Tag>>>>,
     /// Largest `X-Poll-Interval` (seconds) GitHub has asked us to honor; 0 = unset.
     poll_interval: Arc<AtomicU64>,
     rate_state: Arc<Mutex<RateState>>,
@@ -89,6 +91,7 @@ impl Github {
             token: Arc::new(Mutex::new(token.to_string())),
             etags: Arc::new(Mutex::new(HashMap::new())),
             repos_cache: Arc::new(Mutex::new(Vec::new())),
+            tags_cache: Arc::new(Mutex::new(HashMap::new())),
             poll_interval: Arc::new(AtomicU64::new(0)),
             rate_state: Arc::new(Mutex::new(RateState::default())),
         })
@@ -568,6 +571,89 @@ impl Github {
         Ok(resp.runners)
     }
 
+    /// The repo's most recent tags, each already resolved to the commit it
+    /// points at (GitHub dereferences annotated tags for this endpoint).
+    /// Conditional: a `304` hands back the tags we already have and costs no
+    /// rate-limit quota, so polling this while a run is going is nearly free.
+    pub async fn tags(&self, full_name: &str) -> Result<Vec<Tag>> {
+        let key = format!("tags:{full_name}");
+        let url = format!("{API}/repos/{full_name}/tags");
+        match self
+            .cond_get::<Vec<Tag>>(&key, url, &[("per_page", "100".to_string())])
+            .await?
+        {
+            Cond::Modified(tags) => {
+                self.tags_cache
+                    .lock()
+                    .unwrap()
+                    .insert(full_name.to_string(), tags.clone());
+                Ok(tags)
+            }
+            Cond::NotModified => Ok(self
+                .tags_cache
+                .lock()
+                .unwrap()
+                .get(full_name)
+                .cloned()
+                .unwrap_or_default()),
+        }
+    }
+
+    /// The release published under `tag`. GitHub answers `404` both when the tag
+    /// doesn't exist and when it carries no release; here that is an ordinary
+    /// "there isn't one" rather than a failure.
+    pub async fn release_by_tag(&self, full_name: &str, tag: &str) -> Result<Option<Release>> {
+        let resp = self
+            .send(self.client.get(format!("{API}/repos/{full_name}/releases/tags/{tag}")))
+            .await?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(ensure_ok(resp).await?.json().await?))
+    }
+
+    /// What each of these runs put on its commit: the tag now pointing there,
+    /// and the release published under it if there is one. A run tags a commit
+    /// by building it, so a tag that lands on a run's head commit is that run's
+    /// doing. One repo at a time, because a single tag list answers for all of
+    /// its runs; that list is conditional, so a repeat look is normally a free
+    /// `304`. Only a commit that really carries a tag costs a release lookup,
+    /// and each tag is looked up once per batch.
+    pub async fn tags_for_commits(
+        &self,
+        full_name: &str,
+        runs: &[(u64, String)],
+    ) -> Result<Vec<(u64, Option<RunTag>)>> {
+        let tags = self.tags(full_name).await?;
+        let mut seen: HashMap<String, RunTag> = HashMap::new();
+        let mut found = Vec::with_capacity(runs.len());
+        for (run_id, sha) in runs {
+            let mut best: Option<RunTag> = None;
+            for name in tags_at(&tags, sha) {
+                let tag = match seen.get(&name) {
+                    Some(hit) => hit.clone(),
+                    None => {
+                        let release = self.release_by_tag(full_name, &name).await?;
+                        let tag = RunTag::new(full_name, name.clone(), release);
+                        seen.insert(name, tag.clone());
+                        tag
+                    }
+                };
+                // A released tag is the one worth showing; failing that, the
+                // first tag on the commit will do.
+                if tag.released || best.is_none() {
+                    let done = tag.released;
+                    best = Some(tag);
+                    if done {
+                        break;
+                    }
+                }
+            }
+            found.push((*run_id, best));
+        }
+        Ok(found)
+    }
+
     /// Artifacts produced by a run.
     pub async fn list_artifacts(&self, full_name: &str, run_id: u64) -> Result<Vec<Artifact>> {
         #[derive(Deserialize)]
@@ -796,6 +882,9 @@ pub struct Run {
     pub display_title: String,
     #[serde(default)]
     pub head_branch: Option<String>,
+    /// The commit the run is building — how we find the release it published.
+    #[serde(default)]
+    pub head_sha: String,
     pub run_number: u64,
     pub event: String,
     pub status: String,
@@ -932,6 +1021,87 @@ pub struct RunnerLabel {
     pub name: String,
 }
 
+/// A repo tag and the commit it resolves to.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Tag {
+    pub name: String,
+    pub commit: TagCommit,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TagCommit {
+    pub sha: String,
+}
+
+/// A published GitHub release.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Release {
+    pub tag_name: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub html_url: String,
+    #[serde(default)]
+    pub prerelease: bool,
+}
+
+impl Release {
+    /// The release's own name, when it says more than the tag already does.
+    fn title(&self) -> Option<&str> {
+        let name = self.name.as_deref()?.trim();
+        (!name.is_empty() && name != self.tag_name).then_some(name)
+    }
+}
+
+/// What a run put on its commit: a tag, and — once one is published under it —
+/// the release. A tag on its own is worth showing; it just isn't a release yet.
+#[derive(Debug, Clone)]
+pub struct RunTag {
+    pub name: String,
+    /// Its page on github.com. GitHub serves one for a bare tag too.
+    pub url: String,
+    /// A release has been published under the tag.
+    pub released: bool,
+    /// The release's own name, when it says more than the tag already does.
+    pub title: Option<String>,
+    pub prerelease: bool,
+}
+
+impl RunTag {
+    fn new(full_name: &str, name: String, release: Option<Release>) -> Self {
+        Self {
+            url: match &release {
+                Some(r) => r.html_url.clone(),
+                None => format!("https://github.com/{full_name}/releases/tag/{name}"),
+            },
+            title: release.as_ref().and_then(|r| r.title()).map(str::to_string),
+            prerelease: release.as_ref().is_some_and(|r| r.prerelease),
+            released: release.is_some(),
+            name,
+        }
+    }
+
+    /// What to call it: a tag only becomes a release once one is published.
+    pub fn label(&self) -> &'static str {
+        if self.released {
+            "release"
+        } else {
+            "tag"
+        }
+    }
+}
+
+/// Names of the tags pointing at `sha` — usually none, occasionally one, and
+/// more when a commit was tagged twice. An unknown commit matches nothing.
+fn tags_at(tags: &[Tag], sha: &str) -> Vec<String> {
+    if sha.is_empty() {
+        return Vec::new();
+    }
+    tags.iter()
+        .filter(|t| t.commit.sha == sha)
+        .map(|t| t.name.clone())
+        .collect()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Artifact {
     pub id: u64,
@@ -975,6 +1145,11 @@ impl Run {
             },
             _ => RunState::Other,
         }
+    }
+
+    /// Still queued or running — nothing about it is final yet.
+    pub fn is_active(&self) -> bool {
+        matches!(self.state(), RunState::Queued | RunState::Running)
     }
 
     /// True when the run is held awaiting approval — either a fork-PR approval
@@ -1081,6 +1256,48 @@ jobs: {}
         assert_eq!(anns[0].annotation_level.as_deref(), Some("failure"));
         // A missing `annotation_level` deserializes to None (we bucket it as a warning).
         assert!(anns[1].annotation_level.is_none());
+    }
+
+    #[test]
+    fn finds_the_tags_sitting_on_a_commit() {
+        let tag = |name: &str, sha: &str| Tag {
+            name: name.into(),
+            commit: TagCommit { sha: sha.into() },
+        };
+        let tags = [
+            tag("v0.4.0", "a1b2c3d"),
+            tag("latest", "a1b2c3d"),
+            tag("v0.3.9", "9f8e7d6"),
+        ];
+        // A commit can carry more than one tag; both are offered, in repo order.
+        assert_eq!(tags_at(&tags, "a1b2c3d"), ["v0.4.0", "latest"]);
+        assert_eq!(tags_at(&tags, "9f8e7d6"), ["v0.3.9"]);
+        // An untagged commit has no release, and neither does an unknown one.
+        assert!(tags_at(&tags, "0000000").is_empty());
+        assert!(tags_at(&tags, "").is_empty());
+    }
+
+    #[test]
+    fn parses_a_release_and_names_it_only_when_it_adds_something() {
+        let json = r#"{
+          "tag_name": "v0.4.0",
+          "name": "Scrollbars everywhere",
+          "html_url": "https://github.com/org/api/releases/tag/v0.4.0",
+          "prerelease": false
+        }"#;
+        let r: Release = serde_json::from_str(json).unwrap();
+        assert_eq!(r.tag_name, "v0.4.0");
+        assert_eq!(r.title(), Some("Scrollbars everywhere"));
+        assert!(!r.prerelease);
+
+        // A release named after its own tag would just say it twice.
+        let same: Release =
+            serde_json::from_str(r#"{"tag_name":"v1","name":"v1","html_url":"u"}"#).unwrap();
+        assert_eq!(same.title(), None);
+        // GitHub sends `null` for an unnamed release.
+        let none: Release =
+            serde_json::from_str(r#"{"tag_name":"v1","name":null,"html_url":"u"}"#).unwrap();
+        assert_eq!(none.title(), None);
     }
 
     #[test]

@@ -363,6 +363,7 @@ impl App {
                 Focus::Jobs => self.open_logs(),
             },
             KeyCode::Char('o') => self.open_in_browser(),
+            KeyCode::Char('t') => self.open_tag(),
             // Always-available: open the selected job's logs regardless of focus.
             KeyCode::Char('L') => self.open_logs(),
             KeyCode::Char('c') => self.confirm_cancel(),
@@ -873,6 +874,14 @@ impl App {
 
     /// Open github.com for the current selection: the focused job's page when the
     /// Jobs pane holds focus and a job is selected, otherwise the run's page.
+    /// Open what the selected run tagged — its release, or the bare tag.
+    fn open_tag(&mut self) {
+        match self.selected_tag().map(|t| t.url.clone()) {
+            Some(url) => self.pending.push(Command::OpenUrl(url)),
+            None => self.set_status("This run hasn't tagged anything", true),
+        }
+    }
+
     fn open_in_browser(&mut self) {
         let url = if self.focus == Focus::Jobs {
             match (self.selected_run(), self.selected_job()) {

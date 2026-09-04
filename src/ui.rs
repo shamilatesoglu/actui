@@ -9,7 +9,7 @@ use crate::app::{
     is_error_line, log_content, App, Bar, Column, Divider, Filter, Focus, Mode, Panes, RunnerRow,
     RunnerStatus, Scrollable,
 };
-use crate::github::{Job, Run, RunState, Step};
+use crate::github::{Job, Run, RunState, RunTag, Step};
 use ansi_to_tui::IntoText;
 use chrono::{DateTime, Utc};
 use overlays::*;
@@ -446,12 +446,18 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     let wide = budget >= 100; // event + actor
     let medium = budget >= 72; // duration
     let branch = budget >= 55; // branch, once the essentials are covered
+    // The tag column earns its place only when there's width to spare and
+    // something on the list actually tagged — otherwise it's a blank stripe.
+    let tagged = budget >= 66 && app.any_tag_shown();
 
     let mut shown = Vec::new();
     if !scoped {
         shown.push(Column::Repo);
     }
     shown.push(Column::Workflow);
+    if tagged {
+        shown.push(Column::Tag);
+    }
     if branch {
         shown.push(Column::Branch);
     }
@@ -489,7 +495,10 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
         let r = &app.runs[i];
         let (icon, color) = state_glyph(r.state());
         let mut cells = vec![Cell::from(Span::styled(icon, Style::default().fg(color)))];
-        cells.extend(shown.iter().zip(&drawn).map(|(col, w)| cell(r, *col, *w as usize, spin)));
+        let tag = app.tag_of(r.id);
+        cells.extend(
+            shown.iter().zip(&drawn).map(|(col, w)| cell(r, tag, *col, *w as usize, spin)),
+        );
         cells.push(Cell::from("")); // the trailing spacer
         Row::new(cells)
     }).collect();
@@ -533,9 +542,12 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     };
 
+    // The tag row earns its own line rather than crowding out the run info.
+    let tag = app.selected_tag().cloned();
+    let info_h = if tag.is_some() { 10 } else { 9 };
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(9), Constraint::Min(3)])
+        .constraints([Constraint::Length(info_h), Constraint::Min(3)])
         .split(inner);
 
     let (icon, color) = state_glyph(run.state());
@@ -561,8 +573,13 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
     if run.needs_approval() {
         first.push(Span::styled("  · press a", Style::default().fg(dim())));
     }
-    let mut info = vec![
-        Line::from(first),
+    let mut info = vec![Line::from(first)];
+    // Right under the state line: this is what the run produced, and up here it
+    // survives a short pane instead of being the first row cut.
+    if let Some(t) = &tag {
+        info.push(tag_line(t, rows[0].width));
+    }
+    info.extend([
         kv("repo", &run.repository.full_name),
         kv("flow", run.workflow_name()),
         kv("title", run.title()),
@@ -570,9 +587,11 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
         kv("event", &run.event),
         kv("actor", run.actor.as_ref().map(|a| a.login.as_str()).unwrap_or("-")),
         kv("started", &fmt_dt(run.run_started_at.unwrap_or(run.created_at))),
-    ];
+    ]);
     info.truncate(rows[0].height as usize);
-    f.render_widget(Paragraph::new(info).wrap(Wrap { trim: true }), rows[0]);
+    // `trim: false`: these rows are right-aligned labels, and trimming would
+    // strip the very padding that lines them up.
+    f.render_widget(Paragraph::new(info).wrap(Wrap { trim: false }), rows[0]);
 
     draw_jobs(f, app, rows[1]);
 }
@@ -875,7 +894,7 @@ fn draw_runner_detail(f: &mut Frame, rv: &crate::app::RunnersView, area: Rect) {
         Line::raw(""),
         kv("org", rv.selected_org().unwrap_or("-")),
         Line::from(vec![
-            Span::styled(format!("{:>8}  ", "status"), Style::default().fg(dim())),
+            Span::styled(format!("{:>LABEL_W$}  ", "status"), Style::default().fg(dim())),
             Span::styled(state_text, Style::default().fg(scolor)),
         ]),
         kv("os", if os.is_empty() { "-" } else { os }),
@@ -895,7 +914,8 @@ fn draw_runner_detail(f: &mut Frame, rv: &crate::app::RunnersView, area: Rect) {
             ]));
         }
     }
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+    // Right-aligned labels again — trimming would undo the alignment.
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 fn runner_row_item(row: &RunnerRow) -> ListItem<'static> {
@@ -997,6 +1017,11 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 // Offer `v failures` once the selected run has failed.
                 if app.selected_run().is_some_and(|r| r.state() == RunState::Failure) {
                     hints.push("v failures".into());
+                }
+                // And `t` only once the run has actually tagged something —
+                // named for what it opens.
+                if let Some(t) = app.selected_tag() {
+                    hints.push(format!("t {}", t.label()));
                 }
                 hints.extend(owned(&["c cancel", "x/X rerun", "A artifacts", "s runners", "p repos"]));
                 (hints, vec!["? help", "q quit"])
@@ -1309,11 +1334,45 @@ fn highlight_match(raw: &str, query: &str) -> Line<'static> {
 
 // -- helpers ----------------------------------------------------------------
 
+/// Width the detail panes right-align their labels in.
+const LABEL_W: usize = 8;
+
 fn kv(k: &str, v: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{k:>8}  "), Style::default().fg(dim())),
+        Span::styled(format!("{k:>LABEL_W$}  "), Style::default().fg(dim())),
         Span::raw(v.to_string()),
     ])
+}
+
+/// What the run put on its commit: the tag, then — once a release is published
+/// under it — the release's name. Kept to one line, since the rest of the pane
+/// is one line per fact and a name long enough to wrap would push the run's own
+/// details off a short pane.
+fn tag_line(t: &RunTag, width: u16) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(format!("{:>LABEL_W$}  ", t.label()), Style::default().fg(dim())),
+        Span::styled(
+            t.name.clone(),
+            // An unreleased tag is worth showing but isn't the headline.
+            Style::default()
+                .fg(if t.released { accent() } else { dim() })
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    let mut used = LABEL_W + 2 + t.name.chars().count();
+    if t.prerelease {
+        spans.push(Span::styled("  pre", Style::default().fg(Color::Yellow)));
+        used += 5;
+    }
+    // The name comes along only when enough of it fits to be worth reading.
+    let room = (width as usize).saturating_sub(used + 2);
+    if let Some(name) = t.title.as_deref().filter(|_| room >= 8) {
+        spans.push(Span::styled(
+            format!("  {}", truncate(name, room)),
+            Style::default().fg(dim()),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn state_glyph(s: RunState) -> (&'static str, Color) {
@@ -1436,7 +1495,7 @@ fn fmt_dt(ts: DateTime<Utc>) -> String {
 const LEAD: u16 = 4;
 
 /// One table cell, cut to the width its column is actually drawn at.
-fn cell(r: &Run, col: Column, w: usize, spin: &str) -> Cell<'static> {
+fn cell(r: &Run, tag: Option<&RunTag>, col: Column, w: usize, spin: &str) -> Cell<'static> {
     let dimmed = Style::default().fg(dim());
     match col {
         Column::Repo => Cell::from(truncate(&r.repository.full_name, w)),
@@ -1454,6 +1513,15 @@ fn cell(r: &Run, col: Column, w: usize, spin: &str) -> Cell<'static> {
                 Span::styled(number, dimmed),
             ]))
         }
+        // Blank where a run tagged nothing — the column is only on screen
+        // because something on the list did. A released tag is the one worth
+        // spotting from across the table, so only that one gets the accent.
+        Column::Tag => match tag {
+            Some(t) if t.released => Cell::from(truncate(&t.name, w))
+                .style(Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+            Some(t) => Cell::from(truncate(&t.name, w)).style(dimmed),
+            None => Cell::from(""),
+        },
         Column::Branch => Cell::from(truncate(r.head_branch.as_deref().unwrap_or("-"), w)),
         Column::Event => Cell::from(truncate(&event_label(&r.event), w)),
         Column::Actor => Cell::from(truncate(
@@ -1585,6 +1653,7 @@ mod tests {
             name: Some("CI".into()),
             display_title: "fix the thing".into(),
             head_branch: Some("main".into()),
+            head_sha: "a1b2c3d".into(),
             run_number: 296,
             event: "push".into(),
             status: status.into(),
@@ -2005,6 +2074,116 @@ mod tests {
         // The wheel over the bar scrolls it too.
         app.handle_mouse(mouse(MouseEventKind::ScrollDown, x, thumb));
         assert!(app.repos.state.offset() > 0);
+    }
+
+    fn tag(name: &str, released: bool, title: Option<&str>) -> crate::github::RunTag {
+        crate::github::RunTag {
+            url: format!("http://x/releases/tag/{name}"),
+            name: name.into(),
+            released,
+            title: title.map(str::to_string),
+            prerelease: false,
+        }
+    }
+
+    #[test]
+    fn the_runs_table_shows_a_tag_column_only_when_it_has_something_to_say() {
+        let mut app = demo_app();
+        let (released, plain) = (app.runs[1].id, app.runs[2].id);
+
+        // Nothing tagged: no column, no blank stripe down the table.
+        let out = screen(&mut app, 130, 16);
+        assert!(!out.contains("Tag"), "no column before any run has one");
+
+        app.apply(crate::app::DataMsg::Tags {
+            found: vec![
+                (released, Some(tag("v0.4.0", true, None))),
+                // A tag the workflow pushed without publishing a release.
+                (plain, Some(tag("nightly-2026-09-04", false, None))),
+            ],
+        });
+
+        let out = screen(&mut app, 130, 16);
+        println!("{out}");
+        assert!(out.contains("Tag"), "the column appears with the first tag");
+        let rows: Vec<&str> = out.lines().filter(|l| l.contains("org/")).collect();
+        // Each tag lands on the run that made it, and the untagged run stays blank.
+        assert!(rows.iter().any(|l| l.contains("org/web") && l.contains("v0.4.0")));
+        assert!(rows.iter().any(|l| l.contains("dotfiles") && l.contains("nightly-2…")));
+        let api = rows.iter().find(|l| l.contains("org/api")).unwrap();
+        assert!(!api.contains("v0.4.0") && !api.contains("nightly"), "untagged: {api}");
+
+        // Too narrow to spare the width: the essentials win and the column goes.
+        let narrow = screen(&mut app, 84, 16);
+        println!("{narrow}");
+        assert!(!narrow.contains("Tag"), "no room for it here");
+        assert!(narrow.contains("Workflow"), "the essentials stay");
+    }
+
+    #[test]
+    fn the_detail_pane_names_a_bare_tag_a_tag_and_a_released_one_a_release() {
+        let mut app = demo_app();
+        app.table_state.select(Some(0));
+        let run_id = app.selected_run().unwrap().id;
+
+        // Nothing tagged yet: the pane says nothing, and the footer doesn't
+        // offer a key that would go nowhere.
+        let out = screen(&mut app, 130, 24);
+        assert!(!out.contains("t tag") && !out.contains("t release"));
+
+        // A tag with no release behind it is still worth showing — as a tag.
+        app.apply(crate::app::DataMsg::Tags {
+            found: vec![(run_id, Some(tag("v0.4.0", false, None)))],
+        });
+        let out = screen(&mut app, 130, 24);
+        println!("{out}");
+        let row = out.lines().find(|l| l.contains("v0.4.0")).expect("a tag row");
+        assert!(row.contains("tag  v0.4.0"), "called a tag: {row}");
+        assert!(!row.contains("release"), "it isn't one yet: {row}");
+        assert!(out.contains("t tag"), "and the key says what it opens");
+
+        // The workflow publishes under it: same row, now a release.
+        app.apply(crate::app::DataMsg::Tags {
+            found: vec![(run_id, Some(tag("v0.4.0", true, Some("Scrollbars everywhere"))))],
+        });
+        let out = screen(&mut app, 130, 24);
+        println!("{out}");
+        let rows: Vec<&str> = out.lines().filter(|l| l.contains("v0.4.0")).collect();
+        assert_eq!(rows.len(), 1, "one line, like every other row in the pane");
+        assert!(rows[0].contains("release  v0.4.0"), "promoted: {}", rows[0]);
+        assert!(rows[0].contains("Scrollbars"), "and what it's called: {}", rows[0]);
+        assert!(out.contains("t release"), "the key follows suit");
+
+        // Squeezed, the tag still gets through — it's the part that identifies
+        // the release — and the row never wraps onto a second line.
+        let narrow = screen(&mut app, 92, 24);
+        println!("{narrow}");
+        let rows: Vec<&str> = narrow.lines().filter(|l| l.contains("v0.4.0")).collect();
+        assert_eq!(rows.len(), 1, "still one line: {rows:?}");
+        assert!(narrow.contains("started"), "and the run's own details stay put");
+
+        // `t` opens it; the run page stays on `o`.
+        app.handle_key(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('t')));
+        assert!(app
+            .pending
+            .iter()
+            .any(|c| matches!(c, crate::app::Command::OpenUrl(u) if u.ends_with("v0.4.0"))));
+    }
+
+    #[test]
+    fn the_tag_row_marks_prereleases_and_drops_the_name_when_squeezed() {
+        let pre = crate::github::RunTag { prerelease: true, ..tag("v0.5.0-rc1", true, Some("Release candidate")) };
+        let text = |l: Line| l.spans.iter().map(|s| s.content.to_string()).collect::<String>();
+
+        let wide = text(tag_line(&pre, 60));
+        assert!(wide.contains("v0.5.0-rc1"));
+        assert!(wide.contains("pre"), "a prerelease says so: {wide}");
+        assert!(wide.contains("Release candidate"));
+
+        // Too narrow for the name to say anything: the tag keeps the whole row.
+        let tight = text(tag_line(&pre, 26));
+        assert!(tight.contains("v0.5.0-rc1") && tight.contains("pre"));
+        assert!(!tight.contains("candidate"), "a stub is worse than none: {tight}");
     }
 
     #[test]

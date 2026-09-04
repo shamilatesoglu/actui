@@ -18,7 +18,7 @@ pub use protocol::{AnnJob, Command, DataMsg};
 pub(crate) use logs::{is_error_line, log_content};
 
 use crate::config::Config;
-use crate::github::{Actor, Job, RateLimit, Run, RunRepo, RunState, Step};
+use crate::github::{Actor, Job, RateLimit, Run, RunRepo, RunState, RunTag, Step};
 use crate::state::State;
 use chrono::{DateTime, Utc};
 use ratatui::layout::Rect;
@@ -28,6 +28,9 @@ use std::time::{Duration, Instant};
 
 /// Most active runs polled per fast tick (keeps request bursts small).
 const MAX_ACTIVE_POLL: usize = 8;
+/// Most repos asked about tags in one pass, for the same reason. The rest catch
+/// up on later passes, and a repo's answer holds for the whole session.
+const MAX_TAG_REPOS: usize = 8;
 /// Cap on cached job-log blobs so a long session doesn't grow without bound.
 const MAX_LOG_CACHE: usize = 40;
 
@@ -126,6 +129,14 @@ pub enum Mode {
     Runners,
 }
 
+/// The answer to "what did this run put on its commit?".
+struct TagLookup {
+    tag: Option<RunTag>,
+    /// The run had already finished when this answer came back. Anything short
+    /// of a published release isn't the last word while a run is still going.
+    settled: bool,
+}
+
 pub struct App {
     pub user: String,
     pub runs: Vec<Run>,
@@ -150,6 +161,8 @@ pub struct App {
     /// Jobs cached per run id, so re-selecting a run restores them even when
     /// the conditional refetch comes back `304 Not Modified`.
     pub jobs_cache: HashMap<u64, Vec<Job>>,
+    /// What we know about each run's tag and release, keyed by run id.
+    tags: HashMap<u64, TagLookup>,
 
     pub repos_total: usize,
     pub repos_done: usize,
@@ -234,6 +247,7 @@ impl App {
             jobs_state: ListState::default(),
             jobs_run_id: None,
             jobs_cache: HashMap::new(),
+            tags: HashMap::new(),
             repos_total: 0,
             repos_done: 0,
             loading: true,
@@ -275,6 +289,69 @@ impl App {
         let i = self.table_state.selected()?;
         let idx = *self.view.get(i)?;
         self.runs.get(idx)
+    }
+
+    /// The tag a run put on its commit, once one has been found.
+    pub fn tag_of(&self, run_id: u64) -> Option<&RunTag> {
+        self.tags.get(&run_id)?.tag.as_ref()
+    }
+
+    /// The tag the selected run put on its commit, once one has been found.
+    pub fn selected_tag(&self) -> Option<&RunTag> {
+        self.tag_of(self.selected_run()?.id)
+    }
+
+    /// Whether any run on the runs list tagged anything — what decides if the
+    /// table's tag column has something to say.
+    pub fn any_tag_shown(&self) -> bool {
+        self.view.iter().any(|&i| self.tag_of(self.runs[i].id).is_some())
+    }
+
+    /// Ask what the runs on the list tagged, for the ones we don't know yet.
+    ///
+    /// Batched by repo, because one tag list answers for every run in a repo,
+    /// and capped at a few repos a pass so a first sweep of a large org doesn't
+    /// turn into a burst. Runs are taken in list order — most recent first — so
+    /// the repos you're watching resolve first and quieter ones catch up over
+    /// the next few sweeps. Cheap to call often: the tag lists are
+    /// ETag-conditional, so a repeat look comes back `304` and costs no
+    /// rate-limit quota, and an answer we can trust is kept for the session.
+    ///
+    /// A run still going never settles, so its repo holds a slot until it
+    /// finishes. With more busy repos than slots the quiet ones wait, which is
+    /// the right way round: those slots are going to what's moving.
+    fn queue_tag_lookups(&mut self) {
+        let mut by_repo: Vec<(String, Vec<(u64, String)>)> = Vec::new();
+        for &i in &self.view {
+            let run = &self.runs[i];
+            // A dispatch GitHub hasn't registered yet has no commit to look at.
+            if run.head_sha.is_empty() || !self.wants_tag_lookup(run) {
+                continue;
+            }
+            let at = by_repo.iter().position(|(r, _)| *r == run.repository.full_name);
+            match at {
+                Some(at) => by_repo[at].1.push((run.id, run.head_sha.clone())),
+                // A repo past the cap waits for the next pass rather than
+                // widening this one's burst.
+                None if by_repo.len() < MAX_TAG_REPOS => by_repo.push((
+                    run.repository.full_name.clone(),
+                    vec![(run.id, run.head_sha.clone())],
+                )),
+                None => {}
+            }
+        }
+        self.pending
+            .extend(by_repo.into_iter().map(|(repo, runs)| Command::FetchTags { repo, runs }));
+    }
+
+    /// True while what a run produced is still an open question. A published
+    /// release is the end of the story, and so is a run that has finished — but
+    /// a bare tag on a run still going may yet become a release.
+    fn wants_tag_lookup(&self, run: &Run) -> bool {
+        match self.tags.get(&run.id) {
+            Some(known) => !known.tag.as_ref().is_some_and(|t| t.released) && !known.settled,
+            None => true,
+        }
     }
 
     fn set_status(&mut self, msg: impl Into<String>, is_err: bool) {
@@ -405,6 +482,15 @@ impl App {
                     }
                 }
             }
+            DataMsg::Tags { found } => {
+                for (run_id, tag) in found {
+                    // A finished run can't tag or publish anything more, so its
+                    // answer is final; from a run still going it isn't.
+                    let settled =
+                        self.runs.iter().find(|r| r.id == run_id).is_some_and(|r| !r.is_active());
+                    self.tags.insert(run_id, TagLookup { tag, settled });
+                }
+            }
             DataMsg::PendingDeployments { run_id, items } => {
                 let Some(av) = &mut self.approval else { return };
                 if av.run_id != run_id {
@@ -505,8 +591,12 @@ impl App {
         // cache can't grow without bound over a long session.
         let live: HashSet<u64> = self.runs.iter().map(|r| r.id).collect();
         self.jobs_cache.retain(|id, _| live.contains(id));
+        self.tags.retain(|id, _| live.contains(id));
         self.detect_run_completions();
         self.recompute_view();
+        // This sweep is where a run's state turns final, so it's the moment to
+        // take one last look for a tag or release it made in its closing seconds.
+        self.queue_tag_lookups();
     }
 
     /// Compare each run's state to the previous sweep; for runs that went from
@@ -573,6 +663,7 @@ impl App {
             name: Some(workflow_name.to_string()),
             display_title: "manual dispatch".to_string(),
             head_branch: Some(git_ref.to_string()),
+            head_sha: String::new(),
             run_number: 0,
             event: "workflow_dispatch".to_string(),
             status: "in_progress".to_string(),
@@ -871,9 +962,7 @@ impl App {
 
     /// True when any run (not just the selected one) is queued/in progress.
     pub fn any_run_active(&self) -> bool {
-        self.runs
-            .iter()
-            .any(|r| matches!(r.state(), RunState::Running | RunState::Queued))
+        self.runs.iter().any(Run::is_active)
     }
 
     /// Focused poll for the fast cadence: refresh jobs for the active runs (up
@@ -883,7 +972,7 @@ impl App {
         let active: Vec<(String, u64)> = self
             .runs
             .iter()
-            .filter(|r| matches!(r.state(), RunState::Running | RunState::Queued))
+            .filter(|r| r.is_active())
             .filter(|r| !self.is_placeholder(r.id))
             .take(MAX_ACTIVE_POLL)
             .map(|r| (r.repository.full_name.clone(), r.id))
@@ -891,6 +980,9 @@ impl App {
         for (repo, run_id) in active {
             self.pending.push(Command::FetchJobs { repo, run_id });
         }
+        // Riding this cadence is what makes a tag or release show up mid-run,
+        // the moment the workflow makes it.
+        self.queue_tag_lookups();
     }
 
     /// When the live step view is open on a still-running job, the run whose
@@ -989,6 +1081,7 @@ mod tests {
             name: Some("CI".into()),
             display_title: "fix".into(),
             head_branch: Some("main".into()),
+            head_sha: "a1b2c3d".into(),
             run_number: 7,
             event: "push".into(),
             status: status.into(),
@@ -1276,6 +1369,125 @@ mod tests {
         ok.jobs_cache.insert(2, vec![job(20), job(21)]);
         ok.recompute_view();
         assert_eq!(ok.jobs_state.selected(), Some(0));
+    }
+
+    fn tag(name: &str, released: bool) -> RunTag {
+        RunTag {
+            url: format!("http://x/releases/tag/{name}"),
+            name: name.into(),
+            released,
+            title: None,
+            prerelease: false,
+        }
+    }
+
+    /// Put the app on run `id` with nothing queued.
+    fn app_on_run(run: Run) -> App {
+        let mut app = App::new(&Config::default());
+        app.runs = vec![run];
+        app.recompute_view();
+        app.table_state.select(Some(0));
+        app.pending.clear();
+        app
+    }
+
+    fn asked_for_tag(app: &App) -> bool {
+        app.pending.iter().any(|c| matches!(c, Command::FetchTags { .. }))
+    }
+
+    #[test]
+    fn keeps_looking_for_a_release_until_the_run_finishes() {
+        let mut app = app_on_run(run_with(1, "in_progress", None));
+        app.queue_tag_lookups();
+        assert!(asked_for_tag(&app), "a running run is asked about");
+
+        // Nothing published yet — but the run is still going, so ask again.
+        app.pending.clear();
+        app.apply(DataMsg::Tags { found: vec![(1, None)] });
+        assert_eq!(app.selected_tag().map(|t| t.name.clone()), None);
+        app.queue_tag_lookups();
+        assert!(asked_for_tag(&app), "an unfinished run is asked again");
+
+        // The workflow publishes it mid-run: it shows, and we stop asking.
+        app.pending.clear();
+        app.apply(DataMsg::Tags { found: vec![(1, Some(tag("v0.4.0", true)))] });
+        assert_eq!(app.selected_tag().unwrap().name, "v0.4.0");
+        app.queue_tag_lookups();
+        assert!(!asked_for_tag(&app), "a release we have isn't asked about again");
+    }
+
+    #[test]
+    fn a_finished_run_with_no_release_is_asked_once_and_left_alone() {
+        let mut app = app_on_run(run_with(1, "completed", Some("success")));
+        app.queue_tag_lookups();
+        assert!(asked_for_tag(&app));
+
+        app.pending.clear();
+        app.apply(DataMsg::Tags { found: vec![(1, None)] });
+        app.queue_tag_lookups();
+        assert!(!asked_for_tag(&app), "a finished run can't publish anything more");
+    }
+
+    #[test]
+    fn a_run_that_finishes_empty_handed_gets_one_last_look() {
+        // The release can land in a run's closing seconds, so a "no release"
+        // read while it was still going must not settle the question.
+        let mut app = app_on_run(run_with(1, "in_progress", None));
+        app.apply(DataMsg::Tags { found: vec![(1, None)] });
+
+        app.runs = vec![run_with(1, "completed", Some("success"))];
+        app.pending.clear();
+        app.queue_tag_lookups();
+        assert!(asked_for_tag(&app));
+    }
+
+    #[test]
+    fn release_lookups_batch_per_repo_and_cap_the_burst() {
+        let mut app = App::new(&Config::default());
+        // Two runs in each of ten repos — more repos than one pass will take.
+        app.runs = (0..20)
+            .map(|i| run_in(&format!("org/repo-{:02}", i / 2), i))
+            .collect();
+        app.recompute_view();
+        app.pending.clear();
+        app.queue_tag_lookups();
+
+        let asked: Vec<&Vec<(u64, String)>> = app
+            .pending
+            .iter()
+            .filter_map(|c| match c {
+                Command::FetchTags { runs, .. } => Some(runs),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(asked.len(), MAX_TAG_REPOS, "the burst is capped");
+        assert!(asked.iter().all(|r| r.len() == 2), "one ask covers a repo's runs");
+
+        // Answering settles those runs, so the next pass moves on to the rest.
+        let found = asked.iter().flat_map(|r| r.iter().map(|(id, _)| (*id, None))).collect();
+        app.apply(DataMsg::Tags { found });
+        app.pending.clear();
+        app.queue_tag_lookups();
+        let repos: Vec<&String> = app
+            .pending
+            .iter()
+            .filter_map(|c| match c {
+                Command::FetchTags { repo, .. } => Some(repo),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(repos, ["org/repo-08", "org/repo-09"], "only what's left");
+    }
+
+    #[test]
+    fn a_dispatch_with_no_commit_yet_is_not_asked_about() {
+        let mut app = App::new(&Config::default());
+        app.user = "you".into();
+        app.push_dispatch_placeholder("org/api", "CI", "main");
+        app.table_state.select(Some(0));
+        app.pending.clear();
+        app.queue_tag_lookups();
+        assert!(!asked_for_tag(&app), "no head commit to look a tag up on");
     }
 
     #[test]

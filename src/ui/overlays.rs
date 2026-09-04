@@ -353,6 +353,7 @@ pub(super) fn draw_help(f: &mut Frame) {
         hl("Actions"),
         help_row("Enter / l / L", "view logs of selected job (L anywhere)"),
         help_row("o", "open in browser (job's page, else the run)"),
+        help_row("t", "open the tag / release this run produced"),
         help_row("d", "dispatch a workflow (workflow_dispatch)"),
         help_row("  ↳ in Repos", "dispatch in a repo with no runs loaded"),
         help_row("c", "cancel the selected run"),

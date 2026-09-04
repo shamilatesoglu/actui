@@ -3,7 +3,7 @@
 //! `Command` flows UI → worker (drained by the main loop's `dispatch_commands`).
 
 use super::overlays::{AnnotationItem, RunnerGroup};
-use crate::github::{Artifact, Job, PendingDeployment, Run, WfInput, Workflow};
+use crate::github::{Artifact, Job, PendingDeployment, Run, RunTag, WfInput, Workflow};
 use std::collections::HashMap;
 
 /// A job to fetch check-run annotations for: its identity (for display and the
@@ -33,6 +33,9 @@ pub enum DataMsg {
     Workflows { repo: String, workflows: Vec<Workflow> },
     WorkflowInputs { repo: String, dispatchable: bool, inputs: Vec<WfInput> },
     Artifacts { run_id: u64, artifacts: Vec<Artifact> },
+    /// What each asked-about run put on its commit, `None` where the commit
+    /// carries no tag.
+    Tags { found: Vec<(u64, Option<RunTag>)> },
     /// Environments gating a run's deployment, awaiting review.
     PendingDeployments { run_id: u64, items: Vec<PendingDeployment> },
     /// Branches and tags for a repo, for the dispatch ref picker.
@@ -60,6 +63,9 @@ pub enum Command {
     FetchWorkflows { repo: String },
     FetchWorkflowInputs { repo: String, path: String, git_ref: String },
     FetchArtifacts { repo: String, run_id: u64 },
+    /// Look for tags and releases on these runs' head commits — one repo's
+    /// worth at a time, since a single tag list answers for all of them.
+    FetchTags { repo: String, runs: Vec<(u64, String)> },
     DownloadArtifact { repo: String, artifact_id: u64, name: String },
     Dispatch {
         repo: String,

@@ -7,11 +7,11 @@ A fast, beautiful terminal UI for viewing and managing **GitHub Actions** across
  Repos › Runs › Jobs › Logs
  All  Running  Queued  Failed  Success
 ╭ Repos 1/6 ───────────────╮╭ Runs 1/48 ─────────────────────────────────╮╭ Detail ────────────────╮
-│   All repos        ●3 ●2 ││     Repository    Workflow    Branch  Age  ││● success  #296         │
-│ ★ org/api             ●3 ││▌●  org/api       CI #296     main   1m12s  ││    repo  org/api       │
-│   org/infra              ││ ●  org/web       Deploy #88  main    42s   ││    flow  CI            │
-│   org/mobile          ○1 ││ ●  you/dotfiles  lint #5     main    18s   ││ Jobs ──────────────────│
-│   org/web             ●1 ││ ○  org/mobile    Release #3  v1.2     3s   ││▌● build        1m12s   │
+│   All repos        ●3 ●2 ││     Repository    Workflow   Tag      Age  ││● success  #296         │
+│ ★ org/api             ●3 ││▌●  org/api       CI #296     v0.4.0  1m12s ││ release  v0.4.0        │
+│   org/infra              ││ ●  org/web       Deploy #88  nightly  42s  ││    repo  org/api       │
+│   org/mobile          ○1 ││ ●  you/dotfiles  lint #5              18s  ││ Jobs ──────────────────│
+│   org/web             ●1 ││ ○  org/mobile    Release #3           3s   ││▌● build        1m12s   │
 │   you/dotfiles       12m ││                                            ││ ● test           48s   │
 ╰──────────────────────────╯╰────────────────────────────────────────────╯╰────────────────────────╯
  j/k move · Tab focus · / search · ⏎ jobs · l logs · d dispatch · c cancel · x/X rerun · v failures · p repos · ? help · q quit
@@ -28,6 +28,7 @@ A fast, beautiful terminal UI for viewing and managing **GitHub Actions** across
 - **Three-pane navigation** (Repos ⟷ Runs ⟷ Jobs) with a `Repos › Runs › Jobs › Logs` breadcrumb; `Tab` moves focus, `j`/`k` move within the focused pane.
 - **Filter** by status (`1`–`5`) and **fuzzy search** (`/`) across repo, workflow, and branch.
 - **Job detail pane** that auto-loads the selected run's jobs with per-job durations.
+- **What a run shipped** — a tag that lands on a run's head commit is that run's doing, so the detail pane names it right under the run's status: a green run tells you what it actually produced, not just that it passed. A **tag** on its own counts; once a **release** is published under it the row says so and picks up the release's name (and a `pre` marker for a prerelease). Both **appear mid-run**, the moment the workflow makes them, because the lookup rides the same fast cadence as the live job polling — and a bare tag is still watched, so it upgrades itself the instant the release lands. The runs table gets a **`Tag` column** too, which shows up only when the table has width to spare *and* something on the list actually tagged, with released tags in the accent color so they stand out from plain ones. Thrifty by construction: one tag list answers for a whole repo, it's ETag-conditional so repeat looks come back `304` and don't touch your rate limit, only a commit that really carries a tag costs a release lookup, and an answer holds for the session. `t` opens it on github.com.
 - **Rich logs viewer**:
   - **live step view for running jobs** — GitHub's API doesn't expose in-progress log *text* (the log blob 404s until a job finishes), so for a running job actui shows its **steps updating in real time**: which step is running, each step's status, and a ticking elapsed timer. The full text logs **load automatically the moment the job completes**.
   - syntax-highlighted — GitHub `##[error]`/`##[warning]`/`##[group]` markers and embedded ANSI color
@@ -119,6 +120,7 @@ exclude = []            # e.g. ["fork-of-"]
 | `1`–`5`, `[` / `]` | status filter |
 | `/` | fuzzy search runs (repo, workflow, branch) |
 | `o` | open in browser — the selected job's page when Jobs is focused, otherwise the run |
+| `t` | open the tag / release this run produced, if it produced one |
 | `L` | open the selected job's logs (works anywhere) |
 | `d` | dispatch a workflow — in the repo the sidebar is on, else the selected run's |
 | `c` | cancel run |

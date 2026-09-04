@@ -38,6 +38,7 @@ pub fn min_body(steps_shown: bool) -> u16 {
 pub enum Column {
     Repo,
     Workflow,
+    Tag,
     Branch,
     Event,
     Actor,
@@ -54,6 +55,7 @@ impl Column {
         match self {
             Column::Repo => "repo",
             Column::Workflow => "workflow",
+            Column::Tag => "tag",
             Column::Branch => "branch",
             Column::Event => "event",
             Column::Actor => "actor",
@@ -66,6 +68,7 @@ impl Column {
         [
             Column::Repo,
             Column::Workflow,
+            Column::Tag,
             Column::Branch,
             Column::Event,
             Column::Actor,
@@ -80,6 +83,7 @@ impl Column {
         match self {
             Column::Repo => "Repository",
             Column::Workflow => "Workflow",
+            Column::Tag => "Tag",
             Column::Branch => "Branch",
             Column::Event => "Event",
             Column::Actor => "Actor",
@@ -92,6 +96,7 @@ impl Column {
         match self {
             Column::Repo => 24,
             Column::Workflow => 23,
+            Column::Tag => 10,
             Column::Branch => 16,
             Column::Actor => 12,
             Column::Event | Column::Dur => 8,

@@ -488,6 +488,17 @@ fn dispatch_commands(app: &mut App, gh: &Github, cfg: &Config, tx: &UnboundedSen
                     }
                 });
             }
+            Command::FetchTags { repo, runs } => {
+                let (gh, tx) = (gh.clone(), tx.clone());
+                tokio::spawn(async move {
+                    // A repo whose tags we can't read just shows nothing —
+                    // complaining every poll would be noise. Staying quiet also
+                    // leaves those runs unanswered, so the next poll tries again.
+                    if let Ok(found) = gh.tags_for_commits(&repo, &runs).await {
+                        let _ = tx.send(DataMsg::Tags { found });
+                    }
+                });
+            }
             Command::DownloadArtifact { repo, artifact_id, name } => {
                 let (gh, tx) = (gh.clone(), tx.clone());
                 tokio::spawn(async move {
