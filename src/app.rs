@@ -406,11 +406,13 @@ impl App {
             DataMsg::Jobs { run_id, jobs } => {
                 self.jobs_cache.insert(run_id, jobs.clone());
                 if self.selected_run().map(|r| r.id) == Some(run_id) {
+                    // The jobs cursor is an index into this list, so remember
+                    // the job it is on before the list is replaced.
+                    let on = self.selected_job().map(|j| j.id);
                     self.jobs = jobs;
                     self.jobs_run_id = Some(run_id);
-                    if self.jobs_state.selected().is_none() && !self.jobs.is_empty() {
-                        self.jobs_state.select(Some(default_job_idx(&self.jobs)));
-                    }
+                    let at = self.restored_job_idx(on);
+                    self.jobs_state.select(at);
                     // If we're watching a job's live steps and it just finished,
                     // pull the now-available full text logs.
                     if let Some(sv) = &self.steps_view {
@@ -563,9 +565,10 @@ impl App {
                 }
             }
             DataMsg::DispatchFailed { placeholder_id, err } => {
+                let keep = self.selected_run().map(|r| r.id);
                 self.pending_dispatches.retain(|p| p.id != placeholder_id);
                 self.runs.retain(|r| r.id != placeholder_id);
-                self.recompute_view();
+                self.recompute_view_keeping(keep);
                 self.set_status(err, true);
             }
             DataMsg::Action(m) => self.set_status(m, false),
@@ -576,11 +579,13 @@ impl App {
 
     /// Replace a repo's runs with a freshly read set.
     fn ingest_runs(&mut self, repo: String, runs: Vec<Run>) {
+        // Read the cursor's run before the list moves under it.
+        let keep = self.selected_run().map(|r| r.id);
         self.runs.retain(|r| r.repository.full_name != repo);
         self.runs.extend(runs);
         self.reconcile_pending_dispatches(&repo);
         self.resort();
-        self.recompute_view();
+        self.recompute_view_keeping(keep);
     }
 
     fn finish_refresh(&mut self) {
@@ -675,10 +680,11 @@ impl App {
             actor: Some(Actor { login: self.user.clone() }),
             repository: RunRepo { full_name: repo.to_string() },
         };
+        let keep = self.selected_run().map(|r| r.id);
         self.runs.push(run.clone());
         self.pending_dispatches.push(run);
         self.resort();
-        self.recompute_view();
+        self.recompute_view_keeping(keep);
         id
     }
 
@@ -715,13 +721,25 @@ impl App {
     }
 
     pub fn recompute_view(&mut self) {
+        let keep = self.selected_run().map(|r| r.id);
+        self.recompute_view_keeping(keep);
+    }
+
+    /// Rebuild the view, putting the cursor back on run `keep`.
+    ///
+    /// A caller that changes `runs` must read that id *before* it does: `view`
+    /// holds indices into `runs`, so the moment `runs` is rewritten they point
+    /// at whatever moved into those rows, and asking for "the selected run"
+    /// then names a different one — which is how the cursor used to jump on a
+    /// sweep, taking the whole detail pane with it.
+    fn recompute_view_keeping(&mut self, keep: Option<u64>) {
         // Landing on a repo asks for more of its history than the sweep keeps.
         let scope = self.repos.scope().map(str::to_string);
         if scope != self.scoped_repo {
             self.scoped_repo.clone_from(&scope);
             self.runs_fetch_due = scope.map(|repo| (Instant::now(), repo));
         }
-        let prev_id = self.selected_run().map(|r| r.id);
+        let prev_id = keep;
         let resort = std::mem::take(&mut self.resort_repos);
         self.repos.rebuild(&self.runs, resort, &self.state);
         let q = self.search.to_lowercase();
@@ -786,8 +804,12 @@ impl App {
             }
         }
         // Always refresh (304 keeps the cache; Modified updates it) — but
-        // debounced, so skimming the list doesn't fetch every row passed.
-        self.jobs_fetch_due = Some((Instant::now(), repo, run_id));
+        // debounced, so skimming the list doesn't fetch every row passed. A
+        // placeholder's id is ours, not GitHub's, so asking about it would only
+        // raise a 404 for a run that doesn't exist yet.
+        if !self.is_placeholder(run_id) {
+            self.jobs_fetch_due = Some((Instant::now(), repo, run_id));
+        }
     }
 
     /// Issue the debounced jobs fetch now (the selection settled by intent,
@@ -1031,6 +1053,19 @@ impl App {
         let i = self.jobs_state.selected()?;
         self.jobs.get(i)
     }
+
+    /// Where the jobs cursor belongs once the list has changed: back on the job
+    /// it was on, else the default pick — and never past the end, which is how
+    /// a shrinking list used to leave it pointing at nothing.
+    fn restored_job_idx(&self, was: Option<u64>) -> Option<usize> {
+        if self.jobs.is_empty() {
+            return None;
+        }
+        Some(
+            was.and_then(|id| self.jobs.iter().position(|j| j.id == id))
+                .unwrap_or_else(|| default_job_idx(&self.jobs)),
+        )
+    }
 }
 
 /// Default jobs-list selection: the first failed/timed-out job when there is
@@ -1273,6 +1308,86 @@ mod tests {
             completed_at: None,
             steps: Vec::new(),
         }
+    }
+
+    /// A placeholder stands in for a run GitHub has not registered; its id is
+    /// ours, not GitHub's, so asking for its jobs can only 404.
+    #[test]
+    fn a_placeholder_run_is_not_asked_for_jobs() {
+        let mut app = App::new(&Config::default());
+        app.user = "you".into();
+        let id = app.push_dispatch_placeholder("org/api", "CI", "main");
+        let at = app.view.iter().position(|&i| app.runs[i].id == id).unwrap();
+        app.table_state.select(Some(at));
+        app.sync_jobs_for_selection();
+        app.pending.clear();
+        app.flush_jobs_fetch();
+        assert!(
+            !app.pending.iter().any(|c| matches!(c, Command::FetchJobs { .. })),
+            "no request for a run that does not exist yet"
+        );
+    }
+
+    /// The same hazard one level down: the jobs pane's cursor is an index too,
+    /// so a refreshed job list must not slide a different job under it.
+    #[test]
+    fn a_refreshed_job_list_keeps_the_cursor_on_its_job() {
+        let mut app = App::new(&Config::default());
+        app.runs = vec![run_with(1, "in_progress", None)];
+        app.recompute_view();
+        app.apply(DataMsg::Jobs {
+            run_id: 1,
+            jobs: vec![job_full(10, "build", None), job_full(11, "test", None)],
+        });
+        app.jobs_state.select(Some(1));
+        assert_eq!(app.selected_job().unwrap().name, "test");
+
+        // A re-run puts a fresh job at the head of the list.
+        app.apply(DataMsg::Jobs {
+            run_id: 1,
+            jobs: vec![
+                job_full(12, "lint", None),
+                job_full(10, "build", None),
+                job_full(11, "test", None),
+            ],
+        });
+        assert_eq!(app.selected_job().unwrap().name, "test", "still on the same job");
+
+        // And when that job goes away entirely, the cursor lands somewhere real
+        // rather than pointing past the end of the list.
+        app.apply(DataMsg::Jobs { run_id: 1, jobs: vec![job_full(12, "lint", None)] });
+        assert!(app.selected_job().is_some(), "never left pointing at nothing");
+    }
+
+    /// A sweep must not move the cursor onto a different run. `view` holds
+    /// indices into `runs`, so the moment a sweep rewrites `runs` those indices
+    /// point at whatever now sits there — and reading the selection through
+    /// them afterwards names the wrong run.
+    #[test]
+    fn a_sweep_that_reorders_the_list_keeps_the_cursor_on_its_run() {
+        let mut app = App::new(&Config::default());
+        let at = |id: u64, secs: i64| Run {
+            updated_at: Utc::now() - chrono::Duration::seconds(secs),
+            ..run_in("org/api", id)
+        };
+        app.runs = vec![at(1, 30), at(2, 20), at(3, 10)];
+        app.resort(); // newest first: 3, 2, 1
+        app.recompute_view();
+        app.table_state.select(Some(1));
+        assert_eq!(app.selected_run().unwrap().id, 2, "the cursor is on run 2");
+
+        // The sweep brings a newer run, which lands above the others and shifts
+        // every index down by one.
+        app.apply(DataMsg::RunsOnly {
+            repo: "org/api".into(),
+            runs: vec![at(4, 0), at(3, 10), at(2, 20), at(1, 30)],
+        });
+        assert_eq!(app.selected_run().unwrap().id, 2, "and stays on run 2");
+        assert_eq!(
+            app.jobs_run_id.or(Some(2)),
+            Some(app.selected_run().unwrap().id),
+            "the jobs pane is never left showing another run's jobs"
+        );
     }
 
     #[test]

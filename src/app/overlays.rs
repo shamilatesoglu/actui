@@ -247,7 +247,8 @@ impl RunnersView {
     }
 
     /// Replace the contents from a fresh fetch: sort orgs for triage, flatten to
-    /// rows, and park the cursor on the first runner.
+    /// rows, and leave the cursor on the runner it was on — the detail pane
+    /// beside it would otherwise start describing a different machine.
     pub fn set_groups(&mut self, mut groups: Vec<RunnerGroup>) {
         // Orgs with runners first, accessible-but-empty next, errors last; then
         // alphabetical so the list is stable across refreshes.
@@ -288,9 +289,22 @@ impl RunnersView {
                 });
             }
         }
+        let keep = match self.selected_runner() {
+            Some(RunnerRow::Runner { name, .. }) => Some(name.clone()),
+            _ => None,
+        };
         self.rows = rows;
         self.loaded = true;
-        self.state.select(self.runner_indices().first().copied());
+        // Back on the same runner, else the first one — a name that has gone
+        // must not leave the cursor pointing at a header or off the end.
+        let at = keep
+            .and_then(|name| {
+                self.rows.iter().position(
+                    |r| matches!(r, RunnerRow::Runner { name: n, .. } if *n == name),
+                )
+            })
+            .or_else(|| self.runner_indices().first().copied());
+        self.state.select(at);
     }
 
     /// Indices of the selectable (runner) rows, in display order.
@@ -507,6 +521,42 @@ mod tests {
         rp.recompute();
         assert_eq!(rp.view.len(), 1);
         assert_eq!(rp.selected_ref().unwrap().name, "release/1.0");
+    }
+
+    /// Refreshing the runners list must not slide a different runner under the
+    /// cursor — the detail pane beside it would then describe the wrong machine.
+    #[test]
+    fn refreshing_runners_keeps_the_cursor_on_its_runner() {
+        let runner = |name: &str| crate::github::Runner {
+            name: name.into(),
+            os: "linux".into(),
+            status: "online".into(),
+            busy: false,
+            labels: Vec::new(),
+        };
+        let group = |org: &str, names: &[&str]| RunnerGroup {
+            org: org.into(),
+            runners: names.iter().copied().map(runner).collect(),
+            error: None,
+        };
+        let name_of = |rv: &RunnersView| match rv.selected_runner() {
+            Some(RunnerRow::Runner { name, .. }) => name.clone(),
+            _ => panic!("expected a runner"),
+        };
+
+        let mut rv = RunnersView::loading();
+        rv.set_groups(vec![group("acme", &["alpha", "beta", "gamma"])]);
+        let at = rv.runner_indices()[2];
+        rv.select_index(at);
+        assert_eq!(name_of(&rv), "gamma");
+
+        // A refresh where a runner came online ahead of it in the list.
+        rv.set_groups(vec![group("acme", &["alpha", "beta", "delta", "gamma"])]);
+        assert_eq!(name_of(&rv), "gamma", "still on the same runner");
+
+        // And when it drops off entirely, the cursor lands on a real row.
+        rv.set_groups(vec![group("acme", &["alpha", "beta"])]);
+        assert_eq!(name_of(&rv), "alpha");
     }
 
     #[test]
