@@ -28,31 +28,81 @@ async fn main() -> Result<()> {
     };
     let gh = Github::new(&token)?;
 
+    // The terminal has to be asked before raw mode starts, because its answer
+    // arrives as terminal input and the event loop would take it first. Skipped
+    // when the config already picked a palette.
+    let terminal_dark = match cfg.theme.as_str() {
+        "dark" | "light" => None,
+        _ => terminal_is_dark(),
+    };
+
     let mut terminal = ratatui::init();
     // Mouse: wheel scrolls, click selects rows / panes / filter tabs.
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
-    let res = run(&mut terminal, gh, cfg).await;
+    let res = run(&mut terminal, gh, cfg, terminal_dark).await;
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
     res
 }
 
-/// Resolve the active palette: an explicit "dark"/"light" override, else the
-/// system's current light/dark setting (defaulting to dark when unknown).
-fn resolve_theme(cfg: &Config) -> ui::Theme {
-    match cfg.theme.as_str() {
-        "light" => ui::Theme::light(),
-        "dark" => ui::Theme::dark(),
-        _ => match dark_light::detect() {
-            dark_light::Mode::Light => ui::Theme::light(),
-            _ => ui::Theme::dark(), // Dark or Default
+/// Which palette to use, and whether the desktop setting still gets a say
+/// while the app runs.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct ThemeChoice {
+    dark: bool,
+    follow_system: bool,
+}
+
+/// Pick the palette. A configured "dark"/"light" wins outright. Otherwise the
+/// terminal's own background decides, since that is the screen actually being
+/// drawn on and it need not match the desktop — a dark profile on a light
+/// desktop, or a light one reached over ssh. The desktop setting is asked only
+/// when the terminal won't answer, and only then is it worth watching.
+fn resolve_theme(
+    configured: &str,
+    terminal_dark: Option<bool>,
+    system_dark: impl FnOnce() -> bool,
+) -> ThemeChoice {
+    match configured {
+        "dark" => ThemeChoice { dark: true, follow_system: false },
+        "light" => ThemeChoice { dark: false, follow_system: false },
+        _ => match terminal_dark {
+            Some(dark) => ThemeChoice { dark, follow_system: false },
+            None => ThemeChoice { dark: system_dark(), follow_system: true },
         },
     }
 }
 
-async fn run(terminal: &mut ratatui::DefaultTerminal, gh: Github, cfg: Config) -> Result<()> {
+/// Ask the terminal whether it is dark, by its own background color. None when
+/// it doesn't answer: an older terminal, output that is not a terminal at all,
+/// or a link too slow to wait on.
+fn terminal_is_dark() -> Option<bool> {
+    match terminal_colorsaurus::theme_mode(terminal_colorsaurus::QueryOptions::default()) {
+        Ok(terminal_colorsaurus::ThemeMode::Dark) => Some(true),
+        Ok(terminal_colorsaurus::ThemeMode::Light) => Some(false),
+        Err(_) => None,
+    }
+}
+
+/// The desktop's own light/dark setting, which counts as dark when unknown.
+fn system_is_dark() -> bool {
+    !matches!(dark_light::detect(), dark_light::Mode::Light)
+}
+
+/// The palette for a light/dark answer.
+fn palette(dark: bool) -> ui::Theme {
+    if dark { ui::Theme::dark() } else { ui::Theme::light() }
+}
+
+async fn run(
+    terminal: &mut ratatui::DefaultTerminal,
+    gh: Github,
+    cfg: Config,
+    terminal_dark: Option<bool>,
+) -> Result<()> {
     let mut app = App::new(&cfg);
-    ui::set_theme(resolve_theme(&cfg));
+    let theme = resolve_theme(&cfg.theme, terminal_dark, system_is_dark);
+    ui::set_theme(palette(theme.dark));
     let (tx, mut rx) = mpsc::unbounded_channel::<DataMsg>();
 
     // Initial load.
@@ -92,8 +142,10 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, gh: Github, cfg: Config) -
     let mut last_broad = std::time::Instant::now();
     let mut last_focused = std::time::Instant::now();
     let mut last_live = std::time::Instant::now();
-    // Re-check the system theme periodically so it switches live (auto mode only).
-    let auto_theme = cfg.theme != "dark" && cfg.theme != "light";
+    // Re-check the desktop theme periodically so it switches live. Only when
+    // the desktop is what we are following: a terminal that answered has told
+    // us about the screen we are on, and the desktop must not override it.
+    let auto_theme = theme.follow_system;
     let mut last_theme = std::time::Instant::now();
 
     let mut redraw = true;
@@ -127,17 +179,10 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, gh: Github, cfg: Config) -
             _ = sched.tick() => {
                 // The once-a-second redraw also keeps ages/durations current.
                 redraw = true;
-                // Follow the system light/dark setting while running (auto mode).
                 // Detection can block (dbus on Linux), so keep it off the UI loop.
                 if auto_theme && last_theme.elapsed() >= Duration::from_secs(3) {
                     last_theme = std::time::Instant::now();
-                    tokio::task::spawn_blocking(|| {
-                        let t = match dark_light::detect() {
-                            dark_light::Mode::Light => ui::Theme::light(),
-                            _ => ui::Theme::dark(),
-                        };
-                        ui::set_theme(t);
-                    });
+                    tokio::task::spawn_blocking(|| ui::set_theme(palette(system_is_dark())));
                 }
                 // Surface live rate-limit / back-off state from response headers.
                 app.rate = gh.rate();
@@ -616,4 +661,35 @@ fn spawn_refresh(
             })
             .await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_configured_theme_beats_anything_detected() {
+        let choice = resolve_theme("dark", Some(false), || false);
+        assert_eq!(choice, ThemeChoice { dark: true, follow_system: false });
+        let choice = resolve_theme("light", Some(true), || true);
+        assert_eq!(choice, ThemeChoice { dark: false, follow_system: false });
+    }
+
+    #[test]
+    fn the_terminal_decides_when_it_answers() {
+        // The system setting says the opposite in both of these: a dark profile
+        // on a light desktop is the case this exists for.
+        let choice = resolve_theme("auto", Some(true), || false);
+        assert_eq!(choice, ThemeChoice { dark: true, follow_system: false });
+        let choice = resolve_theme("auto", Some(false), || true);
+        assert_eq!(choice, ThemeChoice { dark: false, follow_system: false });
+    }
+
+    #[test]
+    fn the_system_decides_when_the_terminal_stays_silent() {
+        let choice = resolve_theme("auto", None, || true);
+        assert_eq!(choice, ThemeChoice { dark: true, follow_system: true });
+        let choice = resolve_theme("auto", None, || false);
+        assert_eq!(choice, ThemeChoice { dark: false, follow_system: true });
+    }
 }

@@ -24,7 +24,7 @@ A fast, beautiful terminal UI for viewing and managing **GitHub Actions** across
 - **A layout you set stays set** — **drag any pane border** to resize the sidebar, the detail pane, or the live-steps pane, and **drag a column header's edge** to size that column of the runs table; `<` / `>` resize the sidebar from the keyboard, and `=` puts everything back to the defaults. Widths (and the repo history behind `sort = "used"`) are remembered in `~/.config/actui/state.toml`. Panes never squeeze the runs table below what it needs: when there isn't room for all of them — a narrow terminal, or the live-steps pane opening as a fourth column — the sidebar steps out until there is.
 - **Live status** with color-coded states: running, queued, failed, success, cancelled, skipped. lazyactions-style panes: the focused pane gets an accent border and a highlighted (inverted) title tab; the unfocused pane dims its border and keeps a dimmed selection so you never lose your place. Popups float on a filled background.
 - **Completion notifications** — a terminal bell plus a desktop toast the moment a watched run flips to success/failure/cancelled, so you can leave it running in the background. Configurable (`notify` / `bell`).
-- **Automatic light/dark theme** — follows your OS appearance setting and switches live when you flip it. Pin it with `theme = "dark"` / `"light"` if you'd rather not auto-detect.
+- **Automatic light/dark theme** — reads the **terminal's own background color**, so a dark profile on a light desktop (or a light one reached over ssh) gets the palette that suits the screen you're actually looking at. Terminals that don't answer fall back to your OS appearance setting, which still switches live when you flip it. Pin it with `theme = "dark"` / `"light"` if you'd rather not auto-detect.
 - **Three-pane navigation** (Repos ⟷ Runs ⟷ Jobs) with a `Repos › Runs › Jobs › Logs` breadcrumb; `Tab` moves focus, `j`/`k` move within the focused pane.
 - **Filter** by status (`1`–`5`) and **fuzzy search** (`/`) across repo, workflow, and branch.
 - **Job detail pane** that auto-loads the selected run's jobs with per-job durations.
@@ -86,7 +86,7 @@ max_repos           = 60  # cap, from most-recently-pushed repos (0 = no cap)
 skip_archived       = true
 notify              = true  # desktop notification when a watched run finishes
 bell                = true  # ring the terminal bell when a watched run finishes
-theme               = "auto"  # "auto" follows the OS light/dark setting; or "dark" / "light"
+theme               = "auto"  # "auto" reads the terminal's background, else the OS setting; or "dark" / "light"
 sidebar             = true  # show the repos sidebar (`p` toggles it, drag or `<`/`>` resize it)
 sort                = "alpha"  # sidebar order below the pinned repos; or "used"
 

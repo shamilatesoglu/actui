@@ -33,8 +33,8 @@ pub struct Config {
     pub notify: bool,
     /// Ring the terminal bell when a watched run finishes.
     pub bell: bool,
-    /// Color theme: "auto" (follow the system light/dark setting), "dark", or
-    /// "light".
+    /// Color theme: "auto" (follow the terminal's own background, falling back
+    /// to the desktop's light/dark setting), "dark", or "light".
     pub theme: String,
     /// Show the repos sidebar on start (`p` toggles it at runtime).
     pub sidebar: bool,
