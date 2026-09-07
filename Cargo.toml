@@ -1,6 +1,6 @@
 [package]
 name = "actui"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 description = "A beautiful TUI to view and manage GitHub Actions across your repos and orgs"
 license = "MIT"
