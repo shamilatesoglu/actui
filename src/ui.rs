@@ -26,7 +26,9 @@ use std::sync::{OnceLock, RwLock};
 
 /// Palette tints that must differ between light and dark backgrounds. Status
 /// colors (red/green/yellow/cyan) are left to the terminal's own palette so
-/// they already adapt; only these custom tints need a per-mode value.
+/// they already adapt; only these custom tints need a per-mode value. The
+/// exception is `soft_red`, which says something the terminal's one red
+/// can't: this is a guess at an error, not a run that really failed.
 #[derive(Clone, Copy)]
 pub struct Theme {
     accent: Color,
@@ -35,6 +37,7 @@ pub struct Theme {
     bg_sel_dim: Color, // selection background (unfocused pane)
     pale: Color,       // unfocused selected text
     popup_bg: Color,   // popup window fill
+    soft_red: Color,   // a guessed error, quieter than a real failure's red
 }
 
 impl Theme {
@@ -46,6 +49,7 @@ impl Theme {
             bg_sel_dim: Color::Rgb(40, 41, 56),
             pale: Color::Rgb(166, 173, 200),
             popup_bg: Color::Rgb(30, 31, 48),
+            soft_red: Color::Rgb(235, 160, 172),
         }
     }
     pub fn light() -> Self {
@@ -56,6 +60,7 @@ impl Theme {
             bg_sel_dim: Color::Rgb(220, 224, 232),
             pale: Color::Rgb(76, 79, 105),
             popup_bg: Color::Rgb(230, 233, 239),
+            soft_red: Color::Rgb(179, 80, 92),
         }
     }
 }
@@ -92,6 +97,9 @@ fn pale() -> Color {
 }
 fn popup_bg() -> Color {
     theme().popup_bg
+}
+fn soft_red() -> Color {
+    theme().soft_red
 }
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -644,9 +652,10 @@ fn draw_jobs(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol(if focused { "▌" } else { " " });
     f.render_stateful_widget(list, chunks[0], &mut app.jobs_state);
 
-    // Title + body track the selected job: a failing log is titled "Error
-    // Previews · N" and lists every spot an error/fail line appears, so the pane
-    // never claims "Log Preview" while showing errors.
+    // Title + body track the selected job: a log with error-looking lines is
+    // titled "Possible Errors · N" and lists every spot one appears. The count
+    // is a guess from the text, so the title says so — `v` is the pane that
+    // knows, off GitHub's own annotations.
     let mut title = " Log Preview ".to_string();
     let mut title_style = Style::default().fg(dim());
     let mut body: Vec<Line> = Vec::new();
@@ -658,8 +667,8 @@ fn draw_jobs(f: &mut Frame, app: &mut App, area: Rect) {
         } else if let Some(text) = app.logs_cache.get(&j.id) {
             let (lines, errors) = get_error_preview_lines(text, j.conclusion.as_deref());
             if errors > 0 {
-                title = format!(" Error Previews · {errors} ");
-                title_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+                title = format!(" Possible Errors · {errors} ");
+                title_style = Style::default().fg(soft_red()).add_modifier(Modifier::BOLD);
             }
             body = lines;
         } else {
@@ -744,7 +753,7 @@ fn get_error_preview_lines(log_text: &str, conclusion: Option<&str>) -> (Vec<Lin
         if matches!(conclusion, Some("failure") | Some("timed_out")) {
             let start = n.saturating_sub(15);
             let mut preview = vec![Line::from(vec![
-                Span::styled("No error/fail lines found. Showing end of log:", Style::default().fg(dim()))
+                Span::styled("Nothing here looks like an error. Showing the end of the log:", Style::default().fg(dim()))
             ])];
             for (i, line) in lines.iter().enumerate().skip(start) {
                 preview.push(numbered_log_line(i, line));
@@ -753,7 +762,7 @@ fn get_error_preview_lines(log_text: &str, conclusion: Option<&str>) -> (Vec<Lin
         } else {
             return (
                 vec![Line::from(vec![Span::styled(
-                    "Job completed successfully (no error/fail lines found).",
+                    "Nothing in the log looks like an error.",
                     Style::default().fg(dim()),
                 )])],
                 0,
