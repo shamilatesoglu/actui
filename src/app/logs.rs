@@ -63,39 +63,136 @@ pub(crate) fn log_content(raw: &str) -> &str {
     s
 }
 
-/// Keywords that mark a log line as an error/failure. Matched at a word boundary
-/// (see `word_at_boundary`) so substrings like `pipefail` (in `set -o pipefail`)
-/// or `hispanic` don't trip a false positive, while suffixed forms like
-/// `failed`/`errors`/`panicked`/`aborted` still match.
-const ERROR_KEYWORDS: &[&str] = &[
-    "error",
-    "fail",
-    "panic",
+/// Words that mark a log line as a failure. Matched whole, so a word merely
+/// glued into a path, a filename, a flag or an identifier — `Error.cpp`,
+/// `-ErrorAction`, `thiserror` — is not this word. See `words`.
+const ERROR_WORDS: &[&str] = &[
+    "error", "errors",
+    "fail", "fails", "failed", "failing", "failure", "failures",
     "fatal",
+    "panic", "panics", "panicked",
+    "exception", "exceptions",
     "traceback",
-    "exception",
     "segfault",
-    "segmentation fault",
-    "abort",
+    "abort", "aborts", "aborted", "aborting",
     "unable",
+    "non-zero",
 ];
+
+/// Failures no single word can carry: `fault`, `found` and `denied` each say
+/// too little alone, so these are matched as whole phrases.
+const ERROR_PHRASES: &[&str] = &[
+    "segmentation fault",
+    "command not found",
+    "no such file or directory",
+    "permission denied",
+    "connection refused",
+    "cannot find path",
+    "npm err!",
+];
+
+/// Words that only mean trouble when there is at least one: a build that
+/// reports `0 errors` is a build that worked.
+const COUNTED_WORDS: &[&str] = &["error", "errors", "fail", "fails", "failed", "failure", "failures"];
 
 /// Whether a log line looks like an error/failure, for the failure preview.
 pub(crate) fn is_error_line(content: &str) -> bool {
+    let content = content.trim_start();
     // GitHub's annotation markers (`##[error]…`) and workflow-command form
     // (`::error file=…::`) are unambiguous prefixes.
-    content.starts_with("##[error]")
-        || content.starts_with("::error")
-        || ERROR_KEYWORDS.iter().any(|kw| word_at_boundary(content, kw))
+    if content.starts_with("##[error]") || content.starts_with("::error") {
+        return true;
+    }
+    // A comma or semicolon starts a fresh tally, so Maven's `Tests run: 12,
+    // Failures: 0` reads as no failures rather than as twelve of them.
+    content.split([',', ';']).any(reports_a_failure)
+        || ERROR_PHRASES.iter().any(|phrase| contains_ignoring_case(content, phrase))
 }
 
-/// True when `needle` appears in `haystack` (case-insensitively) preceded by a
-/// non-alphanumeric char or the line start — i.e. as the start of a word.
-fn word_at_boundary(haystack: &str, needle: &str) -> bool {
-    let lower = haystack.to_lowercase();
-    lower.match_indices(needle).any(|(i, _)| {
-        i == 0 || !lower[..i].chars().next_back().is_some_and(|c| c.is_alphanumeric())
+/// Whether one stretch of a line reports a failure.
+fn reports_a_failure(tally: &str) -> bool {
+    let words: Vec<&str> = words(tally).collect();
+    words.iter().enumerate().any(|(i, word)| {
+        if is_error_type(word) {
+            return true;
+        }
+        if !ERROR_WORDS.iter().any(|w| word.eq_ignore_ascii_case(w)) {
+            return false;
+        }
+        if !COUNTED_WORDS.iter().any(|w| word.eq_ignore_ascii_case(w)) {
+            return true;
+        }
+        // A counted word takes its count from the number beside it. The one in
+        // front wins; the one behind speaks only when nothing counts from the
+        // front, which is how `Failures: 0` reports none of them.
+        let before = i.checked_sub(1).map(|j| words[j]);
+        let count = match before {
+            Some(w) if says_none(w) || w.bytes().all(|b| b.is_ascii_digit()) => Some(w),
+            _ => words.get(i + 1).copied(),
+        };
+        !count.is_some_and(says_none)
     })
+}
+
+/// Whether a word is a count of none, right beside something counted.
+fn says_none(word: &str) -> bool {
+    ["0", "no", "zero"].iter().any(|w| word.eq_ignore_ascii_case(w))
+}
+
+/// Split a log line into whole words. Alphanumerics plus the characters that
+/// hold an identifier or a path together — `.` `/` `\` `_` `-` and a doubled
+/// `::` — stay inside one word, so `Error.cpp`, `-ErrorAction` and
+/// `std::error::Error` come out whole instead of shedding a bare `error`. A
+/// lone `:` splits, so `error: boom` and Python's `ERROR:root:message` don't
+/// hide their first word. Glue on either end is trimmed, so a sentence's
+/// `failed.` is still `failed`.
+fn words(line: &str) -> impl Iterator<Item = &str> {
+    const GLUE: [char; 6] = ['.', '/', '\\', '_', '-', ':'];
+    let bytes = line.as_bytes();
+    // Only a doubled colon holds a word together; everything else is one byte.
+    let joins = |i: usize| match bytes[i] {
+        b':' => bytes.get(i + 1) == Some(&b':'),
+        b => b.is_ascii_alphanumeric() || GLUE.contains(&(b as char)),
+    };
+
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        while i < bytes.len() {
+            while i < bytes.len() && !joins(i) {
+                i += 1;
+            }
+            let start = i;
+            while i < bytes.len() && joins(i) {
+                i += if bytes[i] == b':' { 2 } else { 1 };
+            }
+            let word = line[start..i].trim_matches(GLUE);
+            if !word.is_empty() {
+                return Some(word);
+            }
+        }
+        None
+    })
+}
+
+/// Whether a word names an error type — `AssertionError`,
+/// `java.lang.NullPointerException` — the way a runtime names what went
+/// wrong. The capital is what makes it a name, and it keeps the `thiserror`
+/// crate and a bare `std::error::Error` in a compiler note out of it.
+fn is_error_type(word: &str) -> bool {
+    let name = word.rsplit(['.', '/', '\\', ':']).next().unwrap_or(word);
+    ["Error", "Exception"].iter().any(|suffix| {
+        name.strip_suffix(suffix)
+            .is_some_and(|stem| !stem.is_empty() && stem.chars().all(|c| c.is_ascii_alphanumeric()))
+    })
+}
+
+/// Whether `needle` — which must be lowercase — appears anywhere in
+/// `haystack`, ignoring case.
+fn contains_ignoring_case(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 /// Parse the RFC3339 timestamp GitHub prefixes onto each log line.
@@ -522,27 +619,120 @@ mod tests {
         assert!(!lv.visible.contains(&3)); // unrelated body line excluded
     }
 
+    /// Lines a run really did fail on. Every one is output a tool actually
+    /// prints: GitHub's markers, compilers, test runners, shells, package
+    /// managers and PowerShell.
+    const FAILING_LINES: &[&str] = &[
+        // GitHub's own markers.
+        "##[error]Process completed with exit code 1.",
+        "::error file=app.js,line=1::Missing semicolon",
+        // Plain prose.
+        "the build failed",
+        "Error: something broke",
+        "2 errors, 0 warnings",
+        "1 error generated.",
+        "fatal: unable to access repo",
+        "process aborted",
+        "step(fail)",
+        // Compilers and build tools.
+        "error[E0308]: mismatched types",
+        "error: could not compile `actui` (bin \"actui\") due to 2 previous errors",
+        r"src\app\Error.cpp(42,17): error C2065: 'x': undeclared identifier",
+        "LINK : fatal error LNK1104: cannot open file 'foo.lib'",
+        "error TS2345: Argument of type 'string' is not assignable",
+        "make: *** [Makefile:12: all] Error 1",
+        "FAILED: build.ninja",
+        // Test runners.
+        "test result: FAILED. 41 passed; 1 failed; 0 ignored",
+        "assertion `left == right` failed",
+        "E   AssertionError: assert 1 == 2",
+        // Runtimes.
+        "thread 'main' panicked at src/lib.rs",
+        "ValueError: invalid literal for int() with base 10",
+        "Exception in thread \"main\" java.lang.IllegalStateException",
+        "panic: runtime error: index out of range",
+        "Traceback (most recent call last):",
+        "terminate called after throwing an exception",
+        "java.lang.NullPointerException: Cannot invoke \"String.length()\"",
+        "Segmentation fault (core dumped)",
+        // Shells and package managers.
+        "bash: line 1: cargo: command not found",
+        "cp: cannot stat 'x': No such file or directory",
+        "Permission denied (publickey).",
+        "npm ERR! code ELIFECYCLE",
+        "ERROR:root:database is locked",
+        "docker: Error response from daemon",
+        "The command '/bin/sh -c npm ci' returned a non-zero code: 1",
+        // PowerShell.
+        r"Get-Item: Cannot find path 'C:\nope' because it does not exist.",
+        r"    + CategoryInfo          : ObjectNotFound: (C:\nope:String) [Get-Item], ItemNotFoundException",
+    ];
+
+    /// Lines that only mention an error — in a path, a filename, a flag, an
+    /// identifier, a crate name, or a count of zero. None of these is a
+    /// failure and none may be flagged.
+    const CLEAN_LINES: &[&str] = &[
+        // Substrings that aren't the word.
+        "Run set -o pipefail",
+        "export SHELLOPTS=pipefail",
+        "downloaded hispanic-locale.tar",
+        "collaborators added",
+        // Flags and parameters.
+        "Get-ChildItem -Path $dir -ErrorAction Stop",
+        "Remove-Item -Recurse -ErrorAction SilentlyContinue",
+        "$ErrorActionPreference = \"Stop\"",
+        "cargo build --error-format=json",
+        // Filenames and paths.
+        "Compiling Error.cpp",
+        r"cl /c src\app\Error.cpp",
+        r"Get-Content .\Error.log",
+        "cargo build 2> errors.txt",
+        // Crate, package and identifier names.
+        "   Compiling thiserror v1.0.69",
+        "   Compiling error-chain v0.12.4",
+        "  Downloading error-stack v0.4.1",
+        "set_error_handler(handler)",
+        "test app::logs::tests::flags_every_failing_line ... ok",
+        "if %ERRORLEVEL% neq 0 exit /b 1",
+        "Error-free build in 2.3s",
+        "if err != nil { return fmt.Errorf(\"%w\", err) }",
+        "note: required because of the impl of std::error::Error",
+        // Counts of zero.
+        "0 errors, 0 warnings",
+        "[INFO] Tests run: 12, Failures: 0, Errors: 0, Skipped: 0",
+        "Build succeeded. 0 Warning(s) 0 Error(s)",
+        "test result: ok. 41 passed; 0 failed; 0 ignored",
+        "Write-Host \"No errors found\"",
+        // Warnings are not errors.
+        "warning: unused variable: `x`",
+        "##[warning]Node.js 16 actions are deprecated",
+    ];
+
     #[test]
-    fn is_error_line_respects_word_boundaries() {
-        // `pipefail` must not trip the `fail` keyword.
-        assert!(!is_error_line("Run set -o pipefail"));
-        assert!(!is_error_line("export SHELLOPTS=pipefail"));
-        // `panic`/`abort` must not trip on embedded substrings.
-        assert!(!is_error_line("downloaded hispanic-locale.tar"));
-        assert!(!is_error_line("collaborators added"));
-        // Genuine failure/error words still match, including suffixed forms.
-        assert!(is_error_line("the build failed"));
-        assert!(is_error_line("Error: something broke"));
-        assert!(is_error_line("2 errors, 0 warnings"));
-        assert!(is_error_line("##[error]boom"));
-        assert!(is_error_line("::error file=app.js,line=1::Missing semicolon"));
-        assert!(is_error_line("thread 'main' panicked at src/lib.rs"));
-        assert!(is_error_line("fatal: unable to access repo")); // two keywords, still one match
-        assert!(is_error_line("Traceback (most recent call last):"));
-        assert!(is_error_line("terminate called after throwing an exception"));
-        assert!(is_error_line("Segmentation fault (core dumped)"));
-        assert!(is_error_line("process aborted"));
-        // Boundary can be punctuation, not only whitespace.
-        assert!(is_error_line("step(fail)"));
+    fn reads_odd_lines_without_panicking() {
+        // Words are sliced out by byte index, so a multi-byte char next to one
+        // must not land mid-character.
+        assert!(is_error_line("❌ error: boom"));
+        assert!(is_error_line("日本語 failed"));
+        assert!(!is_error_line("─── build ───"));
+        assert!(!is_error_line("✅ all good"));
+        // Nothing to read, or nothing but glue.
+        assert!(!is_error_line(""));
+        assert!(!is_error_line("   "));
+        assert!(!is_error_line("::::: ... ---"));
+        // A very long line is still just a line.
+        assert!(!is_error_line(&"a".repeat(10_000)));
+    }
+
+    #[test]
+    fn flags_every_failing_line() {
+        let missed: Vec<&&str> = FAILING_LINES.iter().filter(|l| !is_error_line(l)).collect();
+        assert!(missed.is_empty(), "missed {} real failures: {missed:#?}", missed.len());
+    }
+
+    #[test]
+    fn flags_no_line_that_merely_mentions_an_error() {
+        let wrong: Vec<&&str> = CLEAN_LINES.iter().filter(|l| is_error_line(l)).collect();
+        assert!(wrong.is_empty(), "{} false positives: {wrong:#?}", wrong.len());
     }
 }
