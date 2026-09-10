@@ -34,6 +34,7 @@ impl App {
             Mode::Annotations => self.key_annotations(key),
             Mode::RefPicker => self.key_ref_picker(key),
             Mode::Runners => self.key_runners(key),
+            Mode::Timing => self.key_timing(key),
         }
     }
 
@@ -206,6 +207,12 @@ impl App {
                 }
                 true
             }
+            Mode::Timing => {
+                if let Some(tv) = &mut self.timing {
+                    tv.move_cursor(delta);
+                }
+                true
+            }
             Mode::Dispatch => {
                 if let Some(d) = &mut self.dispatch {
                     if matches!(d.stage, DispatchStage::SelectWorkflow) {
@@ -243,10 +250,33 @@ impl App {
                 }
                 true
             }
+            Mode::Timing => {
+                let pos = Position::new(x, y);
+                if self.hit.timing_tab.contains(pos) {
+                    self.close_timing();
+                } else if self.hit.runners_tab.contains(pos) {
+                    self.close_timing();
+                    self.open_runners();
+                } else if self.hit.repos.contains(pos) {
+                    // The sidebar is still up beside the chart, so a click
+                    // there takes you back to the runs.
+                    self.click_repo_row(y);
+                    self.close_timing();
+                } else if self.hit.timing_plot.contains(pos) {
+                    let col = (x - self.hit.timing_plot.x) as usize;
+                    if let Some(tv) = &mut self.timing {
+                        tv.click_col(col);
+                    }
+                }
+                true
+            }
             Mode::Normal | Mode::Search => {
                 let pos = Position::new(x, y);
                 if self.hit.runners_tab.contains(pos) {
                     self.open_runners();
+                    true
+                } else if self.hit.timing_tab.contains(pos) {
+                    self.open_timing();
                     true
                 } else if self.hit.tabs.contains(pos) {
                     // Map the click to a filter tab by cumulative label width.
@@ -375,6 +405,7 @@ impl App {
             KeyCode::Char('v') => self.open_annotations(),
             KeyCode::Char('d') => self.open_dispatch(),
             KeyCode::Char('s') => self.open_runners(),
+            KeyCode::Char('w') => self.open_timing(),
             KeyCode::Char('p') => self.toggle_repos_pane(),
             KeyCode::Char('>') => self.resize_repos_pane(2),
             KeyCode::Char('<') => self.resize_repos_pane(-2),
@@ -1487,6 +1518,139 @@ impl App {
         if let Some(rv) = &mut self.runners {
             rv.move_sel(delta);
         }
+    }
+
+    /// Open the duration chart for the selected run's workflow. Durations only
+    /// compare within one workflow, so the run under the cursor aims it.
+    fn open_timing(&mut self) {
+        let Some(run) = self.selected_run() else {
+            self.set_status("Select a run - the chart follows its workflow", true);
+            return;
+        };
+        if run.workflow_id == 0 {
+            self.set_status("GitHub hasn't registered that run's workflow yet", true);
+            return;
+        }
+        let repo = run.repository.full_name.clone();
+        let (workflow_id, name) = (run.workflow_id, run.workflow_name().to_string());
+        self.timing = Some(TimingView::new(repo.clone(), workflow_id, name));
+        self.mode = Mode::Timing;
+        // Show what we already read while the conditional refetch goes out: it
+        // comes back 304 for a workflow we have seen, with no runs attached.
+        self.fill_timing(workflow_id);
+        self.state.record(&repo);
+        self.pending.push(Command::FetchWorkflowRuns { repo, workflow_id });
+    }
+
+    fn close_timing(&mut self) {
+        self.timing = None;
+        self.mode = Mode::Normal;
+    }
+
+    fn key_timing(&mut self, key: KeyEvent) {
+        // A paging key crosses the chart in chunks.
+        const PAGE: i32 = 10;
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Char('w') | KeyCode::Esc | KeyCode::Backspace => {
+                self.close_timing()
+            }
+            // The chart runs left to right, so the horizontal keys walk it - and
+            // so do the list keys this app trains your hands on.
+            KeyCode::Char('l') | KeyCode::Char('j') | KeyCode::Right | KeyCode::Down => {
+                self.timing_move(1)
+            }
+            KeyCode::Char('h') | KeyCode::Char('k') | KeyCode::Left | KeyCode::Up => {
+                self.timing_move(-1)
+            }
+            KeyCode::PageDown => self.timing_move(PAGE),
+            KeyCode::PageUp => self.timing_move(-PAGE),
+            KeyCode::Char('g') | KeyCode::Home => self.timing_jump(true),
+            KeyCode::Char('G') | KeyCode::End => self.timing_jump(false),
+            // Back to that run in the list, where everything else about it is.
+            KeyCode::Enter => self.timing_jump_to_run(),
+            KeyCode::Char('o') => {
+                let url = self
+                    .timing
+                    .as_ref()
+                    .and_then(|tv| tv.selected())
+                    .map(|p| p.url.clone())
+                    .filter(|u| !u.is_empty());
+                if let Some(url) = url {
+                    self.pending.push(Command::OpenUrl(url));
+                }
+            }
+            KeyCode::Char('[') => self.step_timing_workflow(-1),
+            KeyCode::Char(']') => self.step_timing_workflow(1),
+            // Re-read the history (a run may have finished since).
+            KeyCode::Char('r') => {
+                if let Some(tv) = &mut self.timing {
+                    let (repo, workflow_id) = (tv.repo.clone(), tv.workflow_id);
+                    self.pending.push(Command::FetchWorkflowRuns { repo, workflow_id });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn timing_move(&mut self, delta: i32) {
+        if let Some(tv) = &mut self.timing {
+            tv.move_cursor(delta);
+        }
+    }
+
+    fn timing_jump(&mut self, oldest: bool) {
+        if let Some(tv) = &mut self.timing {
+            tv.jump(oldest);
+        }
+    }
+
+    /// Leave the chart with the runs cursor on the run under it. A run older
+    /// than the list holds has nowhere to land, so say so rather than putting
+    /// the cursor somewhere arbitrary.
+    fn timing_jump_to_run(&mut self) {
+        let Some(p) = self.timing.as_ref().and_then(|tv| tv.selected()) else {
+            return;
+        };
+        let (id, number) = (p.run_id, p.number);
+        if !self.runs.iter().any(|r| r.id == id) {
+            self.set_status(
+                format!("Run #{number} isn't in the loaded list - o opens it on GitHub"),
+                true,
+            );
+            return;
+        }
+        self.close_timing();
+        // A filter it doesn't match would leave the cursor nowhere to land.
+        if !self.view.iter().any(|&i| self.runs[i].id == id) {
+            self.filter = Filter::All;
+        }
+        self.recompute_view_keeping(Some(id));
+        self.focus = Focus::Runs;
+    }
+
+    /// Move to the repo's previous/next workflow. The listing is fetched only
+    /// when this is first asked for - most visits never leave the workflow they
+    /// opened on, and unlike the runs it is not a conditional request.
+    pub(crate) fn step_timing_workflow(&mut self, delta: i32) {
+        let Some(tv) = &mut self.timing else { return };
+        if tv.workflows.is_empty() {
+            tv.pending_step = Some(delta);
+            let repo = tv.repo.clone();
+            self.pending.push(Command::FetchWorkflows { repo });
+            self.set_status("Loading workflows...", false);
+            return;
+        }
+        let at = tv.workflows.iter().position(|w| w.id == tv.workflow_id).unwrap_or(0);
+        let n = tv.workflows.len() as i32;
+        let to = (at as i32 + delta).rem_euclid(n) as usize;
+        let (id, name) = (tv.workflows[to].id, tv.workflows[to].name.clone());
+        if id == tv.workflow_id {
+            return; // the only workflow there is
+        }
+        let repo = tv.repo.clone();
+        tv.retarget(id, name);
+        self.fill_timing(id);
+        self.pending.push(Command::FetchWorkflowRuns { repo, workflow_id: id });
     }
 
     pub(crate) fn submit_dispatch(&mut self) {

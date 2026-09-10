@@ -4,6 +4,7 @@
 
 mod overlays;
 mod repos;
+mod timing;
 
 use crate::app::{
     is_error_line, log_content, App, Bar, Column, Divider, Filter, Focus, Mode, Panes, RunnerRow,
@@ -14,6 +15,7 @@ use ansi_to_tui::IntoText;
 use chrono::{DateTime, Utc};
 use overlays::*;
 use repos::draw_repos;
+use timing::draw_timing_pane;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -169,6 +171,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     app.hit.tabs = chunks[1];
     app.hit.runners_tab = Rect::default();
+    app.hit.timing_tab = Rect::default();
     // Cleared here so stale rects can't take clicks in the views that drop the
     // panes; draw_repos and draw_body set them again when they draw.
     app.hit.repos = Rect::default();
@@ -311,7 +314,7 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
 /// The tabs row: which runs you're filtering to on the left, and which screen
 /// you're on over on the right.
 fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
-    let elsewhere = app.mode == Mode::Runners;
+    let elsewhere = app.mode == Mode::Runners || app.mode == Mode::Timing;
     let titles: Vec<Line> = Filter::ALL
         .iter()
         .map(|filt| Line::from(format!(" {} ", filt.label())))
@@ -331,20 +334,39 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
         .divider("");
     f.render_widget(tabs, area);
 
-    let label = " ⚙ Runners  s ";
+    // The screens pack in from the right, and only while they still clear the
+    // filter labels — half a switcher written over "Success" helps nobody.
+    let floor = area.x + Filter::ALL.iter().map(|f| f.label().chars().count() as u16 + 2).sum::<u16>();
+    let mut right = area.right();
+    app.hit.runners_tab =
+        screen_tab(f, &mut right, floor, area, " ⚙ Runners  s ", app.mode == Mode::Runners);
+    app.hit.timing_tab =
+        screen_tab(f, &mut right, floor, area, " ◷ Duration  w ", app.mode == Mode::Timing);
+}
+
+/// Draw one screen switcher ending at `right`, moving `right` left past it.
+/// Hands back where it landed (empty when there wasn't room) so clicks resolve.
+fn screen_tab(
+    f: &mut Frame,
+    right: &mut u16,
+    floor: u16,
+    area: Rect,
+    label: &str,
+    active: bool,
+) -> Rect {
     let width = label.chars().count() as u16;
-    if area.width <= width {
-        app.hit.runners_tab = Rect::default();
-        return;
+    if right.saturating_sub(width) < floor {
+        return Rect::default();
     }
-    let at = Rect { x: area.right() - width, width, ..area };
-    app.hit.runners_tab = at;
-    let style = if elsewhere {
+    let at = Rect { x: *right - width, width, ..area };
+    *right = at.x;
+    let style = if active {
         Style::default().fg(Color::Black).bg(accent()).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(dim())
     };
-    f.render_widget(Paragraph::new(Span::styled(label, style)), at);
+    f.render_widget(Paragraph::new(Span::styled(label.to_string(), style)), at);
+    at
 }
 
 fn draw_body(f: &mut Frame, app: &mut App, area: Rect) {
@@ -353,6 +375,14 @@ fn draw_body(f: &mut Frame, app: &mut App, area: Rect) {
         app.hit.body = area;
         let (rest, dividers) = draw_sidebar(f, app, area);
         draw_runners_pane(f, app, rest);
+        app.panes.record_dividers(&dividers);
+        return;
+    }
+    // So does the duration chart.
+    if app.mode == Mode::Timing {
+        app.hit.body = area;
+        let (rest, dividers) = draw_sidebar(f, app, area);
+        draw_timing_pane(f, app, rest);
         app.panes.record_dividers(&dividers);
         return;
     }
@@ -995,6 +1025,18 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             owned(&["org self-hosted runners", "j/k move", "⏎ details", "o open on GitHub", "r refresh"]),
             vec!["Esc back"],
         )
+    } else if app.mode == Mode::Timing {
+        (
+            owned(&[
+                "successful run durations",
+                "h/l move",
+                "⏎ go to run",
+                "o open on GitHub",
+                "[ ] workflow",
+                "r refresh",
+            ]),
+            vec!["Esc back"],
+        )
     } else if app.steps_pane_open() {
         (
             owned(&["live steps", "updates automatically", "⏎ try logs", "j/k move"]),
@@ -1032,7 +1074,14 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 if let Some(t) = app.selected_tag() {
                     hints.push(format!("t {}", t.label()));
                 }
-                hints.extend(owned(&["c cancel", "x/X rerun", "A artifacts", "s runners", "p repos"]));
+                hints.extend(owned(&[
+                    "c cancel",
+                    "x/X rerun",
+                    "A artifacts",
+                    "s runners",
+                    "w durations",
+                    "p repos",
+                ]));
                 (hints, vec!["? help", "q quit"])
             }
             Focus::Jobs => (
@@ -1664,6 +1713,7 @@ mod tests {
             head_branch: Some("main".into()),
             head_sha: "a1b2c3d".into(),
             run_number: 296,
+            workflow_id: 11,
             event: "push".into(),
             status: status.into(),
             conclusion: conclusion.map(str::to_string),
@@ -2013,6 +2063,190 @@ mod tests {
         assert!(matches!(app.mode, crate::app::Mode::Runners));
         app.handle_key(KeyEvent::from(KeyCode::Esc));
         assert_eq!(app.repos.selected_repo(), Some("org/web"));
+    }
+
+
+    /// A finished, successful run of `secs`, `mins` minutes back — the shape
+    /// the workflow-runs endpoint hands over.
+    fn past_run(id: u64, number: u64, secs: i64, mins: i64) -> crate::github::Run {
+        use crate::github::{Run, RunRepo};
+        let end = Utc::now() - chrono::Duration::minutes(mins);
+        Run {
+            id,
+            name: Some("CI".into()),
+            display_title: "fix the thing".into(),
+            head_branch: Some("main".into()),
+            head_sha: "a1b2c3d".into(),
+            run_number: number,
+            workflow_id: 11,
+            event: "push".into(),
+            status: "completed".into(),
+            conclusion: Some("success".into()),
+            html_url: format!("https://github.com/org/api/actions/runs/{id}"),
+            created_at: end - chrono::Duration::seconds(secs),
+            updated_at: end,
+            run_started_at: Some(end - chrono::Duration::seconds(secs)),
+            actor: None,
+            repository: RunRepo { full_name: "org/api".into() },
+        }
+    }
+
+    /// The demo app on the chart, with five minutes-long successful runs on it.
+    /// The newest is run 3, which the runs list also holds — so `⏎` has
+    /// somewhere to go.
+    fn app_on_the_chart() -> App {
+        use crossterm::event::{KeyCode, KeyEvent};
+
+        let mut app = demo_app();
+        app.handle_key(KeyEvent::from(KeyCode::Char('w')));
+        // Newest first, as GitHub returns them.
+        let runs = vec![
+            past_run(3, 300, 300, 1),
+            past_run(104, 299, 60, 2),
+            past_run(103, 298, 240, 3),
+            past_run(102, 297, 120, 4),
+            past_run(101, 296, 180, 5),
+        ];
+        app.apply(crate::app::DataMsg::WorkflowRuns { workflow_id: 11, runs });
+        app
+    }
+
+    #[test]
+    fn the_tabs_row_switches_to_the_duration_chart() {
+        let mut app = demo_app();
+        let out = screen(&mut app, 120, 18);
+        println!("{out}");
+        assert!(out.contains("◷ Duration"), "the switcher sits beside the runners one");
+        assert!(out.contains("⚙ Runners"), "which keeps its place");
+
+        let row = row_of(&out, "Running");
+        let at = column_of(out.lines().nth(row as usize).unwrap(), "◷ Duration") as u16;
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), at, row));
+        assert!(matches!(app.mode, crate::app::Mode::Timing));
+
+        let out = screen(&mut app, 120, 18);
+        println!("{out}");
+        assert!(out.contains("Duration · org/api › CI"), "titled for the run's workflow");
+        assert!(out.contains("Reading"), "and waiting on its history");
+        assert!(out.contains("All repos"), "beside the sidebar, which stays put");
+
+        // Clicking it again comes back, with the repo scope untouched.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), at, row));
+        assert!(matches!(app.mode, crate::app::Mode::Normal));
+    }
+
+    #[test]
+    fn the_chart_draws_the_runs_with_their_numbers_under_it() {
+        use crossterm::event::{KeyCode, KeyEvent};
+
+        let mut app = app_on_the_chart();
+        let out = screen(&mut app, 120, 18);
+        println!("{out}");
+
+        assert!(out.contains("█"), "the longest run reaches the top of the plot");
+        assert!(out.contains("┄"), "the median is drawn across the shorter runs");
+        assert!(out.contains("5m0s┤"), "the axis names its top");
+        assert!(out.contains("1m0s┤"), "and its floor, since the bars don't start at zero");
+        assert!(!out.contains("↑"), "with no outlier, nothing runs off the top");
+        assert!(
+            out.contains("5 runs over 5m · min 1m0s · median 3m0s · max 5m0s"),
+            "the summary reads off the whole history"
+        );
+        // The cursor opens on the newest run, and the detail line names it.
+        assert!(out.contains("#300 · 5m0s · main · push"), "the cursor's run is spelled out");
+
+        // Moving left steps to the run before it.
+        app.handle_key(KeyEvent::from(KeyCode::Char('h')));
+        let out = screen(&mut app, 120, 18);
+        println!("{out}");
+        assert!(out.contains("#299 · 1m0s · main"));
+    }
+
+    #[test]
+    fn a_history_longer_than_the_chart_folds_into_the_columns_there_are() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut app = demo_app();
+        app.handle_key(KeyEvent::from(KeyCode::Char('w')));
+        // 100 runs wobbling around two minutes, with one slow outlier.
+        let runs: Vec<crate::github::Run> = (0..100)
+            .map(|i| {
+                let secs = 110 + (i * 37) % 40 + if i == 6 { 260 } else { 0 };
+                past_run(1000 + i as u64, 400 - i as u64, secs, i)
+            })
+            .collect();
+        app.apply(crate::app::DataMsg::WorkflowRuns { workflow_id: 11, runs });
+
+        let out = screen(&mut app, 120, 18);
+        println!("{out}");
+        assert!(out.contains("100 runs over"), "the summary counts them and says over how long");
+        // Every column now stands for more than one run, and says so.
+        assert!(out.contains("longest of"), "a folded column names what it covers");
+        // The outlier is marked rather than being allowed to flatten the rest.
+        assert!(out.contains("↑"), "the slow run is shown running off the top");
+        assert!(out.contains("max 6m32s"), "and the summary still gives its length");
+    }
+
+    #[test]
+    fn the_chart_survives_a_pane_too_narrow_to_plot_in() {
+        let mut app = app_on_the_chart();
+        // Narrow enough that the sidebar goes and the plot has no room left.
+        let out = screen(&mut app, 34, 10);
+        println!("{out}");
+        assert!(out.contains("5 runs"), "the numbers are what still fit");
+    }
+
+    #[test]
+    fn enter_goes_back_to_the_run_under_the_cursor() {
+        use crossterm::event::{KeyCode, KeyEvent};
+
+        let mut app = app_on_the_chart();
+        screen(&mut app, 120, 18);
+
+        // The newest bar is run 3, which the runs list holds.
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.mode, crate::app::Mode::Normal));
+        assert_eq!(app.selected_run().map(|r| r.id), Some(3));
+
+        // A run older than the list holds has nowhere to go, so it says so and
+        // stays on the chart.
+        app.handle_key(KeyEvent::from(KeyCode::Char('w')));
+        screen(&mut app, 120, 18);
+        app.handle_key(KeyEvent::from(KeyCode::Char('h')));
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.mode, crate::app::Mode::Timing));
+        let (msg, is_err) = app.status().unwrap();
+        assert!(msg.contains("#299"), "names the run it cannot reach: {msg}");
+        assert!(is_err);
+    }
+
+    #[test]
+    fn the_workflow_list_is_only_fetched_when_you_ask_to_move_off_this_one() {
+        use crossterm::event::{KeyCode, KeyEvent};
+
+        let mut app = demo_app();
+        app.handle_key(KeyEvent::from(KeyCode::Char('w')));
+        assert!(
+            !app.pending.iter().any(|c| matches!(c, crate::app::Command::FetchWorkflows { .. })),
+            "opening the chart costs one conditional request, not two"
+        );
+
+        app.handle_key(KeyEvent::from(KeyCode::Char(']')));
+        assert!(
+            app.pending.iter().any(|c| matches!(c, crate::app::Command::FetchWorkflows { .. })),
+            "stepping to another workflow asks for the list"
+        );
+    }
+
+    #[test]
+    fn a_workflow_with_no_successes_says_so() {
+        use crossterm::event::{KeyCode, KeyEvent};
+
+        let mut app = demo_app();
+        app.handle_key(KeyEvent::from(KeyCode::Char('w')));
+        app.apply(crate::app::DataMsg::WorkflowRuns { workflow_id: 11, runs: vec![] });
+        let out = screen(&mut app, 120, 18);
+        println!("{out}");
+        assert!(out.contains("No successful runs of CI"));
     }
 
     /// A sidebar with far more repos than fit, and where its scrollbar landed.

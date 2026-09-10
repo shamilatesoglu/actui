@@ -365,6 +365,8 @@ pub(super) fn draw_help(f: &mut Frame) {
         help_row("A", "browse / download run artifacts"),
         help_row("s", "org runners — or click ⚙ Runners on the tabs row"),
         help_row("  ↳ in runners", "⏎ details · o open on GitHub · r refresh"),
+        help_row("w", "duration chart of this workflow's good runs"),
+        help_row("  ↳ in durations", "h/l move · ⏎ go to run · [ ] workflow"),
         help_row("v", "failure annotations (file:line)"),
         help_row("  ↳ in failures", "⏎ jump to log line · o open on GitHub"),
         help_row("r / F5", "refresh now (auto-refresh is on)"),

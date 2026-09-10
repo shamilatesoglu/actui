@@ -317,6 +317,33 @@ impl Github {
         }
     }
 
+    /// One workflow's successful runs, most recent first (conditional).
+    ///
+    /// Durations only compare within a single workflow, so the chart reads this
+    /// rather than the mixed sweep — and it reaches much further back than the
+    /// handful of runs the sweep keeps per repo.
+    pub async fn list_workflow_runs(
+        &self,
+        full_name: &str,
+        workflow_id: u64,
+        per_page: u32,
+    ) -> Result<Cond<Vec<Run>>> {
+        #[derive(Deserialize)]
+        struct Resp {
+            workflow_runs: Vec<Run>,
+        }
+        let key = format!("wfruns:{workflow_id}:{per_page}");
+        let url = format!("{API}/repos/{full_name}/actions/workflows/{workflow_id}/runs");
+        let query = [
+            ("status", "success".to_string()),
+            ("per_page", per_page.to_string()),
+        ];
+        match self.cond_get::<Resp>(&key, url, &query).await? {
+            Cond::Modified(r) => Ok(Cond::Modified(r.workflow_runs)),
+            Cond::NotModified => Ok(Cond::NotModified),
+        }
+    }
+
     pub async fn list_jobs(&self, full_name: &str, run_id: u64) -> Result<Cond<Vec<Job>>> {
         #[derive(Deserialize)]
         struct Resp {
@@ -886,6 +913,10 @@ pub struct Run {
     #[serde(default)]
     pub head_sha: String,
     pub run_number: u64,
+    /// The workflow this run belongs to — how the duration chart gathers a
+    /// workflow's history without guessing from names.
+    #[serde(default)]
+    pub workflow_id: u64,
     pub event: String,
     pub status: String,
     #[serde(default)]

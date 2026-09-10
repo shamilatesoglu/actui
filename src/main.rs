@@ -390,6 +390,24 @@ fn dispatch_commands(app: &mut App, gh: &Github, cfg: &Config, tx: &UnboundedSen
                     }
                 });
             }
+            Command::FetchWorkflowRuns { repo, workflow_id } => {
+                let (gh, tx) = (gh.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let n = app::TIMING_HISTORY;
+                    match gh.list_workflow_runs(&repo, workflow_id, n).await {
+                        Ok(Cond::Modified(runs)) => {
+                            let _ = tx.send(DataMsg::WorkflowRuns { workflow_id, runs });
+                        }
+                        // Nothing new since we last read it — the chart still has it.
+                        Ok(Cond::NotModified) => {
+                            let _ = tx.send(DataMsg::WorkflowRunsUnchanged { workflow_id });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(DataMsg::Error(format!("workflow runs: {e}")));
+                        }
+                    }
+                });
+            }
             Command::FetchWorkflowInputs { repo, path, git_ref } => {
                 let (gh, tx) = (gh.clone(), tx.clone());
                 tokio::spawn(async move {

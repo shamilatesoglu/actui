@@ -9,11 +9,14 @@ mod overlays;
 mod panes;
 mod protocol;
 mod repos;
+mod timing;
 
 pub use logs::{LogsView, StepsView};
 pub use overlays::*;
 pub use panes::{min_body, Bar, Column, Divider, Panes, Press, Scrollable};
 pub use repos::ReposPane;
+pub use timing::{Layout as TimingLayout, Stats as TimingStats, TimingPoint, TimingView};
+pub(crate) use timing::HISTORY as TIMING_HISTORY;
 pub use protocol::{AnnJob, Command, DataMsg};
 pub(crate) use logs::{is_error_line, log_content};
 
@@ -107,8 +110,12 @@ pub struct HitMap {
     pub runs: Rect,
     /// Jobs list content within the detail pane.
     pub jobs: Rect,
+    /// The duration-chart switcher, left of the runners one.
+    pub timing_tab: Rect,
     /// Org-runners pane content (for click-to-select).
     pub runners_pane: Rect,
+    /// The chart's plot area (for click-to-select a column).
+    pub timing_plot: Rect,
     /// Logs viewport height — the page size for PgUp/PgDn.
     pub logs_h: u16,
 }
@@ -127,6 +134,7 @@ pub enum Mode {
     Annotations,
     RefPicker,
     Runners,
+    Timing,
 }
 
 /// The answer to "what did this run put on its commit?".
@@ -190,6 +198,11 @@ pub struct App {
     pub pending_log_search: Option<String>,
     pub ref_picker: Option<RefPicker>,
     pub runners: Option<RunnersView>,
+    /// The duration chart, and one workflow's successful runs cached by
+    /// workflow id — the conditional refetch answers `304` for a workflow we
+    /// have already read, so without the cache re-opening it would show nothing.
+    pub timing: Option<TimingView>,
+    timing_cache: HashMap<u64, Vec<TimingPoint>>,
     pub pending_action: Option<PendingAction>,
     pub pending_open_log_id: Option<u64>,
     /// Debounced log fetch for the selected job (for preview): (selected at, job_id)
@@ -267,6 +280,8 @@ impl App {
             pending_log_search: None,
             ref_picker: None,
             runners: None,
+            timing: None,
+            timing_cache: HashMap::new(),
             pending_action: None,
             pending_open_log_id: None,
             logs_fetch_due: None,
@@ -540,6 +555,21 @@ impl App {
                 rp.recompute();
             }
             DataMsg::Workflows { repo, workflows } => {
+                let mut step = None;
+                if let Some(tv) = &mut self.timing {
+                    if tv.repo == repo {
+                        // Alphabetical, so `[` and `]` walk them in an order
+                        // that doesn't change under you.
+                        let mut list = workflows.clone();
+                        list.sort_by_key(|w| w.name.to_lowercase());
+                        tv.workflows = list;
+                        step = tv.pending_step.take();
+                    }
+                }
+                // The list was fetched because a step was asked for; take it now.
+                if let Some(delta) = step {
+                    self.step_timing_workflow(delta);
+                }
                 if let Some(d) = &mut self.dispatch {
                     if d.repo == repo {
                         d.workflows = workflows;
@@ -559,6 +589,11 @@ impl App {
                     }
                 }
             }
+            DataMsg::WorkflowRuns { workflow_id, runs } => {
+                self.timing_cache.insert(workflow_id, timing::points_of(&runs));
+                self.fill_timing(workflow_id);
+            }
+            DataMsg::WorkflowRunsUnchanged { workflow_id } => self.fill_timing(workflow_id),
             DataMsg::Runners { groups } => {
                 if let Some(rv) = &mut self.runners {
                     rv.set_groups(groups);
@@ -670,6 +705,8 @@ impl App {
             head_branch: Some(git_ref.to_string()),
             head_sha: String::new(),
             run_number: 0,
+            // GitHub has not registered the run yet, so it has no workflow id.
+            workflow_id: 0,
             event: "workflow_dispatch".to_string(),
             status: "in_progress".to_string(),
             conclusion: None,
@@ -717,6 +754,18 @@ impl App {
             if p.repository.full_name == repo {
                 self.runs.push(p.clone());
             }
+        }
+    }
+
+    /// Hand a workflow's runs to the chart, if that's still the one on screen.
+    /// A fresh fetch and a `304` both land here: the cache is what makes the
+    /// unchanged answer usable, since re-opening a workflow we have already
+    /// read gets no body back.
+    fn fill_timing(&mut self, workflow_id: u64) {
+        let Some(points) = self.timing_cache.get(&workflow_id) else { return };
+        let Some(tv) = &mut self.timing else { return };
+        if tv.workflow_id == workflow_id {
+            tv.set_points(points.clone());
         }
     }
 
@@ -1118,6 +1167,7 @@ mod tests {
             head_branch: Some("main".into()),
             head_sha: "a1b2c3d".into(),
             run_number: 7,
+            workflow_id: 11,
             event: "push".into(),
             status: status.into(),
             conclusion: conclusion.map(|c| c.into()),

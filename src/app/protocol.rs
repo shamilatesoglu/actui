@@ -40,6 +40,10 @@ pub enum DataMsg {
     PendingDeployments { run_id: u64, items: Vec<PendingDeployment> },
     /// Branches and tags for a repo, for the dispatch ref picker.
     Refs { repo: String, branches: Vec<String>, tags: Vec<String> },
+    /// One workflow's successful runs, for the duration chart.
+    WorkflowRuns { workflow_id: u64, runs: Vec<Run> },
+    /// That workflow's runs were unchanged (304) — the chart keeps its cache.
+    WorkflowRunsUnchanged { workflow_id: u64 },
     /// Self-hosted runners grouped per org, for the runners view.
     Runners { groups: Vec<RunnerGroup> },
     /// A dispatch request failed — drop the optimistic placeholder run it created.
@@ -61,6 +65,8 @@ pub enum Command {
     /// Fetch check-run annotations for the given jobs of a run, concurrently.
     FetchAnnotations { run_id: u64, jobs: Vec<AnnJob> },
     FetchWorkflows { repo: String },
+    /// One workflow's successful runs, for the duration chart.
+    FetchWorkflowRuns { repo: String, workflow_id: u64 },
     FetchWorkflowInputs { repo: String, path: String, git_ref: String },
     FetchArtifacts { repo: String, run_id: u64 },
     /// Look for tags and releases on these runs' head commits — one repo's
