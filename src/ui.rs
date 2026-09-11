@@ -40,6 +40,7 @@ pub struct Theme {
     pale: Color,       // unfocused selected text
     popup_bg: Color,   // popup window fill
     soft_red: Color,   // a guessed error, quieter than a real failure's red
+    text: Color,       // the strongest foreground: what stands out from the accent
 }
 
 impl Theme {
@@ -52,6 +53,7 @@ impl Theme {
             pale: Color::Rgb(166, 173, 200),
             popup_bg: Color::Rgb(30, 31, 48),
             soft_red: Color::Rgb(235, 160, 172),
+            text: Color::Rgb(205, 214, 244),
         }
     }
     pub fn light() -> Self {
@@ -63,6 +65,7 @@ impl Theme {
             pale: Color::Rgb(76, 79, 105),
             popup_bg: Color::Rgb(230, 233, 239),
             soft_red: Color::Rgb(179, 80, 92),
+            text: Color::Rgb(76, 79, 105),
         }
     }
 }
@@ -102,6 +105,9 @@ fn popup_bg() -> Color {
 }
 fn soft_red() -> Color {
     theme().soft_red
+}
+fn text() -> Color {
+    theme().text
 }
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -2145,6 +2151,9 @@ mod tests {
 
         assert!(out.contains("█"), "the longest run reaches the top of the plot");
         assert!(out.contains("┄"), "the median is drawn across the shorter runs");
+        let braille = |c: char| ('\u{2801}'..='\u{28FF}').contains(&c);
+        assert!(out.chars().any(braille), "and the smoothed curve runs over them, in braille");
+        assert!(out.contains("███████████ ███████████"), "five runs fill the width as wide bars");
         assert!(out.contains("5m0s┤"), "the axis names its top");
         assert!(out.contains("1m0s┤"), "and its floor, since the bars don't start at zero");
         assert!(!out.contains("↑"), "with no outlier, nothing runs off the top");
@@ -2259,6 +2268,31 @@ mod tests {
         let out = screen(&mut app, 34, 10);
         println!("{out}");
         assert!(out.contains("5 runs"), "the numbers are what still fit");
+    }
+
+    #[test]
+    fn the_curve_keeps_the_colour_of_the_bar_it_crosses_behind_it() {
+        // The curve is braille dots over whatever cell it crosses. Over a solid
+        // bar the bar's colour has to move to the background, or the line
+        // punches a hole through it — the selected bar included.
+        let mut app = app_on_the_chart();
+        app.sync_layout(120);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 18)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let braille = |c: char| ('\u{2801}'..='\u{28FF}').contains(&c);
+        let (mut over_cursor, mut over_bar) = (0, 0);
+        for cell in term.backend().buffer().content() {
+            if !cell.symbol().chars().next().is_some_and(braille) {
+                continue;
+            }
+            if cell.bg == text() {
+                over_cursor += 1;
+            } else if cell.bg == accent() {
+                over_bar += 1;
+            }
+        }
+        assert!(over_cursor > 0, "the selected bar keeps its colour behind the curve");
+        assert!(over_bar > 0, "and so does an ordinary one");
     }
 
     #[test]

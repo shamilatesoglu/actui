@@ -13,9 +13,13 @@ pub const HISTORY: u32 = 100;
 /// How many runs each side of the trend comparison looks at, at most.
 const TREND_WINDOW: usize = 10;
 
-/// Widest a run's slice of the chart gets. Past this the gaps stop reading as
-/// spacing and start reading as missing runs.
-const MAX_STEP: usize = 4;
+/// Widest a run's slice of the chart gets, gap included. Past this a handful
+/// of runs turns into a handful of slabs.
+const MAX_STEP: usize = 12;
+
+/// How many runs the smoothed curve looks at around each one: a tenth of the
+/// history, but never fewer than this or more than that.
+const SMOOTH_WINDOW: (usize, usize) = (5, 15);
 
 /// One successful run on the chart.
 #[derive(Clone)]
@@ -47,37 +51,54 @@ pub struct Bar {
     /// Index into `points` of that longest run: what the cursor lands on and
     /// the detail line describes.
     pub peak: usize,
-    /// How many runs this column covers (1 unless the history is folded).
+    /// The runs this column covers: `first` and the `runs - 1` after it.
+    pub first: usize,
     pub runs: usize,
+}
+
+impl Bar {
+    /// The run in the middle of what this column covers — where the smoothed
+    /// curve is read for it.
+    pub fn middle(&self) -> usize {
+        self.first + self.runs / 2
+    }
 }
 
 /// The chart's shape for a given width.
 pub struct Layout {
     pub bars: Vec<Bar>,
-    /// Columns per bar, including the blank ones after it — the runs spread out
-    /// to fill the width they are given, up to `MAX_STEP`.
+    /// Columns per bar: the bar itself and the gap after it. The runs spread
+    /// out to fill the width they are given, up to `MAX_STEP`.
     pub step: usize,
+    /// Columns the bar itself takes — the slice minus one gap column, once
+    /// there is room for a gap at all.
+    pub bar_w: usize,
 }
 
 impl Layout {
+    fn spread(bars: Vec<Bar>, width: usize) -> Self {
+        let step = (width / bars.len().max(1)).clamp(1, MAX_STEP);
+        let bar_w = if step == 1 { 1 } else { step - 1 };
+        Self { bars, step, bar_w }
+    }
+
     /// How far in the first column sits. The runs are pushed against the right
     /// edge so the newest is always where the axis ends, and a short history
-    /// reads as one - rather than as a chart with its right half missing.
+    /// reads as one — rather than as a chart with its right half missing.
     pub fn offset(&self, width: usize) -> usize {
-        let used = self.bars.len().saturating_sub(1) * self.step + 1;
+        let used = self.bars.len().saturating_sub(1) * self.step + self.bar_w;
         width.saturating_sub(used)
     }
 
-    /// The column bar `i` is drawn in.
+    /// The first column bar `i` is drawn in.
     pub fn col(&self, i: usize, width: usize) -> usize {
         self.offset(width) + i * self.step
     }
 
-    /// The bar nearest a drawn column. Spaced-out bars leave gaps between
-    /// them, and a click in one means the bar it is closest to.
+    /// The bar drawn at a column; the gap after a bar counts as that bar's.
     pub fn bar_of(&self, col: usize, width: usize) -> usize {
         let rel = col.saturating_sub(self.offset(width));
-        ((rel + self.step / 2) / self.step).min(self.bars.len().saturating_sub(1))
+        (rel / self.step).min(self.bars.len().saturating_sub(1))
     }
 }
 
@@ -164,19 +185,18 @@ impl TimingView {
         self.points.get(self.cursor)
     }
 
-    /// Lay the runs out across `width` columns: one column each while they fit,
-    /// spaced apart while there is room to spare, otherwise folded into buckets
-    /// so a long history compresses instead of running off the edge.
+    /// Lay the runs out across `width` columns: a slice each while they fit,
+    /// widening to fill the room there is, otherwise folded into buckets so a
+    /// long history compresses instead of running off the edge.
     pub fn layout(&self, width: usize) -> Layout {
         let n = self.points.len();
         if n == 0 || width == 0 {
-            return Layout { bars: Vec::new(), step: 1 };
+            return Layout { bars: Vec::new(), step: 1, bar_w: 1 };
         }
         let secs = |i: usize| self.points[i].secs;
         if n <= width {
-            let step = (width / n).clamp(1, MAX_STEP);
-            let bars = (0..n).map(|i| Bar { secs: secs(i), peak: i, runs: 1 }).collect();
-            return Layout { bars, step };
+            let bars = (0..n).map(|i| Bar { secs: secs(i), peak: i, first: i, runs: 1 }).collect();
+            return Layout::spread(bars, width);
         }
         // More runs than columns: each column covers an even slice of them and
         // reports its longest, so a spike survives the fold.
@@ -185,10 +205,10 @@ impl TimingView {
                 let first = c * n / width;
                 let last = ((c + 1) * n / width).max(first + 1);
                 let peak = (first..last).max_by_key(|&i| secs(i)).unwrap_or(first);
-                Bar { secs: secs(peak), peak, runs: last - first }
+                Bar { secs: secs(peak), peak, first, runs: last - first }
             })
             .collect();
-        Layout { bars, step: 1 }
+        Layout { bars, step: 1, bar_w: 1 }
     }
 
     /// Move the cursor by whole columns, so it keeps step with what's drawn
@@ -255,6 +275,19 @@ impl TimingView {
             floor: percentile(&secs, 5),
             trend: self.trend(),
         })
+    }
+
+    /// The runs with the noise taken out: each one replaced by the median of
+    /// the few around it. A median rather than a mean, because the one run
+    /// that hung would otherwise drag the curve up for a window either side of
+    /// it — the very spike the curve is meant to see past.
+    pub fn smoothed(&self) -> Vec<i64> {
+        let n = self.points.len();
+        let (least, most) = SMOOTH_WINDOW;
+        let half = (n / 10).clamp(least, most) / 2;
+        (0..n)
+            .map(|i| median_of(&self.points[i.saturating_sub(half)..(i + half + 1).min(n)]))
+            .collect()
     }
 
     /// Percent change between the median of the last few runs and the median of
@@ -334,7 +367,7 @@ fn median(sorted: &[i64]) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github::{RunRepo, Run};
+    use crate::github::{Run, RunRepo};
     use chrono::Duration;
 
     /// A finished run of `secs`, `mins_ago` minutes back.
@@ -465,16 +498,53 @@ mod tests {
     }
 
     #[test]
+    fn the_smoothed_curve_sees_past_a_single_spike() {
+        // A steady two minutes with one run that hung.
+        let mut durations = vec![120; 20];
+        durations[10] = 3600;
+        let curve = view(&durations).smoothed();
+        assert_eq!(curve.len(), 20);
+        assert!(curve.iter().all(|&s| s == 120), "the spike never reaches the curve: {curve:?}");
+
+        // A real shift does: the curve follows the runs up.
+        let v = view(&[100, 100, 100, 100, 100, 100, 200, 200, 200, 200, 200, 200]);
+        let curve = v.smoothed();
+        assert_eq!(curve[0], 100);
+        assert_eq!(curve[11], 200);
+        assert!(curve.windows(2).all(|w| w[0] <= w[1]), "and never dips on the way: {curve:?}");
+    }
+
+    #[test]
+    fn the_curve_exists_for_a_handful_of_runs_too() {
+        assert_eq!(view(&[10, 30, 20]).smoothed(), vec![20, 20, 20]);
+        assert!(view(&[]).smoothed().is_empty());
+    }
+
+    #[test]
+    fn runs_widen_to_fill_the_chart() {
+        // Twenty runs across eighty-four columns: four each, three of bar.
+        let twenty: Vec<i64> = (1..=20).collect();
+        let l = view(&twenty).layout(84);
+        assert_eq!((l.step, l.bar_w), (4, 3));
+        // Ten runs get twice that.
+        let l = view(&twenty[..10]).layout(84);
+        assert_eq!((l.step, l.bar_w), (8, 7));
+        // Three runs stop at the cap rather than becoming three slabs.
+        let l = view(&[10, 20, 30]).layout(400);
+        assert_eq!((l.step, l.bar_w), (MAX_STEP, MAX_STEP - 1));
+        // Two columns a run leaves no room for a gap wider than the bar.
+        let l = view(&twenty).layout(40);
+        assert_eq!((l.step, l.bar_w), (2, 1));
+        // Twice as many runs as columns to put them in, and they close up.
+        let l = view(&[10, 20, 30, 40, 50, 60]).layout(9);
+        assert_eq!((l.step, l.bar_w), (1, 1));
+    }
+
+    #[test]
     fn runs_get_a_column_each_while_they_fit() {
         let v = view(&[10, 20, 30]);
-        // Room to spare, so they spread out.
         let l = v.layout(40);
         assert_eq!(l.bars.len(), 3);
-        assert_eq!(l.step, 4);
-        // Only as far as the cap, though: 3 runs never become 3 fat blocks.
-        assert_eq!(v.layout(400).step, 4);
-        // Twice as many runs as columns to put them in, and they close up.
-        assert_eq!(view(&[10, 20, 30, 40, 50, 60]).layout(9).step, 1);
         assert_eq!(l.bars.iter().map(|b| b.secs).collect::<Vec<_>>(), vec![10, 20, 30]);
         assert!(l.bars.iter().all(|b| b.runs == 1));
 
@@ -495,6 +565,9 @@ mod tests {
         assert_eq!(l.bars.iter().map(|b| b.runs).sum::<usize>(), 100);
         assert_eq!(l.bars[0].secs, 10);
         assert_eq!(l.bars[9].secs, 100);
+        // Each column knows the middle of what it stands for.
+        assert_eq!(l.bars[0].middle(), 5);
+        assert_eq!(l.bars[9].middle(), 95);
     }
 
     #[test]
@@ -533,7 +606,6 @@ mod tests {
         let mut v = view(&[10, 90, 20, 80, 30, 70]);
         v.width = 6;
         v.cursor = 4; // the 30s run
-
         v.width = 2;
         let l = v.layout(2);
         assert!(v.bar_at(&l) < l.bars.len());
@@ -542,17 +614,29 @@ mod tests {
     }
 
     #[test]
+    fn a_chart_with_no_columns_is_still_answerable() {
+        // A pane too narrow to plot anything still asks which bar the cursor is
+        // on, so the answer has to exist.
+        let v = view(&[10, 20, 30]);
+        assert_eq!(v.bar_at(&v.layout(0)), 0);
+        assert_eq!(view(&[]).bar_at(&v.layout(0)), 0);
+    }
+
+    #[test]
     fn the_newest_run_sits_against_the_right_edge() {
+        // Three runs in forty columns: twelve each, eleven of bar, so the
+        // first sits five in and the last ends on the final column.
         let v = view(&[10, 20, 30]);
         let l = v.layout(40);
-        assert_eq!(l.col(2, 40), 39);
-        assert_eq!(l.col(1, 40), 35);
-        assert_eq!(l.col(0, 40), 31);
-        // Clicking finds the bar drawn there, and a gap goes to the nearer one.
+        assert_eq!(l.offset(40), 5);
+        assert_eq!(l.col(0, 40), 5);
+        assert_eq!(l.col(1, 40), 17);
+        assert_eq!(l.col(2, 40) + l.bar_w, 40);
+        // Clicking finds the bar drawn there; the gap after a bar is its own.
+        assert_eq!(l.bar_of(5, 40), 0);
+        assert_eq!(l.bar_of(16, 40), 0);
+        assert_eq!(l.bar_of(17, 40), 1);
         assert_eq!(l.bar_of(39, 40), 2);
-        assert_eq!(l.bar_of(35, 40), 1);
-        assert_eq!(l.bar_of(34, 40), 1);
-        assert_eq!(l.bar_of(31, 40), 0);
         assert_eq!(l.bar_of(0, 40), 0);
 
         // A full chart starts at the left edge, with nothing to spare.
@@ -566,22 +650,13 @@ mod tests {
     fn clicking_a_column_selects_the_run_drawn_there() {
         let mut v = view(&[10, 20, 30]);
         v.width = 40;
-        v.click_col(31);
+        v.click_col(5);
         assert_eq!(v.selected().unwrap().secs, 10);
         v.click_col(39);
         assert_eq!(v.selected().unwrap().secs, 30);
         // A click past the last column stays on it.
         v.click_col(500);
         assert_eq!(v.selected().unwrap().secs, 30);
-    }
-
-    #[test]
-    fn a_chart_with_no_columns_is_still_answerable() {
-        // A pane too narrow to plot anything still asks which bar the cursor is
-        // on, so the answer has to exist.
-        let v = view(&[10, 20, 30]);
-        assert_eq!(v.bar_at(&v.layout(0)), 0);
-        assert_eq!(view(&[]).bar_at(&v.layout(0)), 0);
     }
 
     #[test]
