@@ -47,15 +47,16 @@ pub(super) fn draw_timing_pane(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
     if tv.points.is_empty() {
-        note(
-            f,
-            inner,
+        let why = if tv.unknown > 0 {
             format!(
-                "No successful runs of {} in its last {TIMING_HISTORY}.\n\n\
-                 [ and ] move to another workflow in this repo.",
-                tv.workflow
-            ),
-        );
+                "{} has {} successful runs, but they are past the repo's retention and \
+                 GitHub no longer says how long any of them took.",
+                tv.workflow, tv.unknown
+            )
+        } else {
+            format!("No successful runs of {} in its last {TIMING_HISTORY}.", tv.workflow)
+        };
+        note(f, inner, format!("{why}\n\n[ and ] move to another workflow in this repo."));
         return;
     }
 
@@ -213,6 +214,13 @@ fn stats_row(tv: &TimingView, stats: &TimingStats) -> Line<'static> {
         ),
         Style::default().fg(dim()),
     )];
+    // Successes left off because GitHub no longer says how long they took.
+    if tv.unknown > 0 {
+        spans.push(Span::styled(
+            format!(" · {} with no known duration", tv.unknown),
+            Style::default().fg(dim()),
+        ));
+    }
     if let Some(t) = stats.trend {
         let (glyph, color) = if t > FLAT {
             ("▲", Color::Red)

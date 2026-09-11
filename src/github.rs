@@ -1155,11 +1155,47 @@ pub enum RunState {
     Other,
 }
 
+/// The longest GitHub lets a workflow run go on for. `updated_at` further
+/// than this from the start cannot be the run finishing, so it must be GitHub
+/// touching the run later — which it does, to the second, when the run's logs
+/// or artifacts reach the repo's retention limit.
+const LONGEST_RUN: chrono::Duration = chrono::Duration::days(35);
+
 impl Run {
     /// A run we've asked GitHub for but it hasn't registered yet: the number
     /// and the page belong to the real run, and it doesn't have one yet.
     pub fn is_pending(&self) -> bool {
         self.run_number == 0
+    }
+
+    /// When the run started, or was queued if it never got going.
+    pub fn started_at(&self) -> DateTime<Utc> {
+        self.run_started_at.unwrap_or(self.created_at)
+    }
+
+    /// Whether `updated_at` still says when the run finished, or GitHub has
+    /// moved it since by housekeeping the run.
+    fn updated_at_is_finish(&self) -> bool {
+        self.updated_at - self.started_at() <= LONGEST_RUN
+    }
+
+    /// How long a finished run took, when that is still knowable. A run GitHub
+    /// has housekept since has lost its finish time, and a year-long "duration"
+    /// says less than nothing.
+    pub fn duration_secs(&self) -> Option<i64> {
+        self.updated_at_is_finish()
+            .then(|| (self.updated_at - self.started_at()).num_seconds().max(0))
+    }
+
+    /// When the run last did anything: finished, or was last seen going. Once
+    /// GitHub has housekept the run its `updated_at` is a year off, and the
+    /// start — which GitHub never moves — is the honest stand-in.
+    pub fn last_activity(&self) -> DateTime<Utc> {
+        if self.updated_at_is_finish() {
+            self.updated_at
+        } else {
+            self.started_at()
+        }
     }
 
     pub fn state(&self) -> RunState {

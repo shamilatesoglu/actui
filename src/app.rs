@@ -15,7 +15,8 @@ pub use logs::{LogsView, StepsView};
 pub use overlays::*;
 pub use panes::{min_body, Bar, Column, Divider, Panes, Press, Scrollable};
 pub use repos::ReposPane;
-pub use timing::{Layout as TimingLayout, Stats as TimingStats, TimingPoint, TimingView};
+pub use timing::{Layout as TimingLayout, Stats as TimingStats, TimingView};
+use timing::History as TimingHistory;
 pub(crate) use timing::HISTORY as TIMING_HISTORY;
 pub use protocol::{AnnJob, Command, DataMsg};
 pub(crate) use logs::{is_error_line, log_content};
@@ -202,7 +203,7 @@ pub struct App {
     /// workflow id — the conditional refetch answers `304` for a workflow we
     /// have already read, so without the cache re-opening it would show nothing.
     pub timing: Option<TimingView>,
-    timing_cache: HashMap<u64, Vec<TimingPoint>>,
+    timing_cache: HashMap<u64, TimingHistory>,
     pub pending_action: Option<PendingAction>,
     pub pending_open_log_id: Option<u64>,
     /// Debounced log fetch for the selected job (for preview): (selected at, job_id)
@@ -682,7 +683,7 @@ impl App {
     }
 
     fn resort(&mut self) {
-        self.runs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        self.runs.sort_by_key(|r| std::cmp::Reverse(r.last_activity()));
     }
 
     /// Insert an optimistic placeholder run for a just-submitted dispatch so the
@@ -762,10 +763,10 @@ impl App {
     /// unchanged answer usable, since re-opening a workflow we have already
     /// read gets no body back.
     fn fill_timing(&mut self, workflow_id: u64) {
-        let Some(points) = self.timing_cache.get(&workflow_id) else { return };
+        let Some(history) = self.timing_cache.get(&workflow_id) else { return };
         let Some(tv) = &mut self.timing else { return };
         if tv.workflow_id == workflow_id {
-            tv.set_points(points.clone());
+            tv.set_history(history.clone());
         }
     }
 

@@ -175,7 +175,7 @@ impl ReposPane {
                 RunState::Failure => e.1 += 1,
                 _ => {}
             }
-            e.2 = e.2.max(Some(r.updated_at));
+            e.2 = e.2.max(Some(r.last_activity()));
         }
 
         let mut seen: HashSet<&str> = HashSet::new();

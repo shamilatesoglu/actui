@@ -30,6 +30,15 @@ pub struct TimingPoint {
     pub url: String,
 }
 
+/// What a fetch of a workflow's runs boils down to for the chart.
+#[derive(Clone, Default)]
+pub struct History {
+    /// Successful runs with a known duration, oldest first.
+    pub points: Vec<TimingPoint>,
+    /// Successes GitHub no longer gives a finish time for, left off the chart.
+    pub unknown: usize,
+}
+
 /// One drawn column of the chart. Where there are more runs than columns, a
 /// column stands for several of them and reports the longest.
 pub struct Bar {
@@ -103,6 +112,8 @@ pub struct TimingView {
     pub workflows: Vec<Workflow>,
     /// Successful runs, oldest first.
     pub points: Vec<TimingPoint>,
+    /// Successes with no duration to plot — see `History::unknown`.
+    pub unknown: usize,
     pub loaded: bool,
     /// Index into `points` of the run under the cursor.
     pub cursor: usize,
@@ -122,6 +133,7 @@ impl TimingView {
             workflow,
             workflows: Vec::new(),
             points: Vec::new(),
+            unknown: 0,
             loaded: false,
             cursor: 0,
             width: 0,
@@ -135,13 +147,15 @@ impl TimingView {
         self.workflow_id = workflow_id;
         self.workflow = workflow;
         self.points.clear();
+        self.unknown = 0;
         self.loaded = false;
         self.cursor = 0;
     }
 
     /// Take a fresh (or cached) reading, leaving the cursor on the newest run.
-    pub fn set_points(&mut self, points: Vec<TimingPoint>) {
-        self.points = points;
+    pub fn set_history(&mut self, history: History) {
+        self.points = history.points;
+        self.unknown = history.unknown;
         self.loaded = true;
         self.cursor = self.points.len().saturating_sub(1);
     }
@@ -262,26 +276,27 @@ impl TimingView {
 }
 
 /// The successful runs of a fetch, oldest first. GitHub returns newest first,
-/// and a run still going has no duration to plot.
-pub fn points_of(runs: &[Run]) -> Vec<TimingPoint> {
-    let mut points: Vec<TimingPoint> = runs
-        .iter()
-        .filter(|r| r.state() == RunState::Success && !r.is_pending())
-        .map(|r| {
-            let start = r.run_started_at.unwrap_or(r.created_at);
-            TimingPoint {
-                run_id: r.id,
-                number: r.run_number,
-                secs: (r.updated_at - start).num_seconds().max(0),
-                branch: r.head_branch.clone().unwrap_or_default(),
-                event: r.event.clone(),
-                finished: r.updated_at,
-                url: r.html_url.clone(),
-            }
-        })
-        .collect();
-    points.sort_by_key(|p| (p.finished, p.number));
-    points
+/// a run still going has no duration to plot, and one GitHub has housekept no
+/// longer says how long it took.
+pub fn points_of(runs: &[Run]) -> History {
+    let mut history = History::default();
+    for r in runs.iter().filter(|r| r.state() == RunState::Success && !r.is_pending()) {
+        let Some(secs) = r.duration_secs() else {
+            history.unknown += 1;
+            continue;
+        };
+        history.points.push(TimingPoint {
+            run_id: r.id,
+            number: r.run_number,
+            secs,
+            branch: r.head_branch.clone().unwrap_or_default(),
+            event: r.event.clone(),
+            finished: r.last_activity(),
+            url: r.html_url.clone(),
+        });
+    }
+    history.points.sort_by_key(|p| (p.finished, p.number));
+    history
 }
 
 fn median_of(points: &[TimingPoint]) -> i64 {
@@ -357,7 +372,7 @@ mod tests {
             })
             .collect();
         let mut v = TimingView::new("org/api".into(), 7, "CI".into());
-        v.set_points(points_of(&runs));
+        v.set_history(points_of(&runs));
         v
     }
 
@@ -370,9 +385,25 @@ mod tests {
         runs.push(pending);
 
         let mut v = TimingView::new("org/api".into(), 7, "CI".into());
-        v.set_points(points_of(&runs));
+        v.set_history(points_of(&runs));
         assert_eq!(v.points.len(), 1);
         assert_eq!(v.points[0].secs, 60);
+        assert_eq!(v.unknown, 0);
+    }
+
+    #[test]
+    fn a_run_github_has_housekept_is_counted_but_not_plotted() {
+        // Finished in six minutes; GitHub then touched it when its logs expired,
+        // four hundred days on. Read naively that is a 9600-hour run.
+        let mut old = run(1, 1, 360, 60, "success");
+        old.updated_at = old.started_at() + Duration::days(400) + Duration::seconds(360);
+        let runs = vec![run(2, 2, 90, 5, "success"), old];
+
+        let mut v = TimingView::new("org/api".into(), 7, "CI".into());
+        v.set_history(points_of(&runs));
+        assert_eq!(v.points.len(), 1, "the housekept run is left off");
+        assert_eq!(v.points[0].secs, 90);
+        assert_eq!(v.unknown, 1, "but it is counted, so the chart can say so");
     }
 
     #[test]

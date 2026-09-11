@@ -1503,14 +1503,14 @@ fn fmt_bytes(n: u64) -> String {
     }
 }
 
-/// Total wall-clock of a run: live-ticking while active, final once done.
+/// Total wall-clock of a run: live-ticking while active, final once done —
+/// or a dash for a run so old GitHub no longer says when it finished.
 fn run_dur(r: &Run) -> String {
-    let start = r.run_started_at.unwrap_or(r.created_at);
     match r.state() {
         RunState::Running | RunState::Queued => {
-            format!("{}…", fmt_dur((Utc::now() - start).num_seconds().max(0)))
+            format!("{}…", fmt_dur((Utc::now() - r.started_at()).num_seconds().max(0)))
         }
-        _ => fmt_dur((r.updated_at - start).num_seconds().max(0)),
+        _ => r.duration_secs().map_or_else(|| "—".to_string(), fmt_dur),
     }
 }
 
@@ -1587,7 +1587,7 @@ fn cell(r: &Run, tag: Option<&RunTag>, col: Column, w: usize, spin: &str) -> Cel
             w,
         )),
         Column::Dur => Cell::from(run_dur(r)).style(dimmed),
-        Column::Age => Cell::from(fmt_age(r.updated_at)).style(dimmed),
+        Column::Age => Cell::from(fmt_age(r.last_activity())).style(dimmed),
     }
 }
 
@@ -2184,6 +2184,72 @@ mod tests {
         // The outlier is marked rather than being allowed to flatten the rest.
         assert!(out.contains("↑"), "the slow run is shown running off the top");
         assert!(out.contains("max 6m32s"), "and the summary still gives its length");
+    }
+
+    #[test]
+    fn a_run_github_has_housekept_shows_no_duration_and_keeps_its_place() {
+        use crate::github::{Run, RunRepo};
+        let mut app = demo_app();
+        // Finished in six minutes 400 days ago; GitHub touched it yesterday when
+        // its logs expired. Read naively it ran for 9600 hours and just finished.
+        let start = Utc::now() - chrono::Duration::days(400);
+        let ancient = Run {
+            id: 9,
+            name: Some("Release".into()),
+            display_title: "ancient".into(),
+            head_branch: Some("main".into()),
+            head_sha: "a1b2c3d".into(),
+            run_number: 12,
+            workflow_id: 11,
+            event: "push".into(),
+            status: "completed".into(),
+            conclusion: Some("success".into()),
+            html_url: String::new(),
+            created_at: start,
+            updated_at: start + chrono::Duration::days(400) + chrono::Duration::minutes(6),
+            run_started_at: Some(start),
+            actor: None,
+            repository: RunRepo { full_name: "org/quiet-one".into() },
+        };
+        app.apply(crate::app::DataMsg::RunsOnly { repo: "org/quiet-one".into(), runs: vec![ancient] });
+
+        // Wide enough for the runs table to show its duration column.
+        let out = screen(&mut app, 160, 14);
+        println!("{out}");
+        let row = out.lines().find(|l| l.contains("Release")).expect("the run is listed");
+        assert!(row.contains("—"), "its duration is a dash, not 9600h: {row}");
+        assert!(row.contains("400d"), "and its age is counted from when it ran: {row}");
+        assert!(!row.contains("9600h"));
+        // It sorts as the oldest run, not the newest, and the sidebar's rollup
+        // says when it last ran rather than when GitHub last touched it.
+        assert_eq!(app.runs.last().map(|r| r.id), Some(9));
+        assert!(out.contains("org/quiet-one     400d"), "the sidebar dates it from its run");
+    }
+
+    #[test]
+    fn the_chart_counts_runs_it_cannot_time_rather_than_plotting_them() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut app = demo_app();
+        app.handle_key(KeyEvent::from(KeyCode::Char('w')));
+        let mut old = past_run(101, 296, 360, 5);
+        old.updated_at = old.started_at() + chrono::Duration::days(400) + chrono::Duration::minutes(6);
+        let runs = vec![past_run(3, 300, 300, 1), past_run(104, 299, 60, 2), old];
+        app.apply(crate::app::DataMsg::WorkflowRuns { workflow_id: 11, runs });
+
+        let out = screen(&mut app, 120, 18);
+        println!("{out}");
+        assert!(out.contains("2 runs over"), "only the runs with a known length are charted");
+        assert!(out.contains("1 with no known duration"), "the one left off is counted");
+        assert!(!out.contains("9600h"));
+
+        // A workflow with nothing left to chart says why, not "no runs".
+        let mut old = past_run(101, 296, 360, 5);
+        old.updated_at = old.started_at() + chrono::Duration::days(400);
+        app.apply(crate::app::DataMsg::WorkflowRuns { workflow_id: 11, runs: vec![old] });
+        let out = screen(&mut app, 120, 18);
+        println!("{out}");
+        assert!(out.contains("past the repo's retention"));
+        assert!(!out.contains("No successful runs"));
     }
 
     #[test]

@@ -1410,7 +1410,7 @@ impl App {
         self.runs
             .iter()
             .filter(|r| r.repository.full_name == repo)
-            .max_by_key(|r| r.updated_at)
+            .max_by_key(|r| r.last_activity())
             .and_then(|r| r.head_branch.clone())
     }
 
