@@ -142,6 +142,9 @@ async fn run(
     let mut last_broad = std::time::Instant::now();
     let mut last_focused = std::time::Instant::now();
     let mut last_live = std::time::Instant::now();
+    // After a dispatch, how often to look for the run GitHub makes of it.
+    let pickup_iv = Duration::from_secs(3);
+    let mut last_pickup = std::time::Instant::now();
     // Re-check the desktop theme periodically so it switches live. Only when
     // the desktop is what we are following: a terminal that answered has told
     // us about the screen we are on, and the desktop must not override it.
@@ -219,6 +222,12 @@ async fn run(
                 {
                     app.queue_focused_refresh();
                     last_focused = std::time::Instant::now();
+                }
+                // Apart from the tiers above: it reads only the dispatched
+                // repos, and stops once their runs show up.
+                if !throttled && app.has_pending_dispatch() && last_pickup.elapsed() >= pickup_iv {
+                    app.queue_dispatch_pickup();
+                    last_pickup = std::time::Instant::now();
                 }
             }
         }
@@ -308,7 +317,7 @@ fn dispatch_commands(app: &mut App, gh: &Github, cfg: &Config, tx: &UnboundedSen
         match cmd {
             Command::FetchRuns { repo } => {
                 let (gh, tx) = (gh.clone(), tx.clone());
-                let per_page = cfg.runs_for(&repo, Some(&repo));
+                let per_page = cfg.runs_for(&repo, app.repos.scope());
                 tokio::spawn(async move {
                     match gh.list_runs(&repo, per_page).await {
                         // NotModified → we already have this repo's deep list.

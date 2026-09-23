@@ -49,6 +49,9 @@ const JOBS_FETCH_DEBOUNCE: Duration = Duration::from_millis(250);
 /// sidebar shouldn't pull a hundred runs for every repo you pass.
 const SCOPE_FETCH_DEBOUNCE: Duration = Duration::from_millis(400);
 
+/// How long a dispatch placeholder waits for GitHub to show the real run.
+const DISPATCH_TTL: chrono::Duration = chrono::Duration::seconds(90);
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Filter {
     All,
@@ -693,6 +696,7 @@ impl App {
     pub(crate) fn push_dispatch_placeholder(
         &mut self,
         repo: &str,
+        workflow_id: u64,
         workflow_name: &str,
         git_ref: &str,
     ) -> u64 {
@@ -706,8 +710,7 @@ impl App {
             head_branch: Some(git_ref.to_string()),
             head_sha: String::new(),
             run_number: 0,
-            // GitHub has not registered the run yet, so it has no workflow id.
-            workflow_id: 0,
+            workflow_id,
             event: "workflow_dispatch".to_string(),
             status: "in_progress".to_string(),
             conclusion: None,
@@ -731,13 +734,13 @@ impl App {
     }
 
     /// Reconcile this repo's placeholders against a fresh refresh: a placeholder
-    /// is dropped once the real run shows up (matched by workflow, newer than the
-    /// dispatch) or once it ages out; otherwise it is re-injected so it survives
-    /// the refresh that just wiped this repo's runs.
+    /// is dropped once the real run shows up (matched by workflow id, newer than
+    /// the dispatch) or once it ages out; otherwise it is re-injected so it
+    /// survives the refresh that just wiped this repo's runs. The id, not the
+    /// name: a workflow with `run-name:` names its runs differently.
     fn reconcile_pending_dispatches(&mut self, repo: &str) {
         let now = Utc::now();
         let slack = chrono::Duration::minutes(2);
-        let ttl = chrono::Duration::seconds(90);
         let runs = &self.runs;
         self.pending_dispatches.retain(|p| {
             if p.repository.full_name != repo {
@@ -746,16 +749,47 @@ impl App {
             let confirmed = runs.iter().any(|r| {
                 r.id != p.id
                     && r.repository.full_name == p.repository.full_name
-                    && r.workflow_name() == p.workflow_name()
+                    && r.workflow_id == p.workflow_id
                     && r.created_at >= p.created_at - slack
             });
-            !confirmed && now - p.created_at < ttl
+            !confirmed && now - p.created_at < DISPATCH_TTL
         });
         for p in &self.pending_dispatches {
             if p.repository.full_name == repo {
                 self.runs.push(p.clone());
             }
         }
+    }
+
+    /// Ask again for the runs of each repo with a dispatch GitHub hasn't shown
+    /// us yet, so the real run replaces its placeholder within seconds rather
+    /// than at the next sweep. A placeholder past `DISPATCH_TTL` is dropped
+    /// here too: its repo's list may never change again to reconcile it.
+    pub fn queue_dispatch_pickup(&mut self) {
+        let now = Utc::now();
+        let expired: Vec<u64> = self
+            .pending_dispatches
+            .iter()
+            .filter(|p| now - p.created_at >= DISPATCH_TTL)
+            .map(|p| p.id)
+            .collect();
+        if !expired.is_empty() {
+            let keep = self.selected_run().map(|r| r.id);
+            self.pending_dispatches.retain(|p| !expired.contains(&p.id));
+            self.runs.retain(|r| !expired.contains(&r.id));
+            self.recompute_view_keeping(keep);
+        }
+        let mut repos: Vec<String> =
+            self.pending_dispatches.iter().map(|p| p.repository.full_name.clone()).collect();
+        repos.sort();
+        repos.dedup();
+        for repo in repos {
+            self.pending.push(Command::FetchRuns { repo });
+        }
+    }
+
+    pub fn has_pending_dispatch(&self) -> bool {
+        !self.pending_dispatches.is_empty()
     }
 
     /// Hand a workflow's runs to the chart, if that's still the one on screen.
@@ -1367,7 +1401,7 @@ mod tests {
     fn a_placeholder_run_is_not_asked_for_jobs() {
         let mut app = App::new(&Config::default());
         app.user = "you".into();
-        let id = app.push_dispatch_placeholder("org/api", "CI", "main");
+        let id = app.push_dispatch_placeholder("org/api", 11, "CI", "main");
         let at = app.view.iter().position(|&i| app.runs[i].id == id).unwrap();
         app.table_state.select(Some(at));
         app.sync_jobs_for_selection();
@@ -1649,7 +1683,7 @@ mod tests {
     fn a_dispatch_with_no_commit_yet_is_not_asked_about() {
         let mut app = App::new(&Config::default());
         app.user = "you".into();
-        app.push_dispatch_placeholder("org/api", "CI", "main");
+        app.push_dispatch_placeholder("org/api", 11, "CI", "main");
         app.table_state.select(Some(0));
         app.pending.clear();
         app.queue_tag_lookups();
@@ -1825,7 +1859,7 @@ mod tests {
     #[test]
     fn dispatch_failure_removes_the_placeholder() {
         let mut app = App::new(&Config::default());
-        let id = app.push_dispatch_placeholder("org/api", "CI", "main");
+        let id = app.push_dispatch_placeholder("org/api", 11, "CI", "main");
         assert!(app.runs.iter().any(|r| r.id == id));
 
         app.apply(DataMsg::DispatchFailed { placeholder_id: id, err: "dispatch: nope".into() });
@@ -1838,7 +1872,7 @@ mod tests {
     #[test]
     fn placeholder_survives_refresh_then_yields_to_the_real_run() {
         let mut app = App::new(&Config::default());
-        let id = app.push_dispatch_placeholder("org/api", "CI", "main");
+        let id = app.push_dispatch_placeholder("org/api", 11, "CI", "main");
 
         // A refresh that doesn't yet include the real run keeps the placeholder.
         app.apply(DataMsg::Runs { repo: "org/api".into(), runs: vec![] });
@@ -1853,5 +1887,44 @@ mod tests {
         assert!(!app.is_placeholder(id), "placeholder reconciled away");
         assert!(!app.runs.iter().any(|r| r.id == id));
         assert!(app.runs.iter().any(|r| r.id == 9_999_999));
+    }
+
+    #[test]
+    fn a_pending_dispatch_asks_for_its_repo_runs_once_per_poll() {
+        let mut app = App::new(&Config::default());
+        app.push_dispatch_placeholder("org/api", 11, "CI", "main");
+        app.push_dispatch_placeholder("org/api", 12, "Deploy", "main");
+        app.pending.clear();
+        app.queue_dispatch_pickup();
+        let asked: Vec<_> = app
+            .pending
+            .iter()
+            .filter(|c| matches!(c, Command::FetchRuns { repo } if repo == "org/api"))
+            .collect();
+        assert_eq!(asked.len(), 1, "one read covers both dispatches");
+    }
+
+    #[test]
+    fn a_dispatch_github_never_shows_is_dropped_after_a_while() {
+        let mut app = App::new(&Config::default());
+        let id = app.push_dispatch_placeholder("org/api", 11, "CI", "main");
+        app.pending_dispatches[0].created_at -= DISPATCH_TTL;
+        app.pending.clear();
+        app.queue_dispatch_pickup();
+        assert!(!app.has_pending_dispatch());
+        assert!(!app.runs.iter().any(|r| r.id == id));
+        assert!(app.pending.is_empty(), "nothing left to look for");
+    }
+
+    /// A workflow with `run-name:` gives its runs that name instead of the
+    /// workflow's, so the real run doesn't carry the name the placeholder has.
+    #[test]
+    fn placeholder_yields_to_a_real_run_named_by_run_name() {
+        let mut app = App::new(&Config::default());
+        let id = app.push_dispatch_placeholder("org/api", 11, "CI", "main");
+        let real = Run { name: Some("CI & Release".into()), ..run_with(9_999_999, "queued", None) };
+        app.apply(DataMsg::Runs { repo: "org/api".into(), runs: vec![real] });
+        assert!(!app.is_placeholder(id), "placeholder reconciled away");
+        assert!(!app.runs.iter().any(|r| r.id == id));
     }
 }

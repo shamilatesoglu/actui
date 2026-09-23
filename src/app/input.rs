@@ -1697,7 +1697,7 @@ impl App {
             .map(|w| w.name.clone())
             .unwrap_or_else(|| "workflow".to_string());
         // Show the run immediately as active, before GitHub registers it.
-        let placeholder_id = self.push_dispatch_placeholder(&repo, &workflow_name, &git_ref);
+        let placeholder_id = self.push_dispatch_placeholder(&repo, workflow_id, &workflow_name, &git_ref);
         self.pending.push(Command::Dispatch {
             repo,
             workflow_id,

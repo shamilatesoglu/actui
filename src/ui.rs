@@ -2532,7 +2532,7 @@ mod tests {
     #[test]
     fn a_dispatch_waiting_on_github_spins_instead_of_showing_a_number() {
         let mut app = demo_app();
-        let id = app.push_dispatch_placeholder("org/api", "Release", "main");
+        let id = app.push_dispatch_placeholder("org/api", 11, "Release", "main");
         app.recompute_view();
         // The placeholder is what the runs list is looking at.
         let at = app.view.iter().position(|&i| app.runs[i].id == id).unwrap();
