@@ -1819,8 +1819,12 @@ mod tests {
         let out = screen(&mut app, 120, 40);
         println!("{out}");
         // The last row of each column has to survive the popup's height.
-        assert!(out.contains("save the log to a file"), "left column is clipped");
-        assert!(out.contains("show repos that failed to load"), "right column is clipped");
+        assert!(out.contains("cancel the job's run"), "left column is clipped");
+        assert!(out.contains("bell + toast when a run finishes"), "right column is clipped");
+        // And the longest rows their column's width.
+        assert!(out.contains("resize a pane; a header edge, a column"), "left rows are cut");
+        assert!(out.contains("⏎ details · o open on GitHub · r reload"), "right rows are cut");
+        assert!(out.contains(concat!("actui ", env!("CARGO_PKG_VERSION"))), "no version");
     }
 
     #[test]

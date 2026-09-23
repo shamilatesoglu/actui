@@ -304,9 +304,11 @@ pub(super) fn draw_errors(f: &mut Frame, app: &App) {
 
 pub(super) fn draw_help(f: &mut Frame) {
     // Two columns so the whole reference fits without clipping on short
-    // terminals (a single column runs ~45 rows).
-    let area = centered(86, 90, f.area());
-    let inner = popup(f, area, "Help", accent());
+    // terminals (a single column runs ~70 rows). Each row is kept short
+    // enough to fit its column at 120 columns wide.
+    let area = centered(96, 94, f.area());
+    let title = format!("Help · actui {}", env!("CARGO_PKG_VERSION"));
+    let inner = popup(f, area, &title, accent());
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -314,70 +316,75 @@ pub(super) fn draw_help(f: &mut Frame) {
 
     let left = Text::from(vec![
         hl("Panes  (Repos ⟷ Runs ⟷ Jobs)"),
-        help_row("Tab", "move focus one pane along"),
+        help_row("Tab / S-Tab", "focus the next / previous pane"),
         help_row("→ / l", "drill in (Repos → Runs → Jobs)"),
-        help_row("← / h / Bksp", "back out (Bksp/Esc go back anywhere)"),
-        help_row("Esc", "clear search, then repo scope, then focus"),
-        help_row("Enter", "Runs: drill to jobs · Jobs: view logs"),
+        help_row("← / h / Bksp", "back out one pane"),
+        help_row("Esc", "clear search, then scope, then focus"),
+        help_row("Enter", "Runs: drill to jobs · Jobs: logs"),
         Line::raw(""),
         hl("Navigation  (acts on the focused pane)"),
         help_row("j / k, ↑ / ↓", "move selection"),
-        help_row("g / G", "jump to top / bottom"),
+        help_row("g / G", "top / bottom (also Home / End)"),
         help_row("PgUp / PgDn", "page up / down"),
-        help_row("mouse", "wheel scroll · click selects / focuses"),
-        help_row("drag a border", "resize any pane; a header edge sizes a column"),
-        help_row("a scrollbar", "drag the thumb · press the track to page"),
-        help_row("=", "put the panes and columns back to defaults"),
+        help_row("mouse", "wheel scrolls · click selects"),
+        help_row("drag a border", "resize a pane; a header edge, a column"),
+        help_row("a scrollbar", "drag the thumb · click track to page"),
+        help_row("=", "reset panes and columns to defaults"),
         Line::raw(""),
         hl("Repos sidebar  (★ = pinned in config)"),
-        help_row("p", "show / hide it — pinned first, then A→Z"),
+        help_row("p", "show / hide the sidebar"),
         help_row("j / k", "scope the runs list to that repo"),
-        help_row("< / >", "narrow / widen it (a long name slides past)"),
+        help_row("< / >", "narrow / widen it"),
         Line::raw(""),
         hl("Logs view"),
-        help_row("j / k", "move cursor"),
-        help_row("← / →", "scroll horizontally"),
-        help_row("Enter / Space", "fold / unfold step (shows duration)"),
+        help_row("j / k, g / G", "move · jump to top / bottom"),
+        help_row("← / →", "scroll sideways"),
+        help_row("⏎ / Space / Tab", "fold / unfold a step"),
         help_row("e / f", "expand all / fold all steps"),
-        help_row("/", "search logs (auto-expands folded hits)"),
-        help_row("n / N", "next / previous match"),
+        help_row("p", "only lines near errors (failed jobs)"),
+        help_row("/  ·  n / N", "search · next / previous match"),
         help_row("s", "save the log to a file"),
+        help_row("Esc / q", "close"),
+        Line::raw(""),
+        hl("Live steps  (the job is still running)"),
+        help_row("⏎ / l", "load the full log if it's ready"),
+        help_row("c", "cancel the job's run"),
     ]);
 
     let right = Text::from(vec![
         hl("Filter & search"),
-        help_row("1 - 5", "All / Running / Queued / Failed / Success"),
-        help_row("[ / ]", "cycle status filter"),
-        help_row("/", "fuzzy search (repo, workflow, branch)"),
+        help_row("1 - 5", "pick a filter tab (All … Success)"),
+        help_row("[ / ]", "previous / next filter tab"),
+        help_row("/", "search repo, workflow, title, branch"),
         Line::raw(""),
-        hl("Actions"),
-        help_row("Enter / l / L", "view logs of selected job (L anywhere)"),
-        help_row("o", "open in browser (job's page, else the run)"),
-        help_row("t", "open the tag / release this run produced"),
-        help_row("d", "dispatch a workflow (workflow_dispatch)"),
-        help_row("  ↳ in Repos", "dispatch in a repo with no runs loaded"),
-        help_row("c", "cancel the selected run"),
-        help_row("x / X", "re-run failed jobs / re-run all"),
+        hl("Actions  (on the selected run)"),
+        help_row("Enter / l / L", "open the job's logs (L from any pane)"),
+        help_row("o", "open on GitHub (the job, else the run)"),
+        help_row("t", "open the tag / release the run made"),
+        help_row("d", "dispatch a workflow"),
+        help_row("  ↳ in Repos", "in that repo, even with no runs"),
+        help_row("  ↳ form", "Tab field · Space/←→ change · ⏎ run"),
+        help_row("  ↳ ref field", "Space / → picks a branch or tag"),
+        help_row("c", "cancel the run"),
+        help_row("x / X", "re-run failed jobs / all jobs"),
         help_row("R", "re-run the selected job"),
-        help_row("a", "approve a held run (fork-PR / environment)"),
-        help_row("  ↳ env review", "Space pick · c comment · ⏎ ok · x reject"),
-        help_row("  ↳ dispatch ref", "Space / → on the ref field picks a ref"),
-        help_row("A", "browse / download run artifacts"),
-        help_row("s", "org runners — or click ⚙ Runners on the tabs row"),
-        help_row("  ↳ in runners", "⏎ details · o open on GitHub · r refresh"),
-        help_row("w", "duration chart of this workflow's good runs"),
-        help_row("  ↳ in durations", "h/l move · ⏎ go to run · [ ] workflow"),
+        help_row("a", "approve a held run"),
+        help_row("  ↳ env review", "Space pick · c comment · ⏎ ok · x no"),
+        help_row("A", "artifacts · ⏎ downloads one"),
+        help_row("s", "self-hosted runners of your orgs"),
+        help_row("  ↳ in runners", "⏎ details · o open on GitHub · r reload"),
+        help_row("w", "duration chart of the run's workflow"),
+        help_row("  ↳ in chart", "h/l move · ⏎ go to run · [ ] workflow"),
+        help_row("", "o open the run · r reload"),
         help_row("v", "failure annotations (file:line)"),
-        help_row("  ↳ in failures", "⏎ jump to log line · o open on GitHub"),
-        help_row("r / F5", "refresh now (auto-refresh is on)"),
+        help_row("  ↳ in failures", "⏎ jump to the log line · o open"),
+        help_row("r / F5", "refresh now (it also auto-refreshes)"),
         help_row("E", "show repos that failed to load"),
-        Line::raw(""),
-        hl("Notifications"),
-        help_row("(auto)", "bell + toast when a watched run finishes"),
         Line::raw(""),
         hl("General"),
         help_row("?", "toggle this help"),
         help_row("q / Ctrl-C", "quit"),
+        help_row("(auto)", "bell + toast when a run finishes"),
     ]);
 
     f.render_widget(Paragraph::new(left), cols[0]);
@@ -550,7 +557,7 @@ fn hl(s: &str) -> Line<'static> {
 
 fn help_row(keys: &str, desc: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("  {keys:<14}"), Style::default().fg(Color::Yellow)),
+        Span::styled(format!("  {keys:<16}"), Style::default().fg(Color::Yellow)),
         Span::raw(desc.to_string()),
     ])
 }
