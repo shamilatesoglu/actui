@@ -222,7 +222,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         Span::styled("  actui ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
         Span::styled(format!("@{}  ", app.user), Style::default().fg(dim())),
         Span::styled(spin, Style::default().fg(Color::Yellow)),
-        chip("●", running, Color::Yellow),
+        chip(SPINNER[app.spinner], running, Color::Yellow),
         chip("○", queued, Color::Cyan),
         chip("●", failed, Color::Red),
         chip("●", success, Color::Green),
@@ -537,7 +537,7 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     // map back to rows.
     let rows: Vec<Row> = app.view.iter().map(|&i| {
         let r = &app.runs[i];
-        let (icon, color) = state_glyph(r.state());
+        let (icon, color) = state_glyph(r.state(), spin);
         let mut cells = vec![Cell::from(Span::styled(icon, Style::default().fg(color)))];
         let tag = app.tag_of(r.id);
         cells.extend(
@@ -594,7 +594,7 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
         .constraints([Constraint::Length(info_h), Constraint::Min(3)])
         .split(inner);
 
-    let (icon, color) = state_glyph(run.state());
+    let (icon, color) = state_glyph(run.state(), SPINNER[app.spinner]);
     // Held-for-approval runs read as "queued"; call it out so `a` makes sense.
     // A dispatch we're still waiting on says so rather than claiming progress.
     let (label, label_color) = if run.is_pending() {
@@ -674,7 +674,7 @@ fn draw_jobs(f: &mut Frame, app: &mut App, area: Rect) {
         .jobs
         .iter()
         .map(|j| {
-            let (icon, color) = status_glyph(&j.status, j.conclusion.as_deref());
+            let (icon, color) = status_glyph(&j.status, j.conclusion.as_deref(), SPINNER[app.spinner]);
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{icon} "), Style::default().fg(color)),
                 Span::raw(truncate(&j.name, 28)),
@@ -1313,7 +1313,7 @@ fn draw_steps_pane(f: &mut Frame, app: &App, area: Rect) {
             .skip(scroll)
             .take(height)
             .map(|(i, s)| {
-                let (icon, color) = status_glyph(&s.status, s.conclusion.as_deref());
+                let (icon, color) = status_glyph(&s.status, s.conclusion.as_deref(), SPINNER[app.spinner]);
                 let running = s.status == "in_progress";
                 let name_style = if running {
                     Style::default().add_modifier(Modifier::BOLD)
@@ -1346,9 +1346,9 @@ fn draw_steps_pane(f: &mut Frame, app: &App, area: Rect) {
 
 /// Status glyph shared by jobs and steps (both carry the same GitHub
 /// `status` + `conclusion` model, so they render identically).
-fn status_glyph(status: &str, conclusion: Option<&str>) -> (&'static str, Color) {
+fn status_glyph(status: &str, conclusion: Option<&str>, spin: &'static str) -> (&'static str, Color) {
     match status {
-        "in_progress" => ("●", Color::Yellow),
+        "in_progress" => (spin, Color::Yellow),
         "queued" | "waiting" | "pending" => ("○", Color::Cyan),
         "completed" => match conclusion {
             Some("success") => ("●", Color::Green),
@@ -1439,10 +1439,11 @@ fn tag_line(t: &RunTag, width: u16) -> Line<'static> {
     Line::from(spans)
 }
 
-fn state_glyph(s: RunState) -> (&'static str, Color) {
-    // Single shape, meaning carried by color (filled = terminal/active, hollow = waiting).
+/// `spin` is the current spinner frame, drawn for a run in progress.
+fn state_glyph(s: RunState, spin: &'static str) -> (&'static str, Color) {
+    // Finished runs share one shape and differ by color; a running one spins.
     match s {
-        RunState::Running => ("●", Color::Yellow),
+        RunState::Running => (spin, Color::Yellow),
         RunState::Queued => ("○", Color::Cyan),
         RunState::Success => ("●", Color::Green),
         RunState::Failure => ("●", Color::Red),
@@ -1765,6 +1766,24 @@ mod tests {
         assert!(out.contains("Repos › Runs › Jobs"), "the breadcrumb gains a level");
         // Unscoped, the runs table keeps its repository column.
         assert!(out.contains("Repository"));
+    }
+
+    #[test]
+    fn sidebar_counts_queued_runs_apart_from_running_ones() {
+        let mut app = demo_app();
+        app.runs[2].status = "queued".into();
+        app.runs[2].conclusion = None;
+        app.recompute_view();
+        let out = screen(&mut app, 120, 14);
+        println!("{out}");
+        let row = |name: &str| out.lines().find(|l| l.contains(name)).unwrap().to_string();
+        assert!(row("│   you/dotfiles").contains("○ 1"), "a queued run is counted as queued");
+        let running = row("★ org/api");
+        assert!(
+            SPINNER.iter().any(|s| running.contains(&format!("{s} 1"))),
+            "a running run spins"
+        );
+        assert!(!running.contains("● 1"));
     }
 
     #[test]

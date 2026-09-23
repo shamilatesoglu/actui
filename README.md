@@ -3,15 +3,15 @@
 A fast, beautiful terminal UI for viewing and managing **GitHub Actions** across all the repos and orgs your account can see — without leaving the keyboard or opening a browser tab.
 
 ```
-╭ actui @you  ● 3  ○ 1  ● 2  ● 44   48 runs ──────────────────────────────── api 99% · updated 12s ╮
+╭ actui @you  ⠹ 3  ○ 1  ● 2  ● 44   48 runs ──────────────────────────────── api 99% · updated 12s ╮
  Repos › Runs › Jobs › Logs
  All  Running  Queued  Failed  Success
 ╭ Repos 1/6 ───────────────╮╭ Runs 1/48 ─────────────────────────────────╮╭ Detail ────────────────╮
-│   All repos        ●3 ●2 ││     Repository    Workflow   Tag      Age  ││● success  #296         │
-│ ★ org/api             ●3 ││▌●  org/api       CI #296     v0.4.0  1m12s ││ release  v0.4.0        │
+│   All repos  ⠹ 3 ○ 1 ● 2 ││     Repository    Workflow   Tag      Age  ││● success  #296         │
+│ ★ org/api            ⠹ 3 ││▌●  org/api       CI #296     v0.4.0  1m12s ││ release  v0.4.0        │
 │   org/infra              ││ ●  org/web       Deploy #88  nightly  42s  ││    repo  org/api       │
-│   org/mobile          ○1 ││ ●  you/dotfiles  lint #5              18s  ││ Jobs ──────────────────│
-│   org/web             ●1 ││ ○  org/mobile    Release #3           3s   ││▌● build        1m12s   │
+│   org/mobile         ○ 1 ││ ●  you/dotfiles  lint #5              18s  ││ Jobs ──────────────────│
+│   org/web            ● 1 ││ ○  org/mobile    Release #3           3s   ││▌● build        1m12s   │
 │   you/dotfiles       12m ││                                            ││ ● test           48s   │
 ╰──────────────────────────╯╰────────────────────────────────────────────╯╰────────────────────────╯
  j/k move · Tab focus · / search · ⏎ jobs · l logs · d dispatch · c cancel · x/X rerun · v failures · p repos · ? help · q quit

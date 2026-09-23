@@ -978,9 +978,11 @@ impl App {
     /// so the main loop can skip redrawing on idle ticks.
     pub fn tick(&mut self) -> bool {
         let mut dirty = false;
-        // A dispatch we haven't seen come back spins in the runs list, so the
-        // frames have to keep coming even when nothing is loading.
-        if self.loading || self.any_pending() {
+        // A dispatch we haven't seen come back and a run in progress both spin
+        // in the runs list, so the frames have to keep coming even when
+        // nothing is loading.
+        let running = self.runs.iter().any(|r| r.state() == RunState::Running);
+        if self.loading || self.any_pending() || running {
             self.spinner = (self.spinner + 1) % 10;
             dirty = true;
         }

@@ -31,12 +31,16 @@ impl Sort {
     }
 }
 
+/// A repo's running, queued and failed runs, and its latest run activity.
+type Tally = (usize, usize, usize, Option<DateTime<Utc>>);
+
 /// One repo row: the repo plus a rollup of its runs.
 pub struct RepoRow {
     pub name: String,
     pub pinned: bool,
-    /// Runs queued or in progress.
-    pub active: usize,
+    /// Runs in progress.
+    pub running: usize,
+    pub queued: usize,
     pub failed: usize,
     /// Latest run activity, for the age column.
     pub last: Option<DateTime<Utc>>,
@@ -167,15 +171,16 @@ impl ReposPane {
     /// list under the cursor while you're moving through it. Alphabetical order
     /// can't shift under you, so it always sorts. The counts update either way.
     pub fn rebuild(&mut self, runs: &[Run], resort: bool, uses: &State) {
-        let mut rollup: HashMap<&str, (usize, usize, Option<DateTime<Utc>>)> = HashMap::new();
+        let mut rollup: HashMap<&str, Tally> = HashMap::new();
         for r in runs {
             let e = rollup.entry(r.repository.full_name.as_str()).or_default();
             match r.state() {
-                RunState::Queued | RunState::Running => e.0 += 1,
-                RunState::Failure => e.1 += 1,
+                RunState::Running => e.0 += 1,
+                RunState::Queued => e.1 += 1,
+                RunState::Failure => e.2 += 1,
                 _ => {}
             }
-            e.2 = e.2.max(Some(r.last_activity()));
+            e.3 = e.3.max(Some(r.last_activity()));
         }
 
         let mut seen: HashSet<&str> = HashSet::new();
@@ -195,11 +200,12 @@ impl ReposPane {
         let mut rows: Vec<RepoRow> = names
             .into_iter()
             .map(|name| {
-                let (active, failed, last) = rollup.get(name).copied().unwrap_or_default();
+                let (running, queued, failed, last) = rollup.get(name).copied().unwrap_or_default();
                 RepoRow {
                     name: name.to_string(),
                     pinned: self.pin_rank(name).is_some(),
-                    active,
+                    running,
+                    queued,
                     failed,
                     last,
                 }

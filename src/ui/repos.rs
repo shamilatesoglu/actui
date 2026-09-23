@@ -17,13 +17,13 @@ pub(super) fn draw_repos(f: &mut Frame, app: &mut App, area: Rect) {
     let w = content.width.saturating_sub(1) as usize;
     let step = app.repos.step;
 
-    let mut lines = vec![row_line("All repos", false, running + queued, failed, None, w, step)];
-    lines.extend(
-        app.repos
-            .rows
-            .iter()
-            .map(|r| row_line(&r.name, r.pinned, r.active, r.failed, r.last, w, step)),
-    );
+    let spin = SPINNER[app.spinner];
+    let all = rollup(running, queued, failed, None, spin);
+    let mut lines = vec![row_line("All repos", false, all, w, step)];
+    lines.extend(app.repos.rows.iter().map(|r| {
+        let right = rollup(r.running, r.queued, r.failed, r.last, spin);
+        row_line(&r.name, r.pinned, right, w, step)
+    }));
     // Something is mid-slide, so the clock has an animation to keep running.
     app.repos.sliding = lines.iter().any(|(_, sliding)| *sliding);
 
@@ -45,31 +45,44 @@ pub(super) fn draw_repos(f: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
-/// One row: a pin marker, the repo, and its rollup right-aligned — active and
-/// failed counts when there are any, else how long ago it last ran. Returns the
-/// line and whether the name had to slide to fit.
-#[allow(clippy::too_many_arguments)]
-fn row_line(
-    name: &str,
-    pinned: bool,
-    active: usize,
+/// A repo's counts, right-aligned on its row: running, queued and failed runs
+/// when there are any, else how long ago it last ran. Each uses the icon its
+/// runs have in the runs list.
+fn rollup(
+    running: usize,
+    queued: usize,
     failed: usize,
     last: Option<DateTime<Utc>>,
-    width: usize,
-    step: usize,
-) -> (Line<'static>, bool) {
+    spin: &str,
+) -> Vec<Span<'static>> {
     let mut right = Vec::new();
-    if active > 0 {
-        right.push(Span::styled(format!("●{active} "), Style::default().fg(Color::Yellow)));
-    }
-    if failed > 0 {
-        right.push(Span::styled(format!("●{failed} "), Style::default().fg(Color::Red)));
+    let counts = [
+        (spin, running, Color::Yellow),
+        ("○", queued, Color::Cyan),
+        ("●", failed, Color::Red),
+    ];
+    for (icon, n, color) in counts {
+        if n > 0 {
+            right.push(Span::styled(format!("{icon} {n} "), Style::default().fg(color)));
+        }
     }
     if right.is_empty() {
         if let Some(ts) = last {
             right.push(Span::styled(format!("{} ", fmt_age(ts)), Style::default().fg(dim())));
         }
     }
+    right
+}
+
+/// One row: a pin marker, the repo, and its `rollup` right-aligned. Returns
+/// the line and whether the name had to slide to fit.
+fn row_line(
+    name: &str,
+    pinned: bool,
+    right: Vec<Span<'static>>,
+    width: usize,
+    step: usize,
+) -> (Line<'static>, bool) {
     let right_w: usize = right.iter().map(|s| s.content.chars().count()).sum();
 
     // Pin column + a space, then the name padded out to where the rollup starts.
