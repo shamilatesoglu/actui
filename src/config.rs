@@ -53,7 +53,7 @@ impl Default for Config {
             live_refresh_secs: 2,
             runs_per_repo: 15,
             scoped_runs: 100,
-            concurrency: 3,
+            concurrency: 10,
             max_repos: 60,
             skip_archived: true,
             include: Vec::new(),

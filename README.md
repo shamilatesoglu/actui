@@ -51,7 +51,7 @@ A fast, beautiful terminal UI for viewing and managing **GitHub Actions** across
   - **Two-tier polling** — a slow *broad sweep* of all repos (`refresh_secs`) catches new/finished runs; the jobs of **every active run** (bounded) poll on the fast cadence (`active_refresh_secs`), and only while something is still running. Idle = almost no traffic.
   - **Conditional requests (ETags)** — every poll sends `If-None-Match`; unchanged resources return `304 Not Modified`, which **doesn't count against the rate limit**.
   - **Automatic back-off** — on a primary or secondary rate limit (`403`/`429`), all polling pauses until `Retry-After`/`X-RateLimit-Reset` clears, shown in the header (`rate-limited · resuming in 42s`). It also eases off when remaining quota is low.
-  - Rate-limit numbers come from response headers (no extra `/rate_limit` request), and concurrency is kept low (default 3) to avoid request bursts.
+  - Rate-limit numbers come from response headers (no extra `/rate_limit` request), and at most `concurrency` repos (default 10) are read at once.
 - **Rate-limit aware** — caps the number of repos scanned so large org memberships don't exhaust your API quota.
 
 ## Install
@@ -82,7 +82,7 @@ refresh_secs        = 45  # auto-refresh interval when everything is idle
 active_refresh_secs = 10  # faster interval while a run is queued/in progress
 runs_per_repo       = 15  # recent runs pulled per repo, across the sweep
 scoped_runs         = 100 # and for the repo the sidebar is scoped to (max 100)
-concurrency         = 8   # repos fetched in parallel
+concurrency         = 10  # repos fetched in parallel
 max_repos           = 60  # cap, from most-recently-pushed repos (0 = no cap)
 skip_archived       = true
 notify              = true  # desktop notification when a watched run finishes

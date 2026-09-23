@@ -11,7 +11,7 @@ async fn main() -> anyhow::Result<()> {
     println!("user: {user}");
     let rl = gh.rate_limit().await?;
     println!("rate: {}/{}", rl.remaining, rl.limit);
-    let repos = match gh.list_repos().await? {
+    let repos = match gh.list_repos(|_| true, 0).await? {
         github::Cond::Modified(r) => r,
         github::Cond::NotModified => gh.cached_repos(),
     };

@@ -255,7 +255,14 @@ impl Github {
     }
 
     /// Repos the user owns or is an org member of (paginated, conditional on page 1).
-    pub async fn list_repos(&self) -> Result<Cond<Vec<Repo>>> {
+    /// Pages come most-recently-pushed first, so reading stops once `want` repos
+    /// pass `keep`; `want` 0 reads them all.
+    pub async fn list_repos(
+        &self,
+        keep: impl Fn(&Repo) -> bool,
+        want: usize,
+    ) -> Result<Cond<Vec<Repo>>> {
+        let enough = |repos: &[Repo]| want > 0 && repos.iter().filter(|r| keep(r)).count() >= want;
         let q = |page: u32| {
             vec![
                 ("per_page", "100".to_string()),
@@ -273,7 +280,7 @@ impl Github {
             Cond::Modified(v) => v,
         };
         let mut repos = first;
-        if repos.len() == 100 {
+        if repos.len() == 100 && !enough(&repos) {
             for page in 2..=10u32 {
                 // A failing later page shouldn't discard the repos we already have.
                 let batch: Vec<Repo> = match self
@@ -289,7 +296,7 @@ impl Github {
                 };
                 let n = batch.len();
                 repos.extend(batch);
-                if n < 100 {
+                if n < 100 || enough(&repos) {
                     break;
                 }
             }

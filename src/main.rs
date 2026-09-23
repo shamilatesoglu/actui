@@ -11,7 +11,7 @@ use app::{App, Command, DataMsg, RunnerGroup};
 use config::Config;
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::{FutureExt, StreamExt};
-use github::{Cond, Github, WfDispatch};
+use github::{Cond, Github, Repo, WfDispatch};
 use std::time::Duration;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
@@ -637,7 +637,8 @@ fn spawn_refresh(
     let tx = tx.clone();
     tokio::spawn(async move {
         // Conditional: on 304 reuse the cached repo list (no quota spent).
-        let repos = match gh.list_repos().await {
+        let keep = |r: &Repo| !(cfg.skip_archived && r.archived) && cfg.keep_repo(&r.full_name);
+        let repos = match gh.list_repos(keep, cfg.max_repos).await {
             Ok(Cond::Modified(r)) => r,
             Ok(Cond::NotModified) => gh.cached_repos(),
             Err(e) => {
@@ -648,11 +649,7 @@ fn spawn_refresh(
         };
         // `list_repos` returns repos sorted by most-recently-pushed, so the cap
         // keeps the repos most likely to have active runs.
-        let mut repos: Vec<_> = repos
-            .into_iter()
-            .filter(|r| !(cfg.skip_archived && r.archived))
-            .filter(|r| cfg.keep_repo(&r.full_name))
-            .collect();
+        let mut repos: Vec<_> = repos.into_iter().filter(|r| keep(r)).collect();
         if cfg.max_repos > 0 {
             repos.truncate(cfg.max_repos);
         }
