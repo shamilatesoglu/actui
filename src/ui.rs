@@ -4,6 +4,8 @@
 
 mod overlays;
 mod repos;
+#[cfg(test)]
+mod screenshot;
 mod timing;
 
 use crate::app::{
