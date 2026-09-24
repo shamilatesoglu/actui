@@ -451,7 +451,7 @@ fn draw_dispatch_form(f: &mut Frame, d: &crate::app::DispatchState, area: Rect) 
         if on {
             Style::default().fg(Color::Black).bg(accent())
         } else {
-            Style::default().fg(Color::White).bg(bg_sel())
+            Style::default().fg(text()).bg(bg_sel())
         }
     };
 

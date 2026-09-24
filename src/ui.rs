@@ -297,7 +297,7 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
         let style = if active {
             Style::default().fg(accent()).add_modifier(Modifier::BOLD)
         } else if reached {
-            Style::default().fg(Color::White)
+            Style::default().fg(text())
         } else {
             Style::default().fg(dim())
         };
