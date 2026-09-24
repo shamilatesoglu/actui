@@ -7,7 +7,7 @@ mod state;
 mod ui;
 
 use anyhow::Result;
-use app::{App, Command, DataMsg, RunnerGroup};
+use app::{App, Command, DataMsg, Fetch, RunnerGroup};
 use config::Config;
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::{FutureExt, StreamExt};
@@ -310,6 +310,8 @@ async fn run(
             }
         }
 
+        // Requests going out dim the rows they read, so that's a new frame.
+        redraw |= !app.pending.is_empty();
         dispatch_commands(&mut app, &gh, &cfg, &tx);
     }
     // Keep the repo use history for the next session.
@@ -362,34 +364,40 @@ fn dispatch_commands(app: &mut App, gh: &Github, cfg: &Config, tx: &UnboundedSen
             Command::FetchRuns { repo } => {
                 let (gh, tx) = (gh.clone(), tx.clone());
                 let per_page = cfg.runs_for(&repo, app.repos.scope());
+                app.start_fetch(Fetch::Runs(repo.clone()));
                 tokio::spawn(async move {
                     match gh.list_runs(&repo, per_page).await {
                         // NotModified → we already have this repo's deep list.
                         Ok(Cond::Modified(runs)) => {
-                            let _ = tx.send(DataMsg::RunsOnly { repo, runs });
+                            let _ = tx.send(DataMsg::RunsOnly { repo: repo.clone(), runs });
                         }
                         Ok(Cond::NotModified) => {}
                         Err(e) => {
                             let _ = tx.send(DataMsg::Error(format!("{repo}: {e}")));
                         }
                     }
+                    let _ = tx.send(DataMsg::Fetched(Fetch::Runs(repo)));
                 });
             }
             Command::Refresh { deep } => {
                 app.loading = true;
+                app.listing_repos = true;
                 spawn_refresh(gh, cfg, tx, deep);
             }
             Command::FetchJobs { repo, run_id } => {
                 let (gh, tx) = (gh.clone(), tx.clone());
+                app.start_fetch(Fetch::Jobs(run_id));
                 tokio::spawn(async move {
                     // NotModified → keep the jobs we already have.
                     if let Ok(Cond::Modified(jobs)) = gh.list_jobs(&repo, run_id).await {
                         let _ = tx.send(DataMsg::Jobs { run_id, jobs });
                     }
+                    let _ = tx.send(DataMsg::Fetched(Fetch::Jobs(run_id)));
                 });
             }
             Command::FetchLogs { repo, job_id, title } => {
                 let (gh, tx) = (gh.clone(), tx.clone());
+                app.start_fetch(Fetch::Logs(job_id));
                 tokio::spawn(async move {
                     match gh.job_logs(&repo, job_id).await {
                         Ok(text) => {
@@ -404,6 +412,7 @@ fn dispatch_commands(app: &mut App, gh: &Github, cfg: &Config, tx: &UnboundedSen
                             let _ = tx.send(DataMsg::Error(format!("logs: {e}")));
                         }
                     }
+                    let _ = tx.send(DataMsg::Fetched(Fetch::Logs(job_id)));
                 });
             }
             Command::FetchAnnotations { run_id, jobs } => {
@@ -711,20 +720,14 @@ fn spawn_refresh(
                 let tx = tx.clone();
                 let per_page = cfg.runs_for(&repo.full_name, deep.as_deref());
                 async move {
-                    match gh.list_runs(&repo.full_name, per_page).await {
-                        Ok(Cond::Modified(runs)) => {
-                            let _ = tx.send(DataMsg::Runs { repo: repo.full_name, runs });
-                        }
-                        Ok(Cond::NotModified) => {
-                            let _ = tx.send(DataMsg::RunsUnchanged);
-                        }
-                        Err(e) => {
-                            let _ = tx.send(DataMsg::RepoError {
-                                repo: repo.full_name,
-                                err: e.to_string(),
-                            });
-                        }
-                    }
+                    let name = repo.full_name;
+                    let msg = match gh.list_runs(&name, per_page).await {
+                        Ok(Cond::Modified(runs)) => DataMsg::Runs { repo: name.clone(), runs },
+                        Ok(Cond::NotModified) => DataMsg::RunsUnchanged,
+                        Err(e) => DataMsg::RepoError { repo: name.clone(), err: e.to_string() },
+                    };
+                    let _ = tx.send(msg);
+                    let _ = tx.send(DataMsg::Fetched(Fetch::Runs(name)));
                 }
             })
             .await;

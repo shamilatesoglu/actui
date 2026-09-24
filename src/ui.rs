@@ -9,7 +9,7 @@ mod screenshot;
 mod timing;
 
 use crate::app::{
-    is_error_line, log_content, App, Bar, Column, Divider, Filter, Focus, Mode, Panes, RunnerRow,
+    is_error_line, log_content, App, Bar, Column, Divider, Fetch, Filter, Focus, Mode, Panes, RunnerRow,
     RunnerStatus, Scrollable,
 };
 use crate::github::{Job, Run, RunState, RunTag, Step};
@@ -43,6 +43,7 @@ pub struct Theme {
     popup_bg: Color,   // popup window fill
     soft_red: Color,   // a guessed error, quieter than a real failure's red
     text: Color,       // the strongest foreground: what stands out from the accent
+    faded: Color,      // a row whose data is being read
 }
 
 impl Theme {
@@ -56,6 +57,7 @@ impl Theme {
             popup_bg: Color::Rgb(30, 31, 48),
             soft_red: Color::Rgb(235, 160, 172),
             text: Color::Rgb(205, 214, 244),
+            faded: Color::Rgb(88, 91, 112),
         }
     }
     pub fn light() -> Self {
@@ -68,6 +70,7 @@ impl Theme {
             popup_bg: Color::Rgb(230, 233, 239),
             soft_red: Color::Rgb(179, 80, 92),
             text: Color::Rgb(76, 79, 105),
+            faded: Color::Rgb(172, 176, 190),
         }
     }
 }
@@ -111,8 +114,29 @@ fn soft_red() -> Color {
 fn text() -> Color {
     theme().text
 }
+fn faded() -> Color {
+    theme().faded
+}
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Repaint the text of list rows whose data is being read in the faded color,
+/// until it's back. Done over what was drawn, so every span fades, whatever
+/// its own color. The terminal's own faint style won't do: on a light
+/// background some terminals draw it darker, not lighter. `fetching` holds one
+/// flag per row, counted from the top of the list; `first` is the row drawn at
+/// the top of `area`.
+fn fade_rows(f: &mut Frame, area: Rect, first: usize, fetching: &[bool]) {
+    let buf = f.buffer_mut();
+    for (y, _) in (area.y..area.bottom())
+        .zip(fetching.iter().skip(first))
+        .filter(|(_, on)| **on)
+    {
+        for x in area.x..area.right() {
+            buf[(x, y)].set_fg(faded());
+        }
+    }
+}
 
 /// Row/list selection highlight: bright when focused, dim when not.
 fn select_style(focused: bool) -> Style {
@@ -563,6 +587,10 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol(if focused { "▌" } else { " " });
 
     f.render_stateful_widget(table, content, &mut app.table_state);
+    let fetching: Vec<bool> = app.view.iter().map(|&i| app.run_fetching(&app.runs[i])).collect();
+    // Below the header row.
+    let rows = Rect { y: content.y + 1, height: content.height.saturating_sub(1), ..content };
+    fade_rows(f, rows, app.table_state.offset(), &fetching);
 
     // Scroll position feedback once the list outgrows the viewport. Rendered
     // after the table so the offset reflects this frame.
@@ -674,6 +702,7 @@ fn draw_jobs(f: &mut Frame, app: &mut App, area: Rect) {
         ])
         .split(inner);
 
+    let jobs_fetching = app.jobs_run_id.is_some_and(|id| app.is_fetching(&Fetch::Jobs(id)));
     let items: Vec<ListItem> = app
         .jobs
         .iter()
@@ -686,11 +715,17 @@ fn draw_jobs(f: &mut Frame, app: &mut App, area: Rect) {
             ]))
         })
         .collect();
+    let fetching: Vec<bool> = app
+        .jobs
+        .iter()
+        .map(|j| jobs_fetching || app.is_fetching(&Fetch::Logs(j.id)))
+        .collect();
 
     let list = List::new(items)
         .highlight_style(select_style(focused))
         .highlight_symbol(if focused { "▌" } else { " " });
     f.render_stateful_widget(list, chunks[0], &mut app.jobs_state);
+    fade_rows(f, chunks[0], app.jobs_state.offset(), &fetching);
 
     // Title + body track the selected job: a log with error-looking lines is
     // titled "Possible Errors · N" and lists every spot one appears. The count
@@ -1746,6 +1781,7 @@ mod tests {
             "shamilatesoglu/actui-experiments".into(),
         ]));
         app.loading = false;
+        app.fetching.clear(); // nothing was really sent for
         // Ignore whatever this machine has saved, so renders are deterministic.
         app.state = crate::state::State::default();
         app.panes = crate::app::Panes::new(&app.state);
@@ -2061,6 +2097,54 @@ mod tests {
         let mut saved = crate::state::State::default();
         app.panes.store(&mut saved);
         assert_eq!(saved.steps_width(), Some(app.panes.steps));
+    }
+
+    /// Whether the cell at (x, y) draws in the faded color.
+    fn faded_at(app: &mut App, w: u16, h: u16, x: u16, y: u16) -> bool {
+        app.sync_layout(w);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        let buf = term.backend().buffer();
+        buf.cell((x, y)).unwrap().fg == faded()
+    }
+
+    #[test]
+    fn rows_being_read_draw_faded_until_their_answer_is_back() {
+        use crate::app::DataMsg;
+        let mut app = demo_app();
+        let out = screen(&mut app, 120, 14);
+        println!("{out}");
+        let (web, dotfiles) = (row_of(&out, "org/web   "), row_of(&out, "you/dotfiles   "));
+        let sidebar_web = row_of(&out, "│   org/web");
+        // A column inside the runs table, past the sidebar.
+        let x = column_of(out.lines().nth(web as usize).unwrap(), "org/web   ") as u16 + 1;
+        assert!(!faded_at(&mut app, 120, 14, x, web), "nothing out yet");
+
+        // A sweep starts: everything waits on the repo list.
+        app.listing_repos = true;
+        assert!(faded_at(&mut app, 120, 14, x, web));
+        assert!(faded_at(&mut app, 120, 14, x, dotfiles));
+
+        // The list is in: each repo stays faded until its own runs come back.
+        app.apply(DataMsg::Repos(vec!["org/web".into(), "you/dotfiles".into()]));
+        app.apply(DataMsg::RunsUnchanged);
+        app.apply(DataMsg::Fetched(Fetch::Runs("you/dotfiles".into())));
+        assert!(faded_at(&mut app, 120, 14, x, web), "org/web is still out");
+        assert!(faded_at(&mut app, 120, 14, 4, sidebar_web), "and so is its sidebar row");
+        assert!(!faded_at(&mut app, 120, 14, x, dotfiles), "you/dotfiles is back");
+
+        app.apply(DataMsg::Fetched(Fetch::Runs("org/web".into())));
+        assert!(!faded_at(&mut app, 120, 14, x, web));
+        assert!(!faded_at(&mut app, 120, 14, 4, sidebar_web));
+
+        // Two reads of one run's jobs: faded until the second is back too.
+        app.start_fetch(Fetch::Jobs(2));
+        app.start_fetch(Fetch::Jobs(2));
+        app.apply(DataMsg::Fetched(Fetch::Jobs(2)));
+        assert!(faded_at(&mut app, 120, 14, x, web));
+        app.apply(DataMsg::Fetched(Fetch::Jobs(2)));
+        assert!(!faded_at(&mut app, 120, 14, x, web));
+        assert!(app.fetching.is_empty());
     }
 
     #[test]

@@ -18,7 +18,7 @@ pub use repos::ReposPane;
 pub use timing::{Layout as TimingLayout, Stats as TimingStats, TimingView};
 use timing::History as TimingHistory;
 pub(crate) use timing::HISTORY as TIMING_HISTORY;
-pub use protocol::{AnnJob, Command, DataMsg};
+pub use protocol::{AnnJob, Command, DataMsg, Fetch};
 pub(crate) use logs::{is_error_line, log_content};
 
 use crate::config::Config;
@@ -188,6 +188,11 @@ pub struct App {
     pub repos_total: usize,
     pub repos_done: usize,
     pub loading: bool,
+    /// A sweep is reading the repo list, so every repo's runs are about to be
+    /// read too.
+    pub listing_repos: bool,
+    /// Requests in flight, counted per piece of data they read.
+    pub fetching: HashMap<Fetch, usize>,
     pub rate: Option<RateLimit>,
     /// Seconds remaining on a rate-limit back-off, if any (for the header).
     pub paused_secs: Option<u64>,
@@ -277,6 +282,8 @@ impl App {
             repos_total: 0,
             repos_done: 0,
             loading: true,
+            listing_repos: true,
+            fetching: HashMap::new(),
             rate: None,
             paused_secs: None,
             last_refresh: None,
@@ -403,6 +410,10 @@ impl App {
         match msg {
             DataMsg::User(u) => self.user = u,
             DataMsg::Repos(names) => {
+                self.listing_repos = false;
+                for name in &names {
+                    self.start_fetch(Fetch::Runs(name.clone()));
+                }
                 self.repos_total = names.len();
                 self.repos.set_known(names);
                 self.resort_repos = true;
@@ -621,8 +632,38 @@ impl App {
             }
             DataMsg::Action(m) => self.set_status(m, false),
             DataMsg::Error(e) => self.set_status(e, true),
-            DataMsg::RefreshDone => self.finish_refresh(),
+            DataMsg::RefreshDone => {
+                self.listing_repos = false;
+                self.finish_refresh();
+            }
+            DataMsg::Fetched(what) => {
+                if let Some(n) = self.fetching.get_mut(&what) {
+                    *n -= 1;
+                    if *n == 0 {
+                        self.fetching.remove(&what);
+                    }
+                }
+            }
         }
+    }
+
+    /// Note a request going out for `what`.
+    pub fn start_fetch(&mut self, what: Fetch) {
+        *self.fetching.entry(what).or_default() += 1;
+    }
+
+    pub fn is_fetching(&self, what: &Fetch) -> bool {
+        self.fetching.contains_key(what)
+    }
+
+    /// True while this repo's runs are being read.
+    pub fn repo_fetching(&self, repo: &str) -> bool {
+        self.listing_repos || self.is_fetching(&Fetch::Runs(repo.to_string()))
+    }
+
+    /// True while this run is being read, on its own or with its repo.
+    pub fn run_fetching(&self, run: &Run) -> bool {
+        self.repo_fetching(&run.repository.full_name) || self.is_fetching(&Fetch::Jobs(run.id))
     }
 
     /// Replace a repo's runs with a freshly read set.

@@ -14,6 +14,18 @@ pub struct AnnJob {
     pub check_run_url: String,
 }
 
+/// Data a request is out reading. The rows showing that data draw dimmed
+/// until the request comes back, however it ends.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum Fetch {
+    /// A repo's runs.
+    Runs(String),
+    /// A run's jobs.
+    Jobs(u64),
+    /// A job's logs.
+    Logs(u64),
+}
+
 /// Messages flowing from async workers into the UI.
 pub enum DataMsg {
     User(String),
@@ -51,6 +63,8 @@ pub enum DataMsg {
     Action(String),
     Error(String),
     RefreshDone,
+    /// A request for this data finished, with or without anything new.
+    Fetched(Fetch),
 }
 
 /// Work requested by the UI, executed by the main loop on the async runtime.

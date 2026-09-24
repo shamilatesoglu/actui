@@ -87,6 +87,7 @@ fn demo() -> App {
             .to_vec(),
     ));
     app.loading = false;
+    app.fetching.clear(); // nothing was really sent for
     app.rate = Some(RateLimit { limit: 5000, remaining: 4950 });
     app.last_refresh = Some(now - Duration::seconds(12));
     app.spinner = 2;

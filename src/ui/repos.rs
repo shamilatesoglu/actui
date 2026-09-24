@@ -19,19 +19,21 @@ pub(super) fn draw_repos(f: &mut Frame, app: &mut App, area: Rect) {
 
     let spin = SPINNER[app.spinner];
     let all = rollup(running, queued, failed, None, spin);
-    let mut lines = vec![row_line("All repos", false, all, w, step)];
+    let mut lines = vec![(row_line("All repos", false, all, w, step), app.listing_repos)];
     lines.extend(app.repos.rows.iter().map(|r| {
         let right = rollup(r.running, r.queued, r.failed, r.last, spin);
-        row_line(&r.name, r.pinned, right, w, step)
+        (row_line(&r.name, r.pinned, right, w, step), app.repo_fetching(&r.name))
     }));
     // Something is mid-slide, so the clock has an animation to keep running.
-    app.repos.sliding = lines.iter().any(|(_, sliding)| *sliding);
+    app.repos.sliding = lines.iter().any(|((_, sliding), _)| *sliding);
 
+    let (lines, fetching): (Vec<_>, Vec<bool>) = lines.into_iter().unzip();
     let items: Vec<ListItem> = lines.into_iter().map(|(l, _)| ListItem::new(l)).collect();
     let list = List::new(items)
         .highlight_style(select_style(focused))
         .highlight_symbol(if focused { "▌" } else { " " });
     f.render_stateful_widget(list, content, &mut app.repos.state);
+    fade_rows(f, content, app.repos.state.offset(), &fetching);
 
     let (rows, offset) = (app.repos.len(), app.repos.state.offset());
     scrollbar(
