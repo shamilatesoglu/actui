@@ -78,6 +78,15 @@ impl Filter {
             Filter::Success => "Success",
         }
     }
+    /// The tab as drawn, with the number key that picks it: " 2 Running ".
+    pub fn tab_title(&self) -> String {
+        let key = Filter::ALL.iter().position(|f| f == self).unwrap_or(0) + 1;
+        format!(" {key} {} ", self.label())
+    }
+    /// Columns the tab takes on screen.
+    pub fn tab_width(&self) -> u16 {
+        self.tab_title().chars().count() as u16
+    }
     fn matches(&self, s: RunState) -> bool {
         match self {
             Filter::All => true,

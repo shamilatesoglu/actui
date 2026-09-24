@@ -237,6 +237,9 @@ impl App {
                 let pos = Position::new(x, y);
                 if self.hit.runners_tab.contains(pos) {
                     self.close_runners();
+                } else if let Some(filt) = self.filter_tab_at(pos) {
+                    self.close_runners();
+                    self.set_filter(filt);
                 } else if self.hit.repos.contains(pos) {
                     // The sidebar is still up beside the runners list, so a
                     // click there takes you back to the runs.
@@ -257,6 +260,9 @@ impl App {
                 } else if self.hit.runners_tab.contains(pos) {
                     self.close_timing();
                     self.open_runners();
+                } else if let Some(filt) = self.filter_tab_at(pos) {
+                    self.close_timing();
+                    self.set_filter(filt);
                 } else if self.hit.repos.contains(pos) {
                     // The sidebar is still up beside the chart, so a click
                     // there takes you back to the runs.
@@ -278,18 +284,9 @@ impl App {
                 } else if self.hit.timing_tab.contains(pos) {
                     self.open_timing();
                     true
-                } else if self.hit.tabs.contains(pos) {
-                    // Map the click to a filter tab by cumulative label width.
-                    let mut x0 = self.hit.tabs.x;
-                    for filt in Filter::ALL {
-                        let w = filt.label().chars().count() as u16 + 2; // " label "
-                        if x < x0 + w {
-                            self.set_filter(filt);
-                            return true;
-                        }
-                        x0 += w;
-                    }
-                    false
+                } else if let Some(filt) = self.filter_tab_at(pos) {
+                    self.set_filter(filt);
+                    true
                 } else if self.hit.repos.contains(pos) {
                     self.click_repo_row(y);
                     true
@@ -317,6 +314,18 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    /// The filter tab under the pointer, if any.
+    fn filter_tab_at(&self, pos: Position) -> Option<Filter> {
+        if !self.hit.tabs.contains(pos) {
+            return None;
+        }
+        let mut right = self.hit.tabs.x;
+        Filter::ALL.into_iter().find(|filt| {
+            right += filt.tab_width();
+            pos.x < right
+        })
     }
 
     /// Select the sidebar row under the pointer.
@@ -369,11 +378,7 @@ impl App {
                 }
             }
             // Filters.
-            KeyCode::Char('1') => self.set_filter(Filter::All),
-            KeyCode::Char('2') => self.set_filter(Filter::Running),
-            KeyCode::Char('3') => self.set_filter(Filter::Queued),
-            KeyCode::Char('4') => self.set_filter(Filter::Failed),
-            KeyCode::Char('5') => self.set_filter(Filter::Success),
+            KeyCode::Char(c @ '1'..='5') => self.set_filter(Filter::ALL[c as usize - '1' as usize]),
             KeyCode::Char('[') => self.cycle_filter(-1),
             KeyCode::Char(']') => self.cycle_filter(1),
             KeyCode::Char('/') => self.mode = Mode::Search,
@@ -1458,6 +1463,11 @@ impl App {
             // Esc/← back out of the detail pane first, then close the view; `q`
             // always closes the whole view.
             KeyCode::Char('q') => self.close_runners(),
+            // A filter tab takes you back to the runs it filters.
+            KeyCode::Char(c @ '1'..='5') => {
+                self.close_runners();
+                self.set_filter(Filter::ALL[c as usize - '1' as usize]);
+            }
             KeyCode::Esc | KeyCode::Backspace | KeyCode::Left => {
                 if self.runners.as_ref().is_some_and(|rv| rv.detail_open) {
                     if let Some(rv) = &mut self.runners {
@@ -1553,6 +1563,11 @@ impl App {
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('w') | KeyCode::Esc | KeyCode::Backspace => {
                 self.close_timing()
+            }
+            // A filter tab takes you back to the runs it filters.
+            KeyCode::Char(c @ '1'..='5') => {
+                self.close_timing();
+                self.set_filter(Filter::ALL[c as usize - '1' as usize]);
             }
             // The chart runs left to right, so the horizontal keys walk it - and
             // so do the list keys this app trains your hands on.

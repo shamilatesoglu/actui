@@ -325,7 +325,7 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
     let elsewhere = app.mode == Mode::Runners || app.mode == Mode::Timing;
     let titles: Vec<Line> = Filter::ALL
         .iter()
-        .map(|filt| Line::from(format!(" {} ", filt.label())))
+        .map(|filt| Line::from(filt.tab_title()))
         .collect();
     let sel = Filter::ALL.iter().position(|x| *x == app.filter).unwrap_or(0);
     // The filter belongs to the runs list, so it stops shouting while another
@@ -339,12 +339,14 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
         .select(sel)
         .style(Style::default().fg(dim()))
         .highlight_style(selected)
+        // No padding: the click mapping counts only the titles' own widths.
+        .padding("", "")
         .divider("");
     f.render_widget(tabs, area);
 
     // The screens pack in from the right, and only while they still clear the
     // filter labels — half a switcher written over "Success" helps nobody.
-    let floor = area.x + Filter::ALL.iter().map(|f| f.label().chars().count() as u16 + 2).sum::<u16>();
+    let floor = area.x + Filter::ALL.iter().map(Filter::tab_width).sum::<u16>();
     let mut right = area.right();
     app.hit.runners_tab =
         screen_tab(f, &mut right, floor, area, " ⚙ Runners  s ", app.mode == Mode::Runners);
@@ -2059,6 +2061,38 @@ mod tests {
         let mut saved = crate::state::State::default();
         app.panes.store(&mut saved);
         assert_eq!(saved.steps_width(), Some(app.panes.steps));
+    }
+
+    #[test]
+    fn a_click_anywhere_on_a_filter_tab_picks_that_tab() {
+        use crate::app::Filter;
+        let mut app = demo_app();
+        let out = screen(&mut app, 120, 14);
+        println!("{out}");
+        let row = row_of(&out, "Running");
+        let line = out.lines().nth(row as usize).unwrap();
+        for filt in Filter::ALL {
+            // Every column of the title as drawn, first to last.
+            let title = filt.tab_title();
+            let start = column_of(line, &title) as u16;
+            for x in start..start + filt.tab_width() {
+                app.filter = Filter::All;
+                app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, row));
+                assert_eq!(app.filter, filt, "column {x} of {title:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_filter_key_leaves_the_runners_view_for_the_runs() {
+        use crate::app::Filter;
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut app = demo_app();
+        app.handle_key(KeyEvent::from(KeyCode::Char('s')));
+        assert!(matches!(app.mode, crate::app::Mode::Runners));
+        app.handle_key(KeyEvent::from(KeyCode::Char('4')));
+        assert!(matches!(app.mode, crate::app::Mode::Normal));
+        assert_eq!(app.filter, Filter::Failed);
     }
 
     #[test]
