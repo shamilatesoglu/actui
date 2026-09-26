@@ -359,7 +359,7 @@ fn spawn_action<F, Fut>(
 
 /// Execute everything the UI queued since the last iteration.
 fn dispatch_commands(app: &mut App, gh: &Github, cfg: &Config, tx: &UnboundedSender<DataMsg>) {
-    for cmd in app.pending.drain(..).collect::<Vec<_>>() {
+    for cmd in std::mem::take(&mut app.pending) {
         match cmd {
             Command::FetchRuns { repo } => {
                 let (gh, tx) = (gh.clone(), tx.clone());
