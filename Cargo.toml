@@ -36,3 +36,12 @@ terminal-colorsaurus = "1"
 [profile.release]
 lto = "thin"
 strip = true
+
+# `cargo binstall actui` fetches the release archives instead of compiling.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }{ archive-suffix }"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"

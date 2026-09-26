@@ -1,0 +1,145 @@
+name: Release
+
+# Runs only when dispatched by hand. Bump `version` in Cargo.toml and push
+# first; this releases whatever version the dispatched commit carries:
+#
+#   1. lint + test, and refuse if the tag v<version> already exists
+#   2. build binaries for macOS, Linux and Windows
+#   3. tag the commit and publish a GitHub release with the archives
+#   4. publish the crate to crates.io (needs the CARGO_REGISTRY_TOKEN secret)
+
+on:
+  workflow_dispatch:
+    inputs:
+      crates_io:
+        description: "Also publish to crates.io"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Read version
+        id: version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+            echo "::error::v$version is already tagged; bump the version in Cargo.toml first"
+            exit 1
+          fi
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --locked
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin,      os: macos-latest }
+          - { target: x86_64-apple-darwin,       os: macos-latest }
+          - { target: x86_64-unknown-linux-gnu,  os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+          - { target: x86_64-pc-windows-msvc,    os: windows-latest }
+    env:
+      NAME: actui-v${{ needs.check.outputs.version }}-${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir "$NAME"
+          cp "target/${{ matrix.target }}/release/actui" README.md LICENSE config.example.toml "$NAME/"
+          tar -czf "$NAME.tar.gz" "$NAME"
+          shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory $env:NAME | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/actui.exe", README.md, LICENSE, config.example.toml $env:NAME
+          Compress-Archive $env:NAME "$env:NAME.zip"
+          $hash = (Get-FileHash "$env:NAME.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $env:NAME.zip" | Out-File -Encoding ascii -NoNewline "$env:NAME.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            ${{ env.NAME }}.*
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Tag and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          gh release create "v$VERSION" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "v$VERSION" \
+            --generate-notes
+
+  crates-io:
+    name: Publish to crates.io
+    needs: release
+    if: inputs.crates_io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::error::Add a CARGO_REGISTRY_TOKEN repository secret to publish to crates.io"
+            exit 1
+          fi
+          cargo publish --locked
