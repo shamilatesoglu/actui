@@ -49,7 +49,8 @@ The token needs the `repo` and `workflow` scopes.
 
 ## Configuration
 
-Optional, in `~/.config/actui/config.toml` (Windows: `%APPDATA%\actui\config.toml`).
+Optional, in `~/.config/actui/config.toml`, or under `$XDG_CONFIG_HOME` if you set it
+(Windows: `%APPDATA%\actui\config.toml`). `actui --help` prints the path it reads.
 The defaults:
 
 ```toml

@@ -39,10 +39,7 @@ pub struct State {
 
 impl State {
     pub fn load() -> Self {
-        let Some(path) = path() else {
-            return Self::default();
-        };
-        let Ok(text) = std::fs::read_to_string(path) else {
+        let Some(text) = crate::config::read("state.toml") else {
             return Self::default();
         };
         toml::from_str(&text).unwrap_or_default()
@@ -133,7 +130,7 @@ impl State {
 }
 
 fn path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("actui").join("state.toml"))
+    Some(crate::config::dir()?.join("state.toml"))
 }
 
 #[cfg(test)]

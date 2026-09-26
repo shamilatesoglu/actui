@@ -1,6 +1,7 @@
 //! Optional config loaded from `~/.config/actui/config.toml`.
 
 use serde::Deserialize;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -68,13 +69,38 @@ impl Default for Config {
     }
 }
 
+/// Where the config and state live: `$XDG_CONFIG_HOME/actui`, else
+/// `~/.config/actui` — on macOS too, where a terminal user looks for it rather
+/// than in `~/Library/Application Support`.
+#[cfg(not(windows))]
+pub fn dir() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| Some(dirs::home_dir()?.join(".config")))?;
+    Some(base.join("actui"))
+}
+
+/// Where the config and state live: `%APPDATA%\actui`.
+#[cfg(windows)]
+pub fn dir() -> Option<PathBuf> {
+    Some(dirs::config_dir()?.join("actui"))
+}
+
+/// Read one of actui's files. Up to 0.7.4 macOS kept them in
+/// `~/Library/Application Support/actui`, so that is the fallback until the
+/// next save writes the file to `dir()`.
+pub fn read(name: &str) -> Option<String> {
+    let legacy = || Some(dirs::config_dir()?.join("actui").join(name));
+    [dir().map(|d| d.join(name)), legacy()]
+        .into_iter()
+        .flatten()
+        .find_map(|path| std::fs::read_to_string(path).ok())
+}
+
 impl Config {
     pub fn load() -> Self {
-        let Some(dir) = dirs::config_dir() else {
-            return Self::default();
-        };
-        let path = dir.join("actui").join("config.toml");
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Some(text) = read("config.toml") else {
             return Self::default();
         };
         toml::from_str(&text).unwrap_or_default()
