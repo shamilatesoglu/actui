@@ -12,11 +12,75 @@ use config::Config;
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::{FutureExt, StreamExt};
 use github::{Cond, Github, Repo, WfDispatch};
+use std::io::IsTerminal;
 use std::time::Duration;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
+/// What the command line asked for.
+#[derive(Debug, PartialEq)]
+enum Cli {
+    Run,
+    Help,
+    Version,
+    /// An argument actui doesn't take.
+    Unknown(String),
+}
+
+fn parse_args(mut args: impl Iterator<Item = String>) -> Cli {
+    match args.next().as_deref() {
+        None => Cli::Run,
+        Some("-h" | "--help") => Cli::Help,
+        Some("-V" | "--version") => Cli::Version,
+        Some(other) => Cli::Unknown(other.to_string()),
+    }
+}
+
+fn help() -> String {
+    let config = config::dir()
+        .map(|d| d.join("config.toml").display().to_string())
+        .unwrap_or_else(|| "(no config directory on this system)".to_string());
+    format!(
+        "actui {version} — GitHub Actions across your repos and orgs, in the terminal
+
+Usage: actui [options]
+
+Options:
+  -h, --help     Print this help
+  -V, --version  Print the version
+
+Auth:    $GITHUB_TOKEN or $GH_TOKEN, else `gh auth token`
+Config:  {config}
+Keys:    press ? inside actui
+
+{repo}",
+        version = env!("CARGO_PKG_VERSION"),
+        repo = env!("CARGO_PKG_REPOSITORY"),
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    match parse_args(std::env::args().skip(1)) {
+        Cli::Run => {}
+        Cli::Help => {
+            println!("{}", help());
+            return Ok(());
+        }
+        Cli::Version => {
+            println!("actui {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Cli::Unknown(arg) => {
+            eprintln!("actui: unexpected argument '{arg}'\nTry 'actui --help'.");
+            std::process::exit(2);
+        }
+    }
+    // Without a terminal on both ends, ratatui can't draw and would panic.
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        eprintln!("actui: needs an interactive terminal");
+        std::process::exit(1);
+    }
+
     let cfg = Config::load();
 
     let token = match github::resolve_token() {
@@ -737,6 +801,20 @@ fn spawn_refresh(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(list: &[&str]) -> Cli {
+        parse_args(list.iter().map(|a| a.to_string()))
+    }
+
+    #[test]
+    fn reads_the_command_line() {
+        assert_eq!(args(&[]), Cli::Run);
+        assert_eq!(args(&["-h"]), Cli::Help);
+        assert_eq!(args(&["--help"]), Cli::Help);
+        assert_eq!(args(&["-V"]), Cli::Version);
+        assert_eq!(args(&["--version"]), Cli::Version);
+        assert_eq!(args(&["--frobnicate"]), Cli::Unknown("--frobnicate".into()));
+    }
 
     #[test]
     fn a_configured_theme_beats_anything_detected() {
