@@ -30,8 +30,12 @@ A terminal UI for GitHub Actions across all the repos and orgs your account can 
 
 ## Install
 
+Prebuilt binaries for macOS, Linux and Windows are on the
+[releases page](https://github.com/shamilatesoglu/actui/releases). Or with Cargo:
+
 ```sh
-cargo install actui
+cargo binstall actui   # fetches the prebuilt binary
+cargo install actui    # builds from source
 ```
 
 ## Auth
@@ -92,4 +96,4 @@ edges to resize.
 
 ## License
 
-MIT
+MIT, see [LICENSE](LICENSE).
