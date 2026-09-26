@@ -18,14 +18,14 @@ skip_archived       = true # ignore archived repos
 # them back.
 sidebar = true
 # Repos kept at the top of it, in this order.
-pinned  = []            # e.g. ["nodos-dev/api", "shamilatesoglu/actui"]
+pinned  = []            # e.g. ["your-org/api", "you/dotfiles"]
 # Order for everything below the pinned repos: "alpha" (A→Z) or "used" (the
 # repos you work in most, decayed week by week).
 sort    = "alpha"
 
 # Only watch repos whose full_name contains one of these substrings.
 # Empty = every repo you own or are an org member of.
-include = []            # e.g. ["nodos-dev/", "shamilatesoglu/actui"]
+include = []            # e.g. ["your-org/", "you/dotfiles"]
 
 # Always drop repos whose full_name contains one of these substrings.
 exclude = []
