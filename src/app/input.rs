@@ -888,10 +888,11 @@ impl App {
         self.select_idx(next);
     }
 
-    fn select_idx(&mut self, i: usize) {
+    pub(super) fn select_idx(&mut self, i: usize) {
         if self.view.is_empty() {
             return;
         }
+        self.cursor_hold = CursorHold::PickedRun;
         self.table_state.select(Some(i.min(self.view.len() - 1)));
         self.sync_jobs_for_selection();
     }
@@ -1639,6 +1640,7 @@ impl App {
         if !self.view.iter().any(|&i| self.runs[i].id == id) {
             self.filter = Filter::All;
         }
+        self.cursor_hold = CursorHold::PickedRun;
         self.recompute_view_keeping(Some(id));
         self.focus = Focus::Runs;
     }

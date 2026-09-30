@@ -98,6 +98,16 @@ impl Filter {
     }
 }
 
+/// What the runs cursor stays on while the list changes under it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CursorHold {
+    /// Nothing picked yet: the cursor stays on the first row, so runs arriving
+    /// during the first load don't push it down the list.
+    TopRow,
+    /// The user put the cursor on a run, and a refresh must not move it off.
+    PickedRun,
+}
+
 /// Which pane the keyboard drives in normal mode.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -163,6 +173,7 @@ pub struct App {
     pub runs: Vec<Run>,
     pub view: Vec<usize>, // indices into `runs`, after filter+search
     pub table_state: TableState,
+    pub cursor_hold: CursorHold,
     pub filter: Filter,
     pub search: String,
     pub mode: Mode,
@@ -266,6 +277,7 @@ impl App {
             runs: Vec::new(),
             view: Vec::new(),
             table_state: TableState::default(),
+            cursor_hold: CursorHold::TopRow,
             filter: Filter::All,
             search: String::new(),
             mode: Mode::Normal,
@@ -624,7 +636,7 @@ impl App {
                 }
             }
             DataMsg::DispatchFailed { placeholder_id, err } => {
-                let keep = self.selected_run().map(|r| r.id);
+                let keep = self.run_to_keep();
                 self.pending_dispatches.retain(|p| p.id != placeholder_id);
                 self.runs.retain(|r| r.id != placeholder_id);
                 self.recompute_view_keeping(keep);
@@ -669,7 +681,7 @@ impl App {
     /// Replace a repo's runs with a freshly read set.
     fn ingest_runs(&mut self, repo: String, runs: Vec<Run>) {
         // Read the cursor's run before the list moves under it.
-        let keep = self.selected_run().map(|r| r.id);
+        let keep = self.run_to_keep();
         self.runs.retain(|r| r.repository.full_name != repo);
         self.runs.extend(runs);
         self.reconcile_pending_dispatches(&repo);
@@ -771,7 +783,7 @@ impl App {
             actor: Some(Actor { login: self.user.clone() }),
             repository: RunRepo { full_name: repo.to_string() },
         };
-        let keep = self.selected_run().map(|r| r.id);
+        let keep = self.run_to_keep();
         self.runs.push(run.clone());
         self.pending_dispatches.push(run);
         self.resort();
@@ -824,7 +836,7 @@ impl App {
             .map(|p| p.id)
             .collect();
         if !expired.is_empty() {
-            let keep = self.selected_run().map(|r| r.id);
+            let keep = self.run_to_keep();
             self.pending_dispatches.retain(|p| !expired.contains(&p.id));
             self.runs.retain(|r| !expired.contains(&r.id));
             self.recompute_view_keeping(keep);
@@ -854,8 +866,16 @@ impl App {
         }
     }
 
+    /// The run the cursor must stay on when the list is rebuilt, if any.
+    fn run_to_keep(&self) -> Option<u64> {
+        match self.cursor_hold {
+            CursorHold::TopRow => None,
+            CursorHold::PickedRun => self.selected_run().map(|r| r.id),
+        }
+    }
+
     pub fn recompute_view(&mut self) {
-        let keep = self.selected_run().map(|r| r.id);
+        let keep = self.run_to_keep();
         self.recompute_view_keeping(keep);
     }
 
@@ -1510,7 +1530,7 @@ mod tests {
         app.runs = vec![at(1, 30), at(2, 20), at(3, 10)];
         app.resort(); // newest first: 3, 2, 1
         app.recompute_view();
-        app.table_state.select(Some(1));
+        app.select_idx(1);
         assert_eq!(app.selected_run().unwrap().id, 2, "the cursor is on run 2");
 
         // The sweep brings a newer run, which lands above the others and shifts
@@ -1527,6 +1547,25 @@ mod tests {
         );
     }
 
+    /// The first load arrives one repo at a time, and a later repo's newer runs
+    /// sort above the ones already shown. Until the user picks a run, the
+    /// cursor stays on the first row instead of riding down with the run it
+    /// happened to land on.
+    #[test]
+    fn runs_arriving_before_a_pick_leave_the_cursor_on_the_top_row() {
+        let mut app = App::new(&Config::default());
+        let at = |repo: &str, id: u64, secs: i64| Run {
+            updated_at: Utc::now() - chrono::Duration::seconds(secs),
+            ..run_in(repo, id)
+        };
+        app.apply(DataMsg::RunsOnly { repo: "org/api".into(), runs: vec![at("org/api", 1, 30)] });
+        assert_eq!(app.table_state.selected(), Some(0));
+
+        app.apply(DataMsg::RunsOnly { repo: "org/web".into(), runs: vec![at("org/web", 2, 10)] });
+        assert_eq!(app.table_state.selected(), Some(0), "still on the top row");
+        assert_eq!(app.selected_run().unwrap().id, 2, "which is now the newer run");
+    }
+
     #[test]
     fn recompute_view_preserves_selection_by_run_id() {
         let mut app = App::new(&Config::default());
@@ -1538,7 +1577,7 @@ mod tests {
         app.recompute_view();
         // Select a run that is NOT at index 0, so preservation is distinguishable
         // from the fall-back-to-0 path.
-        app.table_state.select(Some(1));
+        app.select_idx(1);
         assert_eq!(app.selected_run().unwrap().id, 2);
 
         // (a) A filter that keeps the selected run: selection stays on run 2.
