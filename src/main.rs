@@ -124,7 +124,8 @@ enum Follow {
     Nothing,
     /// The terminal answers when asked for its background.
     Terminal,
-    /// The terminal won't answer, so the desktop setting stands in for it.
+    /// The terminal won't answer, or missed an answer, so the desktop setting
+    /// stands in for it.
     System,
 }
 
@@ -357,8 +358,9 @@ async fn run(
                 Some(_) => {}
                 // A late answer would land in the new stream as keypresses, and
                 // each wait stalls the app, so a terminal that missed once is
-                // not asked again.
-                None => follow = Follow::Nothing,
+                // not asked again. The desktop setting takes over, so the
+                // theme still follows.
+                None => follow = Follow::System,
             }
             events = EventStream::new();
         }
