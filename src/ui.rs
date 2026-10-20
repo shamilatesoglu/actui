@@ -17,7 +17,7 @@ use crate::github::{Job, Run, RunState, RunTag, Step};
 use ansi_to_tui::IntoText;
 use chrono::{DateTime, Utc};
 use overlays::*;
-use prs::draw_prs_pane;
+use prs::{draw_open_pr, draw_prs_pane};
 use repos::draw_repos;
 use timing::draw_timing_pane;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
@@ -467,6 +467,10 @@ fn draw_body(f: &mut Frame, app: &mut App, area: Rect) {
         let (rest, dividers) = draw_sidebar(f, app, area);
         draw_runners_pane(f, app, rest);
         app.panes.record_dividers(&dividers);
+        return;
+    }
+    if app.mode == Mode::Prs && app.prs.open.is_some() {
+        draw_open_pr(f, app, area);
         return;
     }
     if app.mode == Mode::Prs {
@@ -1194,7 +1198,11 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         )
     } else if app.mode == Mode::Prs {
         (
-            owned(&["pull requests", "j/k move", "o open on GitHub", "r refresh"]),
+            if app.prs.open.is_some() {
+                owned(&["Tab next tab", "j/k scroll", "J/K checks", "o open on GitHub", "r refresh"])
+            } else {
+                owned(&["pull requests", "j/k move", "⏎ open", "o open on GitHub", "r refresh"])
+            },
             vec!["Esc back"],
         )
     } else if app.mode == Mode::Timing {
@@ -2413,6 +2421,94 @@ mod tests {
         app.handle_key(KeyEvent::from(KeyCode::Char('P')));
         app.handle_key(KeyEvent::from(KeyCode::Esc));
         assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    fn pr_detail() -> crate::pulls::model::PrDetail {
+        use crate::pulls::model::*;
+        PrDetail {
+            node_id: "PR_7".into(),
+            title: "Fix login".into(),
+            body: "Stops the loop.\n<!-- template -->".into(),
+            author: "ana".into(),
+            url: "https://github.com/org/api/pull/7".into(),
+            head: HeadRef { branch: "main".into(), repo: "org/api".into(), oid: "abc".into() },
+            base_branch: "release".into(),
+            draft: false,
+            labels: vec!["bug".into()],
+            merge_status: MergeStatus::Blocked,
+            reviewers: vec![Reviewer { login: "bob".into(), verdict: Verdict::ChangesRequested }],
+            checks: vec![Check {
+                name: "Unit tests".into(),
+                state: CheckState::Pending,
+                target: CheckTarget::ActionsRun { run_id: 555 },
+            }],
+            comments: vec![],
+            reviews: vec![],
+            threads: vec![],
+            merge_methods: vec![MergeMethod::Squash],
+            queue: QueueState::Queued { position: 2 },
+        }
+    }
+
+    #[test]
+    fn enter_opens_the_pr_overview() {
+        use crate::app::{Command, DataMsg, Mode, PrCommand, PrMsg};
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut app = prs_app();
+        screen(&mut app, 140, 24);
+        app.pending.clear();
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        let pr = match &app.pending[..] {
+            [Command::Pr(PrCommand::FetchDetail(pr))] => pr.clone(),
+            _ => panic!("expected a detail fetch"),
+        };
+        assert_eq!(pr.label(), "org/api#7");
+        let out = screen(&mut app, 140, 24);
+        assert!(out.contains("loading"), "{out}");
+
+        app.apply(DataMsg::Pr(PrMsg::Detail { pr, result: Ok(Box::new(pr_detail())) }));
+        let out = screen(&mut app, 140, 24);
+        println!("{out}");
+        assert!(out.contains("org/api#7  Fix login"));
+        assert!(out.contains("main → release"));
+        assert!(out.contains("blocked: changes requested, queued #2"));
+        assert!(out.contains("Stops the loop."));
+        assert!(!out.contains("template"));
+        assert!(out.contains("Unit tests"));
+        assert!(out.contains("Conversation 0"), "the count of conversation entries");
+        assert!(app.prs.open_checks_pending());
+
+        // Another PR's answer, arriving late, changes nothing.
+        let other = crate::pulls::model::PrRef { repo: "org/api".into(), number: 9 };
+        app.apply(DataMsg::Pr(PrMsg::Detail { pr: other, result: Err("late".into()) }));
+        assert!(screen(&mut app, 140, 24).contains("Unit tests"));
+
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert!(screen(&mut app, 140, 24).contains("Not built yet"));
+        app.pending.clear();
+        app.handle_key(KeyEvent::from(KeyCode::Char('o')));
+        assert!(matches!(&app.pending[..], [Command::OpenUrl(u)] if u == "https://github.com/org/api/pull/7"));
+        app.pending.clear();
+        app.handle_key(KeyEvent::from(KeyCode::Char('r')));
+        assert!(matches!(&app.pending[..], [Command::Pr(PrCommand::FetchDetail(_))]));
+
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Prs));
+        let out = screen(&mut app, 140, 24);
+        assert!(out.contains("Review requested"), "back on the list");
+    }
+
+    #[test]
+    fn a_failed_first_read_of_a_pr_shows_the_error() {
+        use crate::app::{DataMsg, PrMsg};
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut app = prs_app();
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        let pr = app.prs.open.as_ref().unwrap().pr.clone();
+        app.apply(DataMsg::Pr(PrMsg::Detail { pr, result: Err("Could not resolve".into()) }));
+        let out = screen(&mut app, 140, 24);
+        assert!(out.contains("Could not resolve"));
     }
 
     #[test]

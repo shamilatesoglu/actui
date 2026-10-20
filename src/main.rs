@@ -214,6 +214,8 @@ async fn run(
     // After a dispatch, how often to look for the run GitHub makes of it.
     let pickup_iv = Duration::from_secs(3);
     let mut last_pickup = std::time::Instant::now();
+    // The open PR is read again on its own cadence.
+    let mut last_pr = std::time::Instant::now();
     // Re-ask the terminal for its colors periodically so the theme switches
     // live.
     let mut ask_terminal = false;
@@ -298,6 +300,12 @@ async fn run(
                 if !throttled && app.has_pending_dispatch() && last_pickup.elapsed() >= pickup_iv {
                     app.queue_dispatch_pickup();
                     last_pickup = std::time::Instant::now();
+                }
+                // An open PR with checks still running is watched closely.
+                let pr_iv = if app.prs.open_checks_pending() { focused_iv } else { broad_iv };
+                if !throttled && app.prs.open.is_some() && last_pr.elapsed() >= pr_iv.max(floor) {
+                    app.queue_pr_refresh();
+                    last_pr = std::time::Instant::now();
                 }
             }
         }

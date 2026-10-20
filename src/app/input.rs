@@ -215,7 +215,7 @@ impl App {
                 true
             }
             Mode::Prs => {
-                self.prs.list.move_sel(delta);
+                self.move_prs(delta);
                 true
             }
             Mode::Dispatch => {

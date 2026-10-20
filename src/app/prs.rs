@@ -6,8 +6,8 @@ mod protocol;
 
 pub use protocol::{PrCommand, PrMsg};
 
-use super::App;
-use crate::pulls::model::{PrGroup, PrRef, PrSummary};
+use super::{App, Command};
+use crate::pulls::model::{CheckState, PrDetail, PrGroup, PrRef, PrSummary};
 use ratatui::widgets::ListState;
 
 /// Something a request is out reading.
@@ -140,13 +140,110 @@ impl PrList {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PrTab {
+    Overview,
+    Files,
+    Conversation,
+}
+
+impl PrTab {
+    pub const ALL: [PrTab; 3] = [PrTab::Overview, PrTab::Files, PrTab::Conversation];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            PrTab::Overview => "Overview",
+            PrTab::Files => "Files",
+            PrTab::Conversation => "Conversation",
+        }
+    }
+}
+
+/// A PR opened from the list.
+pub struct PrView {
+    pub pr: PrRef,
+    pub detail: Loadable<Box<PrDetail>>,
+    pub tab: PrTab,
+    pub overview_scroll: u16,
+    /// The most the overview text scrolls, as of the last frame.
+    pub overview_max_scroll: u16,
+    pub checks: ListState,
+}
+
+impl PrView {
+    fn new(pr: PrRef) -> Self {
+        PrView {
+            pr,
+            detail: Loadable::Loading,
+            tab: PrTab::Overview,
+            overview_scroll: 0,
+            overview_max_scroll: 0,
+            checks: ListState::default(),
+        }
+    }
+
+    pub fn cycle_tab(&mut self, delta: i32) {
+        let at = PrTab::ALL.iter().position(|t| *t == self.tab).unwrap_or(0) as i32;
+        self.tab = PrTab::ALL[(at + delta).rem_euclid(PrTab::ALL.len() as i32) as usize];
+    }
+
+    pub fn scroll_overview(&mut self, delta: i32) {
+        let next = (self.overview_scroll as i32 + delta).clamp(0, self.overview_max_scroll as i32);
+        self.overview_scroll = next as u16;
+    }
+
+    pub fn move_check(&mut self, delta: i32) {
+        let Loadable::Ready(detail) = &self.detail else { return };
+        let count = detail.checks.len() as i32;
+        if count == 0 {
+            return;
+        }
+        let at = self.checks.selected().unwrap_or(0) as i32;
+        self.checks.select(Some((at + delta).clamp(0, count - 1) as usize));
+    }
+
+    /// Takes in a finished read. A failed refresh leaves what was already
+    /// shown in place.
+    fn set_detail(&mut self, result: Result<Box<PrDetail>, String>) {
+        match result {
+            Ok(detail) => {
+                let kept = self.checks.selected().filter(|&i| i < detail.checks.len());
+                self.checks.select(kept.or(if detail.checks.is_empty() { None } else { Some(0) }));
+                self.detail = Loadable::Ready(detail);
+            }
+            Err(e) if !matches!(self.detail, Loadable::Ready(_)) => self.detail = Loadable::Failed(e),
+            Err(_) => {}
+        }
+    }
+}
+
 /// Everything the PRs screens show.
 #[derive(Default)]
 pub struct PrsState {
     pub list: PrList,
+    /// The PR opened from the list, if any.
+    pub open: Option<PrView>,
+}
+
+impl PrsState {
+    /// Whether the open PR has checks still running, which is when it is
+    /// worth reading again soon.
+    pub fn open_checks_pending(&self) -> bool {
+        match self.open.as_ref().map(|v| &v.detail) {
+            Some(Loadable::Ready(d)) => d.checks.iter().any(|c| c.state == CheckState::Pending),
+            _ => false,
+        }
+    }
 }
 
 impl App {
+    /// Reads the open PR again; the refresh timer calls this.
+    pub fn queue_pr_refresh(&mut self) {
+        if let Some(view) = &self.prs.open {
+            self.pending.push(Command::Pr(PrCommand::FetchDetail(view.pr.clone())));
+        }
+    }
+
     pub(super) fn apply_pr(&mut self, msg: PrMsg) {
         match msg {
             PrMsg::List { group, result } => {
@@ -154,6 +251,18 @@ impl App {
                     self.set_status(format!("{}: {e}", group.title()), true);
                 }
                 self.prs.list.set(group, result);
+            }
+            PrMsg::Detail { pr, result } => {
+                // An answer for a PR that has since been closed or swapped is dropped.
+                if !self.prs.open.as_ref().is_some_and(|v| v.pr == pr) {
+                    return;
+                }
+                if let Err(e) = &result {
+                    self.set_status(format!("{}: {e}", pr.label()), true);
+                }
+                if let Some(view) = &mut self.prs.open {
+                    view.set_detail(result);
+                }
             }
         }
     }

@@ -1,6 +1,6 @@
 //! Keys and clicks on the PRs screens.
 
-use super::PrCommand;
+use super::{PrCommand, PrTab, PrView};
 use crate::app::{App, Command, Filter, Mode};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Position;
@@ -13,19 +13,63 @@ impl App {
     }
 
     fn close_prs(&mut self) {
+        self.prs.open = None;
         self.mode = Mode::Normal;
     }
 
+    fn open_pr(&mut self) {
+        if let Some(pr) = self.prs.list.selected().map(|p| p.pr.clone()) {
+            self.pending.push(Command::Pr(PrCommand::FetchDetail(pr.clone())));
+            self.prs.open = Some(PrView::new(pr));
+        }
+    }
+
+    /// Moves the list cursor, or scrolls the open PR's text (the mouse wheel).
+    pub(in crate::app) fn move_prs(&mut self, delta: i32) {
+        match &mut self.prs.open {
+            Some(view) => view.scroll_overview(delta),
+            None => self.prs.list.move_sel(delta),
+        }
+    }
+
     pub(in crate::app) fn key_prs(&mut self, key: KeyEvent) {
-        // Rows moved by the paging keys.
-        const PAGE: i32 = 10;
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q' | 'P') | KeyCode::Backspace => self.close_prs(),
+            KeyCode::Char('q' | 'P') => self.close_prs(),
             // A filter tab takes you back to the runs it filters.
             KeyCode::Char(c @ '1'..='5') => {
                 self.close_prs();
                 self.set_filter(Filter::ALL[c as usize - '1' as usize]);
             }
+            _ if self.prs.open.is_some() => self.key_open_pr(key),
+            _ => self.key_pr_list(key),
+        }
+    }
+
+    fn key_open_pr(&mut self, key: KeyEvent) {
+        let Some(view) = &mut self.prs.open else { return };
+        match key.code {
+            KeyCode::Esc | KeyCode::Backspace => self.prs.open = None,
+            KeyCode::Tab => view.cycle_tab(1),
+            KeyCode::BackTab => view.cycle_tab(-1),
+            KeyCode::Char('o') => {
+                let url = view.pr.url();
+                self.pending.push(Command::OpenUrl(url));
+            }
+            KeyCode::Char('r') => self.queue_pr_refresh(),
+            KeyCode::Char('j') | KeyCode::Down if view.tab == PrTab::Overview => view.scroll_overview(1),
+            KeyCode::Char('k') | KeyCode::Up if view.tab == PrTab::Overview => view.scroll_overview(-1),
+            KeyCode::Char('J') if view.tab == PrTab::Overview => view.move_check(1),
+            KeyCode::Char('K') if view.tab == PrTab::Overview => view.move_check(-1),
+            _ => {}
+        }
+    }
+
+    fn key_pr_list(&mut self, key: KeyEvent) {
+        // Rows moved by the paging keys.
+        const PAGE: i32 = 10;
+        match key.code {
+            KeyCode::Esc | KeyCode::Backspace => self.close_prs(),
+            KeyCode::Enter => self.open_pr(),
             KeyCode::Char('r') => self.pending.push(Command::Pr(PrCommand::FetchList)),
             KeyCode::Char('o') => {
                 if let Some(pr) = self.prs.list.selected() {
