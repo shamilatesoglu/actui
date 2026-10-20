@@ -1,7 +1,9 @@
 //! What the PRs screens ask the workers for, and what comes back.
 
 use crate::github::Run;
-use crate::pulls::model::{MergeMethod, PrDetail, PrFile, PrGroup, PrRef, PrSummary};
+use crate::pulls::model::{
+    DraftComment, MergeMethod, PrDetail, PrFile, PrGroup, PrRef, PrSummary, ReviewSubmission,
+};
 
 /// Work the PRs screens request from the GitHub worker.
 pub enum PrCommand {
@@ -28,6 +30,12 @@ pub enum PrAction {
     Merge { method: MergeMethod, head_oid: String, delete_branch: Option<String> },
     Enqueue { node_id: String, head_oid: String },
     Dequeue { node_id: String },
+    /// Posts one line comment on its own, outside any review.
+    LineComment { head_oid: String, comment: DraftComment },
+    /// Answers a review thread at once; `comment_id` is the thread's first comment.
+    Reply { comment_id: u64, body: String },
+    SubmitReview { node_id: String, submission: ReviewSubmission },
+    ResolveThread { thread_id: String, resolved: bool },
 }
 
 /// Which change an answer is about.
@@ -41,6 +49,11 @@ pub enum PrActionKind {
     Merge,
     Enqueue,
     Dequeue,
+    LineComment,
+    Reply,
+    SubmitReview,
+    ResolveThread,
+    UnresolveThread,
 }
 
 impl PrAction {
@@ -54,6 +67,11 @@ impl PrAction {
             PrAction::Merge { .. } => PrActionKind::Merge,
             PrAction::Enqueue { .. } => PrActionKind::Enqueue,
             PrAction::Dequeue { .. } => PrActionKind::Dequeue,
+            PrAction::LineComment { .. } => PrActionKind::LineComment,
+            PrAction::Reply { .. } => PrActionKind::Reply,
+            PrAction::SubmitReview { .. } => PrActionKind::SubmitReview,
+            PrAction::ResolveThread { resolved: true, .. } => PrActionKind::ResolveThread,
+            PrAction::ResolveThread { resolved: false, .. } => PrActionKind::UnresolveThread,
         }
     }
 }
@@ -70,6 +88,11 @@ impl PrActionKind {
             PrActionKind::Merge => "Merged",
             PrActionKind::Enqueue => "Added to the merge queue",
             PrActionKind::Dequeue => "Removed from the merge queue",
+            PrActionKind::LineComment => "Line comment posted",
+            PrActionKind::Reply => "Reply posted",
+            PrActionKind::SubmitReview => "Review submitted",
+            PrActionKind::ResolveThread => "Thread resolved",
+            PrActionKind::UnresolveThread => "Thread unresolved",
         }
     }
 }

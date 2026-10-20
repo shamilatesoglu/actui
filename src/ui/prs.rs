@@ -7,14 +7,14 @@ mod overlays;
 mod overview;
 
 use super::*;
-use crate::app::{App, Loadable, PrRow, PrTab, PrView, Scroll};
+use crate::app::{App, Loadable, PendingReview, PrRow, PrTab, PrView, PrsState, ReviewPopup, Scroll};
 use crate::pulls::model::{
     Check, CheckState, CheckTarget, ChecksState, MergeStatus, PrSummary, QueueState, ReviewDecision,
 };
 use conversation::{conversation, draw_conversation};
 use diff::draw_files;
 use overview::draw_overview;
-pub(super) use overlays::{draw_compose, draw_merge_dialog};
+pub(super) use overlays::{draw_compose, draw_merge_dialog, draw_review_popup};
 use ratatui::buffer::Buffer;
 use ratatui::widgets::Widget;
 
@@ -51,7 +51,9 @@ pub(super) fn draw_open_pr(f: &mut Frame, app: &mut App, area: Rect) {
     // The list is hidden, so its rows take no clicks.
     app.hit.prs_pane = Rect::default();
     let spin = SPINNER[app.spinner];
-    let Some(view) = app.prs.open.as_mut() else { return };
+    let PrsState { open, drafts, .. } = &mut app.prs;
+    let Some(view) = open.as_mut() else { return };
+    let review = drafts.get(&view.pr).filter(|d| !d.is_empty());
     let inner = pane(f, area, "Pull request", true).inner(Margin { horizontal: 1, vertical: 0 });
     let [title_row, tabs_row, _, body] = Layout::vertical([
         Constraint::Length(1),
@@ -73,11 +75,12 @@ pub(super) fn draw_open_pr(f: &mut Frame, app: &mut App, area: Rect) {
         title.push(Span::raw(d.title.clone()));
     }
     f.render_widget(Paragraph::new(Line::from(title)), title_row);
-    f.render_widget(Paragraph::new(tab_strip(view.tab, &detail, &view.files.files)), tabs_row);
+    let pending = review.map_or(0, PendingReview::len);
+    f.render_widget(Paragraph::new(tab_strip(view.tab, &detail, &view.files.files, pending)), tabs_row);
 
     // The files come from their own read, so the tab shows without the detail.
     if view.tab == PrTab::Files {
-        draw_files(f, view, body, spin);
+        draw_files(f, view, body, spin, review.map_or(&[], |r| &r.comments));
         view.detail = detail;
         return;
     }
@@ -132,11 +135,13 @@ fn wrapped_rows(lines: &[Line], width: u16) -> usize {
         .map_or(0, |y| y as usize + 1)
 }
 
-/// `Overview  Files  Conversation {n}`, the open tab highlighted.
+/// `Overview  Files  Conversation {n}`, the open tab highlighted, then how
+/// many comments the pending review holds, if there is one.
 fn tab_strip(
     open: PrTab,
     detail: &Loadable<Box<crate::pulls::model::PrDetail>>,
     files: &Loadable<Vec<crate::pulls::model::PrFile>>,
+    pending: usize,
 ) -> Line<'static> {
     let mut spans = Vec::new();
     for tab in PrTab::ALL {
@@ -162,6 +167,9 @@ fn tab_strip(
             Style::default().fg(dim())
         };
         spans.push(Span::styled(label, style));
+    }
+    if pending > 0 {
+        spans.push(Span::styled(format!("   review: {pending} pending"), Style::default().fg(Color::Yellow)));
     }
     Line::from(spans)
 }
@@ -214,10 +222,10 @@ fn pr_line(pr: &PrSummary, width: usize, spin: &'static str) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The footer's hints for an open PR.
-pub(super) fn open_pr_hints(view: &PrView) -> Vec<String> {
-    if view.compose.is_some() {
-        return owned(&["Ctrl+S send", "Esc cancel"]);
+/// The footer's hints for an open PR, whose pending review is `review`.
+pub(super) fn open_pr_hints(view: &PrView, review: Option<&PendingReview>) -> Vec<String> {
+    if let Some(compose) = &view.compose {
+        return owned(compose.target.keys());
     }
     if let Some(dialog) = &view.merge_dialog {
         let mut hints = owned(&["j/k method"]);
@@ -227,9 +235,19 @@ pub(super) fn open_pr_hints(view: &PrView) -> Vec<String> {
         hints.extend(owned(&["⏎ merge", "Esc cancel"]));
         return hints;
     }
+    if let Some(popup) = &view.review_popup {
+        return review_popup_hints(view, popup);
+    }
     let mut hints = match (view.tab, &view.files.diff) {
-        (PrTab::Files, Some(diff)) if diff.searching => owned(&["type to search", "⏎ keep", "Esc drop"]),
-        (PrTab::Files, Some(_)) => owned(&["j/k move", "g/G ends", "/ search", "n/N next match", "h back to files"]),
+        (PrTab::Files, Some(diff)) if diff.searching => return owned(&["type to search", "⏎ keep", "Esc drop"]),
+        (PrTab::Files, Some(diff)) => {
+            let mut hints = owned(&["j/k move", if diff.mark.is_some() { "v clear mark" } else { "v mark" }, "c comment"]);
+            if diff.thread_rows.contains_key(&diff.cursor) {
+                hints.push("⏎ thread".to_string());
+            }
+            hints.extend(owned(&["/ search", "n/N next match", "g/G ends", "h back to files"]));
+            hints
+        }
         (PrTab::Files, None) => owned(&["Tab next tab", "j/k move", "⏎ open diff", "o open on GitHub", "r refresh"]),
         (PrTab::Conversation, _) => {
             owned(&["Tab next tab", "j/k scroll", "c comment", "PgUp/PgDn page", "g/G ends", "o open on GitHub", "r refresh"])
@@ -258,5 +276,28 @@ pub(super) fn open_pr_hints(view: &PrView) -> Vec<String> {
             hints.insert(at, "x re-run failed".to_string());
         }
     }
+    if review.is_some() {
+        hints.push("p pending".to_string());
+    }
+    hints.push("R review".to_string());
     hints
+}
+
+fn review_popup_hints(view: &PrView, popup: &ReviewPopup) -> Vec<String> {
+    match popup {
+        ReviewPopup::Thread(thread) => {
+            let mut hints = owned(&["j/k scroll"]);
+            if thread.thread_ids.len() > 1 {
+                hints.push("n/N thread".to_string());
+            }
+            let resolved = match &view.detail {
+                Loadable::Ready(d) => d.threads.iter().any(|t| Some(&t.id) == thread.thread_ids.get(thread.sel) && t.resolved),
+                _ => false,
+            };
+            hints.extend(owned(&["r reply", if resolved { "x unresolve" } else { "x resolve" }, "Esc close"]));
+            hints
+        }
+        ReviewPopup::Pending { .. } => owned(&["j/k move", "e edit", "d drop", "R submit", "Esc close"]),
+        ReviewPopup::Verdict { .. } => owned(&["j/k verdict", "⏎ write message", "Esc cancel"]),
+    }
 }

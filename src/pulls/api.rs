@@ -33,18 +33,37 @@ fn parse_graphql<T: DeserializeOwned>(body: &str) -> Result<T> {
     }
 }
 
+/// Returns the `data` of a mutation's response. Any error fails it: GitHub
+/// answers a refused mutation with `data` holding a null result next to the
+/// error, which must not read as success.
+fn parse_mutation<T: DeserializeOwned>(body: &str) -> Result<T> {
+    let resp: GraphqlResponse<serde_json::Value> = serde_json::from_str(body).context("bad GraphQL response")?;
+    if let Some(first) = resp.errors.into_iter().next() {
+        return Err(anyhow!(first.message));
+    }
+    let data = resp.data.ok_or_else(|| anyhow!("GraphQL response has no data"))?;
+    serde_json::from_value(data).context("bad GraphQL response")
+}
+
 impl Github {
+    async fn graphql_body(&self, query: &str, variables: serde_json::Value) -> Result<String> {
+        let req = self
+            .client
+            .post(GRAPHQL_URL)
+            .json(&serde_json::json!({ "query": query, "variables": variables }));
+        Ok(ensure_ok(self.send(req).await?).await?.text().await?)
+    }
+
     pub(crate) async fn graphql<T: DeserializeOwned>(
         &self,
         query: &str,
         variables: serde_json::Value,
     ) -> Result<T> {
-        let req = self
-            .client
-            .post(GRAPHQL_URL)
-            .json(&serde_json::json!({ "query": query, "variables": variables }));
-        let body = ensure_ok(self.send(req).await?).await?.text().await?;
-        parse_graphql(&body)
+        parse_graphql(&self.graphql_body(query, variables).await?)
+    }
+
+    pub(crate) async fn mutate<T: DeserializeOwned>(&self, mutation: &str, variables: serde_json::Value) -> Result<T> {
+        parse_mutation(&self.graphql_body(mutation, variables).await?)
     }
 
     /// Lists the open pull requests of one group, most recently updated first.
@@ -584,7 +603,7 @@ impl Github {
     /// Marks a draft ready for review, or turns a ready PR back into a draft.
     pub async fn set_draft(&self, node_id: &str, draft: bool) -> Result<()> {
         let mutation = if draft { CONVERT_TO_DRAFT } else { MARK_READY };
-        self.graphql::<serde_json::Value>(mutation, serde_json::json!({ "id": node_id })).await.map(|_| ())
+        self.mutate::<serde_json::Value>(mutation, serde_json::json!({ "id": node_id })).await.map(|_| ())
     }
 
     /// Merges the base branch into the PR's branch. GitHub refuses if the
@@ -610,12 +629,102 @@ impl Github {
 
     pub async fn enqueue_pr(&self, node_id: &str, head_oid: &str) -> Result<()> {
         let vars = serde_json::json!({ "id": node_id, "oid": head_oid });
-        self.graphql::<serde_json::Value>(ENQUEUE, vars).await.map(|_| ())
+        self.mutate::<serde_json::Value>(ENQUEUE, vars).await.map(|_| ())
     }
 
     pub async fn dequeue_pr(&self, node_id: &str) -> Result<()> {
-        self.graphql::<serde_json::Value>(DEQUEUE, serde_json::json!({ "id": node_id })).await.map(|_| ())
+        self.mutate::<serde_json::Value>(DEQUEUE, serde_json::json!({ "id": node_id })).await.map(|_| ())
     }
+
+    /// Posts one line comment outside any review.
+    pub async fn post_line_comment(&self, pr: &PrRef, head_oid: &str, comment: &DraftComment) -> Result<()> {
+        let url = format!("{REST_URL}/repos/{}/pulls/{}/comments", pr.repo, pr.number);
+        let req = self.client.post(url).json(&line_comment_body(head_oid, comment));
+        ensure_ok(self.send(req).await?).await.map(|_| ())
+    }
+
+    /// Replies to the review thread that starts with `comment_id`.
+    pub async fn reply_to_thread(&self, pr: &PrRef, comment_id: u64, body: &str) -> Result<()> {
+        let url = format!("{REST_URL}/repos/{}/pulls/{}/comments/{comment_id}/replies", pr.repo, pr.number);
+        let req = self.client.post(url).json(&serde_json::json!({ "body": body }));
+        ensure_ok(self.send(req).await?).await.map(|_| ())
+    }
+
+    pub async fn resolve_thread(&self, thread_id: &str, resolved: bool) -> Result<()> {
+        let mutation = if resolved { RESOLVE_THREAD } else { UNRESOLVE_THREAD };
+        self.mutate::<serde_json::Value>(mutation, serde_json::json!({ "id": thread_id })).await.map(|_| ())
+    }
+
+    /// Sends a review with all its comments and replies: starts it as a
+    /// pending review on the given head commit, adds the replies, then submits
+    /// it with the verdict. If a later step fails, the half-made review is
+    /// deleted, since GitHub allows one pending review per person and PR.
+    pub async fn submit_review(&self, node_id: &str, review: &ReviewSubmission) -> Result<()> {
+        let threads: Vec<serde_json::Value> = review.comments.iter().map(draft_thread).collect();
+        let vars = serde_json::json!({ "pr": node_id, "oid": review.head_oid, "threads": threads });
+        let added: AddedReview = self.mutate(ADD_REVIEW, vars).await?;
+        let review_id = added.add_pull_request_review.pull_request_review.id;
+        let finish = async {
+            for reply in &review.replies {
+                let vars = serde_json::json!({ "review": review_id, "thread": reply.thread_id, "body": reply.body });
+                self.mutate::<serde_json::Value>(REPLY_IN_REVIEW, vars).await?;
+            }
+            let vars = serde_json::json!({ "review": review_id, "event": review.event.api_name(), "body": review.body });
+            self.mutate::<serde_json::Value>(SUBMIT_REVIEW, vars).await.map(|_| ())
+        };
+        if let Err(e) = finish.await {
+            // The first error is what the user needs to see, not a failed clean-up.
+            let _ = self.mutate::<serde_json::Value>(DELETE_REVIEW, serde_json::json!({ "review": review_id })).await;
+            return Err(e);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddedReview {
+    add_pull_request_review: AddedReviewPayload,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddedReviewPayload {
+    pull_request_review: NodeId,
+}
+
+#[derive(Deserialize)]
+struct NodeId {
+    id: String,
+}
+
+/// A draft comment as one of `addPullRequestReview`'s threads. A single line
+/// leaves out the start fields.
+fn draft_thread(comment: &DraftComment) -> serde_json::Value {
+    let side = comment.side.api_name();
+    let mut thread = serde_json::json!({ "path": comment.path, "line": comment.span.end(), "side": side, "body": comment.body });
+    if let Some(start) = comment.span.start() {
+        thread["startLine"] = start.into();
+        thread["startSide"] = side.into();
+    }
+    thread
+}
+
+/// The REST body that posts a line comment on its own.
+fn line_comment_body(head_oid: &str, comment: &DraftComment) -> serde_json::Value {
+    let side = comment.side.api_name();
+    let mut body = serde_json::json!({
+        "body": comment.body,
+        "commit_id": head_oid,
+        "path": comment.path,
+        "side": side,
+        "line": comment.span.end(),
+    });
+    if let Some(start) = comment.span.start() {
+        body["start_line"] = start.into();
+        body["start_side"] = side.into();
+    }
+    body
 }
 
 /// The REST address of a branch. Each part of the name is escaped, so a `#`
@@ -635,6 +744,13 @@ const ENQUEUE: &str = "mutation($id: ID!, $oid: GitObjectID!) { enqueuePullReque
 const DEQUEUE: &str = "mutation($id: ID!) { dequeuePullRequest(input: { id: $id }) { clientMutationId } }";
 const MARK_READY: &str = "mutation($id: ID!) { markPullRequestReadyForReview(input: { pullRequestId: $id }) { clientMutationId } }";
 const CONVERT_TO_DRAFT: &str = "mutation($id: ID!) { convertPullRequestToDraft(input: { pullRequestId: $id }) { clientMutationId } }";
+/// Without an `event` the review stays pending, so replies can join it before it is submitted.
+const ADD_REVIEW: &str = "mutation($pr: ID!, $oid: GitObjectID!, $threads: [DraftPullRequestReviewThread!]!) { addPullRequestReview(input: { pullRequestId: $pr, commitOID: $oid, threads: $threads }) { pullRequestReview { id } } }";
+const REPLY_IN_REVIEW: &str = "mutation($review: ID!, $thread: ID!, $body: String!) { addPullRequestReviewThreadReply(input: { pullRequestReviewId: $review, pullRequestReviewThreadId: $thread, body: $body }) { clientMutationId } }";
+const SUBMIT_REVIEW: &str = "mutation($review: ID!, $event: PullRequestReviewEvent!, $body: String!) { submitPullRequestReview(input: { pullRequestReviewId: $review, event: $event, body: $body }) { clientMutationId } }";
+const DELETE_REVIEW: &str = "mutation($review: ID!) { deletePullRequestReview(input: { pullRequestReviewId: $review }) { clientMutationId } }";
+const RESOLVE_THREAD: &str = "mutation($id: ID!) { resolveReviewThread(input: { threadId: $id }) { clientMutationId } }";
+const UNRESOLVE_THREAD: &str = "mutation($id: ID!) { unresolveReviewThread(input: { threadId: $id }) { clientMutationId } }";
 
 #[cfg(test)]
 mod tests {
@@ -661,6 +777,12 @@ mod tests {
             ("CONVERT_TO_DRAFT", CONVERT_TO_DRAFT),
             ("ENQUEUE", ENQUEUE),
             ("DEQUEUE", DEQUEUE),
+            ("ADD_REVIEW", ADD_REVIEW),
+            ("REPLY_IN_REVIEW", REPLY_IN_REVIEW),
+            ("SUBMIT_REVIEW", SUBMIT_REVIEW),
+            ("DELETE_REVIEW", DELETE_REVIEW),
+            ("RESOLVE_THREAD", RESOLVE_THREAD),
+            ("UNRESOLVE_THREAD", UNRESOLVE_THREAD),
         ];
         for (name, op) in operations {
             let open = op.find('(').unwrap_or_else(|| panic!("{name} has no variable list"));
@@ -705,6 +827,38 @@ mod tests {
         let body = r#"{"data":null,"errors":[{"message":"Field 'nope' doesn't exist"}]}"#;
         let err = parse_graphql::<serde_json::Value>(body).unwrap_err();
         assert_eq!(err.to_string(), "Field 'nope' doesn't exist");
+    }
+
+    #[test]
+    fn a_refused_mutation_is_an_error_even_with_data() {
+        let body = r#"{"data":{"markPullRequestReadyForReview":null},
+            "errors":[{"type":"NOT_FOUND","message":"Could not resolve to a node with the global id of 'PR_x'"}]}"#;
+        let err = parse_mutation::<serde_json::Value>(body).unwrap_err();
+        assert_eq!(err.to_string(), "Could not resolve to a node with the global id of 'PR_x'");
+        let ok = r#"{"data":{"addPullRequestReview":{"pullRequestReview":{"id":"PRR_1"}}}}"#;
+        let added: AddedReview = parse_mutation(ok).unwrap();
+        assert_eq!(added.add_pull_request_review.pull_request_review.id, "PRR_1");
+    }
+
+    #[test]
+    fn a_range_comment_carries_its_start_and_a_single_line_does_not() {
+        let comment = |span| DraftComment { path: "src/a.rs".into(), side: Side::Left, span, body: "why?".into() };
+        assert_eq!(
+            draft_thread(&comment(LineSpan::One(12))),
+            serde_json::json!({ "path": "src/a.rs", "line": 12, "side": "LEFT", "body": "why?" })
+        );
+        assert_eq!(
+            draft_thread(&comment(LineSpan::Range { start: 10, end: 12 })),
+            serde_json::json!({ "path": "src/a.rs", "line": 12, "side": "LEFT", "startLine": 10, "startSide": "LEFT", "body": "why?" })
+        );
+        assert_eq!(
+            line_comment_body("abc", &comment(LineSpan::Range { start: 10, end: 12 })),
+            serde_json::json!({
+                "body": "why?", "commit_id": "abc", "path": "src/a.rs",
+                "side": "LEFT", "line": 12, "start_line": 10, "start_side": "LEFT",
+            })
+        );
+        assert!(line_comment_body("abc", &comment(LineSpan::One(3))).get("start_line").is_none());
     }
 
     #[test]

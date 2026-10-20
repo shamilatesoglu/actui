@@ -65,6 +65,10 @@ async fn act(gh: &Github, pr: &PrRef, action: PrAction) -> anyhow::Result<()> {
         }
         PrAction::Enqueue { node_id, head_oid } => gh.enqueue_pr(&node_id, &head_oid).await,
         PrAction::Dequeue { node_id } => gh.dequeue_pr(&node_id).await,
+        PrAction::LineComment { head_oid, comment } => gh.post_line_comment(pr, &head_oid, &comment).await,
+        PrAction::Reply { comment_id, body } => gh.reply_to_thread(pr, comment_id, &body).await,
+        PrAction::SubmitReview { node_id, submission } => gh.submit_review(&node_id, &submission).await,
+        PrAction::ResolveThread { thread_id, resolved } => gh.resolve_thread(&thread_id, resolved).await,
         PrAction::RerunFailed { run_ids } => {
             // Every run gets its turn; the first failure is the one reported.
             let mut first_error = None;

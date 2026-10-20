@@ -50,6 +50,11 @@ impl App {
             self.key_merge_dialog(key);
             return;
         }
+        // And a review box.
+        if self.prs.open.as_ref().is_some_and(|v| v.review_popup.is_some()) {
+            self.key_review_popup(key);
+            return;
+        }
         // So does a search box.
         if let Some(diff) = self.prs.open.as_mut().and_then(|v| v.files.diff.as_mut()).filter(|d| d.searching) {
             key_search_box(diff, key);
@@ -68,7 +73,7 @@ impl App {
     }
 
     fn key_open_pr(&mut self, key: KeyEvent) {
-        if self.key_files(key) {
+        if self.key_review(key) || self.key_files(key) {
             return;
         }
         let Some(view) = &mut self.prs.open else { return };

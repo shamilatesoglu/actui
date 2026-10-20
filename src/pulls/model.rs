@@ -86,7 +86,6 @@ pub struct PrSummary {
 #[derive(Clone, Debug)]
 pub struct PrDetail {
     /// GraphQL node id, used by mutations.
-    #[allow(dead_code)] // nothing mutates yet
     pub node_id: String,
     pub title: String,
     pub body: String,
@@ -113,7 +112,6 @@ pub struct HeadRef {
     pub branch: String,
     /// `owner/name` of the repo the branch lives in; a fork differs from the PR's repo.
     pub repo: String,
-    #[allow(dead_code)] // review comments are placed on this commit
     pub oid: String,
 }
 
@@ -236,6 +234,124 @@ pub enum Side {
     Right,
 }
 
+impl Side {
+    /// The name the APIs take.
+    pub fn api_name(self) -> &'static str {
+        match self {
+            Side::Left => "LEFT",
+            Side::Right => "RIGHT",
+        }
+    }
+}
+
+/// The lines a review comment covers, on one side of the diff.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LineSpan {
+    One(u32),
+    /// `start` is before `end`.
+    Range { start: u32, end: u32 },
+}
+
+impl LineSpan {
+    /// The span between two lines, in either order.
+    pub fn new(a: u32, b: u32) -> LineSpan {
+        match a.cmp(&b) {
+            std::cmp::Ordering::Equal => LineSpan::One(a),
+            std::cmp::Ordering::Less => LineSpan::Range { start: a, end: b },
+            std::cmp::Ordering::Greater => LineSpan::Range { start: b, end: a },
+        }
+    }
+
+    /// The last line, which is where GitHub shows the comment.
+    pub fn end(self) -> u32 {
+        match self {
+            LineSpan::One(line) | LineSpan::Range { end: line, .. } => line,
+        }
+    }
+
+    /// The first line of a range; a single line has none.
+    pub fn start(self) -> Option<u32> {
+        match self {
+            LineSpan::One(_) => None,
+            LineSpan::Range { start, .. } => Some(start),
+        }
+    }
+
+    /// `12`, or `11-12` for a range.
+    pub fn label(self) -> String {
+        match self {
+            LineSpan::One(line) => line.to_string(),
+            LineSpan::Range { start, end } => format!("{start}-{end}"),
+        }
+    }
+}
+
+/// A line comment written into a pending review and not sent yet.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DraftComment {
+    pub path: String,
+    pub side: Side,
+    pub span: LineSpan,
+    pub body: String,
+}
+
+impl DraftComment {
+    /// `src/a.rs:11-12`, with `(old)` for the removed side.
+    pub fn place(&self) -> String {
+        let old = if self.side == Side::Left { " (old)" } else { "" };
+        format!("{}:{}{old}", self.path, self.span.label())
+    }
+}
+
+/// A reply to a review thread, written into a pending review and not sent yet.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DraftReply {
+    pub thread_id: String,
+    pub body: String,
+}
+
+/// The verdict a review is submitted with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReviewEvent {
+    Approve,
+    RequestChanges,
+    Comment,
+}
+
+impl ReviewEvent {
+    /// In the order the verdict picker lists them.
+    pub const ALL: [ReviewEvent; 3] = [ReviewEvent::Approve, ReviewEvent::RequestChanges, ReviewEvent::Comment];
+
+    /// The name GraphQL's `PullRequestReviewEvent` takes.
+    pub fn api_name(self) -> &'static str {
+        match self {
+            ReviewEvent::Approve => "APPROVE",
+            ReviewEvent::RequestChanges => "REQUEST_CHANGES",
+            ReviewEvent::Comment => "COMMENT",
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            ReviewEvent::Approve => "Approve",
+            ReviewEvent::RequestChanges => "Request changes",
+            ReviewEvent::Comment => "Comment",
+        }
+    }
+}
+
+/// Everything a review sends at once.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ReviewSubmission {
+    /// The head commit the comments were written against. GitHub refuses the
+    /// review if the branch has moved since.
+    pub head_oid: String,
+    pub event: ReviewEvent,
+    pub body: String,
+    pub comments: Vec<DraftComment>,
+    pub replies: Vec<DraftReply>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MergeMethod {
     Merge,
@@ -349,5 +465,21 @@ impl PrFile {
             (Some(old), FileStatus::Renamed | FileStatus::Copied) => format!("{old} → {}", self.path),
             _ => self.path.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_span_is_one_line_or_a_sorted_range() {
+        assert_eq!(LineSpan::new(12, 12), LineSpan::One(12));
+        assert_eq!(LineSpan::new(12, 10), LineSpan::Range { start: 10, end: 12 });
+        assert_eq!(LineSpan::new(10, 12), LineSpan::Range { start: 10, end: 12 });
+        assert_eq!((LineSpan::new(12, 10).start(), LineSpan::new(12, 10).end()), (Some(10), 12));
+        assert_eq!(LineSpan::One(3).start(), None);
+        let draft = DraftComment { path: "a.rs".into(), side: Side::Left, span: LineSpan::new(4, 2), body: String::new() };
+        assert_eq!(draft.place(), "a.rs:2-4 (old)");
     }
 }

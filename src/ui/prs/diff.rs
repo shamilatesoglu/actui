@@ -2,18 +2,22 @@
 //! the right. Borrows the palette accessors and `pane` from the `ui` module.
 
 use super::*;
-use crate::app::{DiffLine, DiffView, FilesState, PrView};
-use crate::pulls::model::{FileStatus, PrFile};
+use crate::app::{draft_rows, DiffLine, DiffView, FilesState, PrView};
+use crate::pulls::model::{DraftComment, FileStatus, PrFile};
 use ratatui::widgets::ListState;
 
 /// Widest the file list grows to.
 const LIST_WIDTH: u16 = 40;
-/// Columns the review-thread marker takes in the gutter.
-const MARKER_WIDTH: usize = 4;
+/// Columns the review-thread and draft-comment markers take in the gutter.
+const MARKER_WIDTH: usize = 5;
 /// What a tab character is drawn as.
 const TAB: &str = "    ";
+/// Marks a row that a comment of the pending review is on.
+const DRAFT_MARK: &str = "\u{270E}";
 
-pub(super) fn draw_files(f: &mut Frame, view: &mut PrView, area: Rect, spin: &'static str) {
+/// The Files tab. `drafts` are the pending review's comments, marked on
+/// their rows.
+pub(super) fn draw_files(f: &mut Frame, view: &mut PrView, area: Rect, spin: &'static str, drafts: &[DraftComment]) {
     let FilesState { files, sel, diff, .. } = &mut view.files;
     let files = match files {
         Loadable::Loading => {
@@ -46,7 +50,7 @@ pub(super) fn draw_files(f: &mut Frame, view: &mut PrView, area: Rect, spin: &'s
             let line = Line::styled(format!("{}  Enter opens the diff", file.display_path()), Style::default().fg(dim()));
             f.render_widget(Paragraph::new(line), right);
         }
-        (Some(_), Some(diff)) => draw_diff(f, diff, file, right),
+        (Some(_), Some(diff)) => draw_diff(f, diff, file, drafts, right),
     }
 }
 
@@ -126,7 +130,7 @@ fn search_text(diff: &DiffView) -> Option<String> {
     Some(format!("  /{}{cursor}{found}", diff.search))
 }
 
-fn draw_diff(f: &mut Frame, diff: &mut DiffView, file: &PrFile, area: Rect) {
+fn draw_diff(f: &mut Frame, diff: &mut DiffView, file: &PrFile, drafts: &[DraftComment], area: Rect) {
     let [head, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
     let mut title = vec![Span::styled(file.display_path(), Style::default().add_modifier(Modifier::BOLD))];
     if let Some(search) = search_text(diff) {
@@ -146,10 +150,12 @@ fn draw_diff(f: &mut Frame, diff: &mut DiffView, file: &PrFile, area: Rect) {
     diff.scroll = diff.scroll.min(diff.lines.len().saturating_sub(rows));
 
     let marked = diff.mark.map(|m| m.min(diff.cursor)..=m.max(diff.cursor));
+    let drafted = draft_rows(&diff.lines, drafts, &file.path);
     let end = (diff.scroll + rows).min(diff.lines.len());
     let lines: Vec<Line> = (diff.scroll..end)
         .map(|i| {
             let threads_here = diff.thread_rows.get(&i).map_or(0, Vec::len);
+            let marker = row_marker(threads_here, drafted.contains(&i));
             let style = if i == diff.cursor {
                 select_style(true)
             } else if marked.as_ref().is_some_and(|r| r.contains(&i)) {
@@ -158,14 +164,23 @@ fn draw_diff(f: &mut Frame, diff: &mut DiffView, file: &PrFile, area: Rect) {
                 Style::default()
             };
             let found = diff.matches.binary_search(&i).is_ok();
-            diff_row(diff, i, threads_here, body.width as usize, found).style(style)
+            diff_row(diff, i, marker, body.width as usize, found).style(style)
         })
         .collect();
     f.render_widget(Paragraph::new(lines), body);
 }
 
-/// `{old} {new} {💬n}{+|-| }{text}`, the text cut to the pane.
-fn diff_row(diff: &DiffView, at: usize, thread_count: usize, width: usize, found: bool) -> Line<'static> {
+/// `💬n` for a row with review threads, then `✎` if a draft comment is on it.
+fn row_marker(thread_count: usize, drafted: bool) -> String {
+    let mut marker = if thread_count > 0 { format!("\u{1F4AC}{thread_count}") } else { String::new() };
+    if drafted {
+        marker.push_str(DRAFT_MARK);
+    }
+    marker
+}
+
+/// `{old} {new} {marker}{+|-| }{text}`, the text cut to the pane.
+fn diff_row(diff: &DiffView, at: usize, marker: String, width: usize, found: bool) -> Line<'static> {
     let line = &diff.lines[at];
     let digits = diff.number_width;
     let number = |n: Option<u32>| match n {
@@ -178,7 +193,6 @@ fn diff_row(diff: &DiffView, at: usize, thread_count: usize, width: usize, found
         DiffLine::Removed { old, .. } => (Some(*old), None),
         DiffLine::Hunk(_) | DiffLine::NoNewline => (None, None),
     };
-    let marker = if thread_count > 0 { format!("\u{1F4AC}{thread_count}") } else { String::new() };
     let marker_pad = " ".repeat(MARKER_WIDTH.saturating_sub(Span::raw(marker.clone()).width()));
 
     let (sign, color) = match line {

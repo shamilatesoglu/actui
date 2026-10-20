@@ -73,7 +73,7 @@ fn conversation_lines(d: &PrDetail) -> Vec<Line<'static>> {
     lines
 }
 
-fn thread_lines(t: &ReviewThread, lines: &mut Vec<Line<'static>>) {
+pub(super) fn thread_lines(t: &ReviewThread, lines: &mut Vec<Line<'static>>) {
     let place = match t.line {
         Some(n) => format!("{}:{n}", t.path),
         None => t.path.clone(),

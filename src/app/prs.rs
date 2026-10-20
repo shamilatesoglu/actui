@@ -1,22 +1,25 @@
 //! The pull request screens' state. Key handling is in `input`, the worker
-//! protocol in `protocol`.
+//! protocol in `protocol`, reviewing in `review`.
 
 mod compose;
 mod diff;
 mod input;
 mod merge;
 mod protocol;
+mod review;
 
 pub use compose::{Compose, ComposeTarget};
-pub use diff::{DiffLine, DiffView, FilesState};
+pub use diff::{draft_rows, DiffLine, DiffView, FilesState};
 pub use merge::MergeDialog;
 pub use protocol::{PrAction, PrActionKind, PrCommand, PrMsg};
+pub use review::{PendingReview, ReviewPopup, ThreadPopup};
 
 use super::{App, Command, CursorHold, Focus, Mode};
 use crate::github::Run;
 use crate::pulls::model::{CheckState, PrDetail, PrGroup, PrRef, PrSummary};
 use ratatui::text::Line;
 use ratatui::widgets::ListState;
+use std::collections::HashMap;
 
 /// Something a request is out reading.
 #[derive(Default)]
@@ -254,6 +257,8 @@ pub struct PrView {
     pub compose: Option<Compose>,
     /// The box that picks how to merge, if one is open.
     pub merge_dialog: Option<MergeDialog>,
+    /// The review box open over the PR, if any.
+    pub review_popup: Option<ReviewPopup>,
     /// What was sent from a box and has no answer yet, kept so a failure can
     /// put it back.
     pub inflight: Option<(ComposeTarget, String)>,
@@ -271,6 +276,7 @@ impl PrView {
             files: FilesState::default(),
             compose: None,
             merge_dialog: None,
+            review_popup: None,
             inflight: None,
         }
     }
@@ -346,6 +352,8 @@ pub struct PrsState {
     pub open: Option<PrView>,
     /// Set while the runs screen shows a check's run, so Esc can come back.
     pub jump: Option<RunJump>,
+    /// Each PR's review being written, kept while the user moves around.
+    pub drafts: HashMap<PrRef, PendingReview>,
 }
 
 impl PrsState {
@@ -496,6 +504,11 @@ impl App {
             Err(e) => self.set_status(format!("{}: {e}", pr.label()), true),
         }
         let merged = kind == PrActionKind::Merge && result.is_ok();
+        // Only a review that went through ends the drafts; a failed one keeps
+        // them to send again.
+        if kind == PrActionKind::SubmitReview && result.is_ok() {
+            self.prs.drafts.remove(&pr);
+        }
         let Some(view) = self.prs.open.as_mut().filter(|v| v.pr == pr) else {
             // The list still shows a PR merged after its view was closed.
             if merged {
@@ -503,7 +516,7 @@ impl App {
             }
             return;
         };
-        if let Some((target, text)) = view.inflight.take_if(|(target, _)| target.sends() == kind) {
+        if let Some((target, text)) = view.inflight.take_if(|(target, _)| target.sends() == Some(kind)) {
             if result.is_err() {
                 view.compose = Some(Compose::new(target, &text));
             }
@@ -525,7 +538,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent};
     use chrono::Utc;
 
-    fn summary(repo: &str, n: u64) -> PrSummary {
+    pub(super) fn summary(repo: &str, n: u64) -> PrSummary {
         PrSummary {
             pr: PrRef { repo: repo.into(), number: n },
             node_id: format!("PR_{n}"),
@@ -560,7 +573,7 @@ mod tests {
     }
 
     /// An app showing a PR whose only check is Actions run 555.
-    fn app_on_a_pr_with_a_run_check() -> App {
+    pub(super) fn app_on_a_pr_with_a_run_check() -> App {
         use crate::pulls::model::*;
         let mut app = App::new(&crate::config::Config::default());
         let pr = PrRef { repo: "org/api".into(), number: 7 };
@@ -594,7 +607,7 @@ mod tests {
         app
     }
 
-    fn press(app: &mut App, code: KeyCode) {
+    pub(super) fn press(app: &mut App, code: KeyCode) {
         app.handle_key(KeyEvent::from(code));
     }
 
@@ -695,17 +708,17 @@ mod tests {
         assert!(app.status_msg.as_ref().is_some_and(|(m, _, _)| m == "That check has no page to open"));
     }
 
-    fn type_text(app: &mut App, text: &str) {
+    pub(super) fn type_text(app: &mut App, text: &str) {
         for c in text.chars() {
             press(app, KeyCode::Char(c));
         }
     }
 
-    fn ctrl_s(app: &mut App) {
+    pub(super) fn ctrl_s(app: &mut App) {
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), crossterm::event::KeyModifiers::CONTROL));
     }
 
-    fn edit_detail(app: &mut App, edit: impl FnOnce(&mut PrDetail)) {
+    pub(super) fn edit_detail(app: &mut App, edit: impl FnOnce(&mut PrDetail)) {
         if let Some(Loadable::Ready(d)) = app.prs.open.as_mut().map(|v| &mut v.detail) {
             edit(d);
         }

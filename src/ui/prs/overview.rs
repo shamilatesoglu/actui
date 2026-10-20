@@ -264,6 +264,7 @@ mod tests {
             files: Default::default(),
             compose: None,
             merge_dialog: None,
+            review_popup: None,
             inflight: None,
         };
         let draw = |view: &mut PrView| {

@@ -2,9 +2,9 @@
 //! lookups the diff viewer needs.
 
 use super::Loadable;
-use crate::pulls::model::{PrFile, ReviewThread, Side};
+use crate::pulls::model::{DraftComment, PrFile, ReviewThread, Side};
 use ratatui::widgets::ListState;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// One row of a diff.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,7 +20,6 @@ pub enum DiffLine {
 
 impl DiffLine {
     /// The side and line number a review comment on this row attaches to.
-    #[allow(dead_code)] // posting comments uses it
     pub fn anchor(&self) -> Option<(Side, u32)> {
         match self {
             DiffLine::Removed { old, .. } => Some((Side::Left, *old)),
@@ -81,22 +80,36 @@ pub fn parse_patch(patch: &str) -> Vec<DiffLine> {
     rows
 }
 
+/// The row that shows `line` of `side`, if the diff has it.
+fn row_of(lines: &[DiffLine], side: Side, line: u32) -> Option<usize> {
+    lines.iter().position(|row| match (side, row) {
+        (Side::Left, DiffLine::Removed { old, .. } | DiffLine::Context { old, .. }) => *old == line,
+        (Side::Right, DiffLine::Added { new, .. } | DiffLine::Context { new, .. }) => *new == line,
+        _ => false,
+    })
+}
+
 /// Which diff rows carry review threads: row index to thread indices. A
 /// thread whose lines are gone has no row.
 pub fn thread_rows(lines: &[DiffLine], threads: &[ReviewThread], path: &str) -> HashMap<usize, Vec<usize>> {
     let mut rows: HashMap<usize, Vec<usize>> = HashMap::new();
     for (i, thread) in threads.iter().enumerate() {
         let Some(line) = thread.line.filter(|_| thread.path == path) else { continue };
-        let at = lines.iter().position(|row| match (thread.side, row) {
-            (Side::Left, DiffLine::Removed { old, .. } | DiffLine::Context { old, .. }) => *old == line,
-            (Side::Right, DiffLine::Added { new, .. } | DiffLine::Context { new, .. }) => *new == line,
-            _ => false,
-        });
-        if let Some(at) = at {
+        if let Some(at) = row_of(lines, thread.side, line) {
             rows.entry(at).or_default().push(i);
         }
     }
     rows
+}
+
+/// Which diff rows carry draft comments: the last line of each one's span,
+/// where GitHub will show it.
+pub fn draft_rows(lines: &[DiffLine], drafts: &[DraftComment], path: &str) -> HashSet<usize> {
+    drafts
+        .iter()
+        .filter(|d| d.path == path)
+        .filter_map(|d| row_of(lines, d.side, d.span.end()))
+        .collect()
 }
 
 /// An open diff.
@@ -106,7 +119,7 @@ pub struct DiffView {
     pub lines: Vec<DiffLine>,
     pub cursor: usize,
     pub scroll: usize,
-    /// The other end of a marked range, set when comments arrive.
+    /// The row a range comment starts from, set with `v`; the cursor is its other end.
     pub mark: Option<usize>,
     pub search: String,
     /// The search box is taking keys.

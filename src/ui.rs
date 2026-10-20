@@ -267,6 +267,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_tabs(f, app, chunks[1]);
     draw_body(f, app, chunks[2]);
     draw_footer(f, app, chunks[3]);
+    prs::draw_review_popup(f, app);
     prs::draw_compose(f, app);
     prs::draw_merge_dialog(f, app);
 
@@ -1201,7 +1202,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     } else if app.shows_prs() {
         (
             if let Some(view) = &app.prs.open {
-                prs::open_pr_hints(view)
+                prs::open_pr_hints(view, app.prs.review_of(&view.pr))
             } else {
                 owned(&["pull requests", "j/k move", "⏎ open", "o open on GitHub", "r refresh"])
             },
@@ -2971,6 +2972,74 @@ mod tests {
         assert!(row.contains('\u{1F4AC}'), "{row}");
         let other = out.lines().find(|l| l.contains("-a")).unwrap();
         assert!(!other.contains('\u{1F4AC}'));
+    }
+
+    fn ctrl(app: &mut App, c: char) {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn a_draft_comment_is_marked_on_its_row_and_counted_beside_the_tabs() {
+        use crossterm::event::KeyCode;
+        let mut app = files_app(vec![pr_file("a.rs", Some("@@ -1 +1 @@\n-a\n+b"))]);
+        press(&mut app, KeyCode::Enter);
+        let out = screen(&mut app, 200, 24);
+        assert!(out.contains("v mark") && out.contains("c comment") && out.contains("R review"), "{out}");
+        assert!(!out.contains("p pending") && !out.contains("pending"));
+
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('c'));
+        let out = screen(&mut app, 200, 30);
+        assert!(out.contains("Comment on a.rs:1"), "{out}");
+        assert!(out.contains("Ctrl+S add to review · Ctrl+G post alone · Esc cancel"), "{out}");
+        type_text(&mut app, "note");
+        ctrl(&mut app, 's');
+        app.status_msg = None;
+
+        let out = screen(&mut app, 200, 24);
+        let row = out.lines().find(|l| l.contains("+b")).unwrap();
+        assert!(row.contains('\u{270E}'), "{row}");
+        assert!(!out.lines().find(|l| l.contains("-a")).unwrap().contains('\u{270E}'));
+        assert!(out.contains("review: 1 pending"), "{out}");
+        assert!(out.contains("p pending"), "{out}");
+        assert!(out.lines().all(|l| l.chars().count() == 200), "the marker keeps the rows aligned");
+    }
+
+    #[test]
+    fn the_review_boxes_draw_over_the_pr() {
+        use crossterm::event::KeyCode;
+        let mut detail = pr_detail();
+        detail.threads = vec![thread_at("a.rs", Some(1), false)];
+        let mut app = files_app_with(vec![pr_file("a.rs", Some("@@ -1 +1 @@\n-a\n+b"))], detail);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        assert!(screen(&mut app, 200, 24).contains("⏎ thread"));
+
+        press(&mut app, KeyCode::Enter);
+        let out = screen(&mut app, 140, 30);
+        assert!(out.contains("Review thread"), "{out}");
+        assert!(out.contains("Why this?"), "{out}");
+        assert!(out.contains("j/k scroll · r reply · x resolve · Esc close"), "{out}");
+        press(&mut app, KeyCode::Esc);
+
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "Rename it");
+        ctrl(&mut app, 's');
+        press(&mut app, KeyCode::Char('p'));
+        let out = screen(&mut app, 140, 30);
+        assert!(out.contains("Pending review of org/api#7"), "{out}");
+        assert!(out.contains("› a.rs:1  Rename it"), "{out}");
+        press(&mut app, KeyCode::Char('R'));
+        let out = screen(&mut app, 140, 30);
+        assert!(out.contains("Review org/api#7"), "{out}");
+        assert!(out.contains("› Approve") && out.contains("Request changes"), "{out}");
+        assert!(out.contains("Sends 1 comment with the verdict."), "{out}");
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Enter);
+        assert!(screen(&mut app, 140, 30).contains("Request changes org/api#7"));
     }
 
     #[test]
