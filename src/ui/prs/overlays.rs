@@ -77,7 +77,7 @@ pub(in crate::ui) fn draw_review_popup(f: &mut Frame, app: &mut App) {
     match &mut view.review_popup {
         Some(ReviewPopup::Thread(thread)) => draw_thread_popup(f, thread, detail, review),
         Some(ReviewPopup::Pending { sel }) => draw_pending_panel(f, *sel, &view.pr, detail, review),
-        Some(ReviewPopup::Verdict { sel }) => draw_verdict_picker(f, *sel, &view.pr, review),
+        Some(ReviewPopup::Verdict { sel }) => draw_verdict_picker(f, *sel, &view.pr, detail, review),
         None => {}
     }
 }
@@ -153,7 +153,13 @@ fn draw_pending_panel(f: &mut Frame, sel: usize, pr: &PrRef, detail: Option<&PrD
     hint(f, "j/k move · e edit · d drop · R submit · Esc close", hint_area);
 }
 
-fn draw_verdict_picker(f: &mut Frame, sel: usize, pr: &PrRef, review: Option<&PendingReview>) {
+fn draw_verdict_picker(
+    f: &mut Frame,
+    sel: usize,
+    pr: &PrRef,
+    detail: Option<&PrDetail>,
+    review: Option<&PendingReview>,
+) {
     let inner = popup(f, centered(50, 40, f.area()), &format!("Review {}", pr.label()), accent());
     let [body, hint_area] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
     let mut lines: Vec<Line> = ReviewEvent::ALL
@@ -176,6 +182,14 @@ fn draw_verdict_picker(f: &mut Frame, sel: usize, pr: &PrRef, review: Option<&Pe
         None => "No pending comments; the verdict goes with its message only.".to_string(),
     };
     lines.push(Line::styled(sends, Style::default().fg(dim())));
+    // The drafts stay on the commit they were written against.
+    if review.zip(detail).is_some_and(|(r, d)| r.head_oid != d.head.oid) {
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            "The branch has new commits since you started this review.",
+            Style::default().fg(soft_red()),
+        ));
+    }
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
     hint(f, "j/k verdict · ⏎ write message · Esc cancel", hint_area);
 }

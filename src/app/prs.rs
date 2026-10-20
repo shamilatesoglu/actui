@@ -19,7 +19,7 @@ use crate::github::Run;
 use crate::pulls::model::{CheckState, PrDetail, PrGroup, PrRef, PrSummary};
 use ratatui::text::Line;
 use ratatui::widgets::ListState;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Something a request is out reading.
 #[derive(Default)]
@@ -354,6 +354,8 @@ pub struct PrsState {
     pub jump: Option<RunJump>,
     /// Each PR's review being written, kept while the user moves around.
     pub drafts: HashMap<PrRef, PendingReview>,
+    /// PRs whose review has been sent and has no answer yet.
+    sending: HashSet<PrRef>,
 }
 
 impl PrsState {
@@ -506,8 +508,11 @@ impl App {
         let merged = kind == PrActionKind::Merge && result.is_ok();
         // Only a review that went through ends the drafts; a failed one keeps
         // them to send again.
-        if kind == PrActionKind::SubmitReview && result.is_ok() {
-            self.prs.drafts.remove(&pr);
+        if kind == PrActionKind::SubmitReview {
+            self.prs.sending.remove(&pr);
+            if result.is_ok() {
+                self.prs.drafts.remove(&pr);
+            }
         }
         let Some(view) = self.prs.open.as_mut().filter(|v| v.pr == pr) else {
             // The list still shows a PR merged after its view was closed.

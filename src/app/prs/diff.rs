@@ -2,7 +2,7 @@
 //! lookups the diff viewer needs.
 
 use super::Loadable;
-use crate::pulls::model::{DraftComment, PrFile, ReviewThread, Side};
+use crate::pulls::model::{DraftComment, LineSpan, PrFile, ReviewThread, Side};
 use ratatui::widgets::ListState;
 use std::collections::{HashMap, HashSet};
 
@@ -100,6 +100,37 @@ pub fn thread_rows(lines: &[DiffLine], threads: &[ReviewThread], path: &str) -> 
         }
     }
     rows
+}
+
+/// The side and lines a comment on rows `a` to `b` (either order) covers.
+/// A range of only context lines is on the new side. Removed lines put it on
+/// the old side, where its context lines count by their old numbers. Added
+/// and removed lines can't share a range, and a range can't leave its hunk.
+pub fn range_span(lines: &[DiffLine], a: usize, b: usize) -> Result<(Side, LineSpan), &'static str> {
+    const NOT_A_LINE: &str = "Only code lines can be commented on";
+    let rows = lines.get(a.min(b)..=a.max(b)).ok_or(NOT_A_LINE)?;
+    if rows.iter().any(|row| matches!(row, DiffLine::Hunk(_))) {
+        return Err("A range has to stay inside one hunk");
+    }
+    let removed = rows.iter().any(|row| matches!(row, DiffLine::Removed { .. }));
+    let added = rows.iter().any(|row| matches!(row, DiffLine::Added { .. }));
+    let side = match (removed, added) {
+        (true, true) => return Err("A range has to stay on one side of the diff"),
+        (true, false) => Side::Left,
+        (false, _) => Side::Right,
+    };
+    let numbers: Vec<u32> = rows
+        .iter()
+        .filter_map(|row| match (side, row) {
+            (Side::Left, DiffLine::Removed { old, .. } | DiffLine::Context { old, .. }) => Some(*old),
+            (Side::Right, DiffLine::Added { new, .. } | DiffLine::Context { new, .. }) => Some(*new),
+            _ => None,
+        })
+        .collect();
+    match (numbers.first(), numbers.last()) {
+        (Some(&first), Some(&last)) => Ok((side, LineSpan::new(first, last))),
+        _ => Err(NOT_A_LINE),
+    }
 }
 
 /// Which diff rows carry draft comments: the last line of each one's span,
@@ -375,6 +406,30 @@ mod tests {
         assert_eq!(rows[&4], [1]);
         assert_eq!(lines[4], DiffLine::Added { new: 12, text: "added".into() });
         assert_eq!(rows[&2], [3]);
+    }
+
+    #[test]
+    fn an_old_side_range_takes_in_context_by_old_numbers() {
+        // 0 hunk, 1 removed 1, 2 context 2/1, 3 removed 3.
+        let lines = parse_patch("@@ -1,3 +1,1 @@\n-a\n b\n-c");
+        assert_eq!(range_span(&lines, 1, 3), Ok((Side::Left, LineSpan::Range { start: 1, end: 3 })));
+        assert_eq!(range_span(&lines, 2, 3), Ok((Side::Left, LineSpan::Range { start: 2, end: 3 })));
+    }
+
+    #[test]
+    fn a_new_side_range_takes_in_context_by_new_numbers() {
+        // 0 hunk, 1 added 1, 2 context 1/2, 3 added 3.
+        let lines = parse_patch("@@ -1,1 +1,3 @@\n+a\n b\n+c");
+        assert_eq!(range_span(&lines, 3, 1), Ok((Side::Right, LineSpan::Range { start: 1, end: 3 })));
+        assert_eq!(range_span(&lines, 2, 2), Ok((Side::Right, LineSpan::One(2))), "context alone is the new side");
+    }
+
+    #[test]
+    fn a_range_breaks_on_the_other_side_or_a_hunk_header() {
+        let lines = parse_patch("@@ -1,2 +1,2 @@\n-a\n b\n+c\n@@ -9 +9 @@\n d");
+        assert_eq!(range_span(&lines, 1, 3), Err("A range has to stay on one side of the diff"));
+        assert_eq!(range_span(&lines, 2, 5), Err("A range has to stay inside one hunk"));
+        assert_eq!(range_span(&lines, 0, 0), Err("A range has to stay inside one hunk"));
     }
 
     fn huge_patch() -> String {

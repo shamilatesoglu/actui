@@ -343,8 +343,9 @@ impl ReviewEvent {
 /// Everything a review sends at once.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ReviewSubmission {
-    /// The head commit the comments were written against. GitHub refuses the
-    /// review if the branch has moved since.
+    /// The commit the review is placed on: the head when its first draft was
+    /// written, so the drafts' line numbers match, or the current head for a
+    /// verdict without drafts.
     pub head_oid: String,
     pub event: ReviewEvent,
     pub body: String,

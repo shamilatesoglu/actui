@@ -883,6 +883,7 @@ impl App {
                             self.set_status("Working…", false);
                         }
                         PendingAction::DiscardCompose => self.discard_compose(),
+                        PendingAction::DropDraft => self.drop_selected_draft(),
                     }
                 }
                 self.mode = self.confirm_from;

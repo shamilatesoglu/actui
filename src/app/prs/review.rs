@@ -2,20 +2,30 @@
 //! and resolving of review threads, the pending-review panel, the verdict
 //! picker, and submitting the review.
 
+use super::diff::range_span;
 use super::{ComposeTarget, Loadable, PrAction, PrCommand, PrTab, PrsState, Scroll};
-use crate::app::{App, Command};
+use crate::app::{App, Command, PendingAction};
 use crate::pulls::model::{DraftComment, DraftReply, LineSpan, PrRef, ReviewEvent, ReviewSubmission, Side};
 use crossterm::event::{KeyCode, KeyEvent};
 
+/// What the status line says when a draft is touched while its review is out.
+const STILL_SENDING: &str = "Your review is still being sent";
+
 /// A PR's review being written: what goes to GitHub when it is submitted.
 /// It lives in actui's memory only.
-#[derive(Default)]
 pub struct PendingReview {
+    /// The head commit when the first draft was written. The drafts' line
+    /// numbers belong to that commit's diff, so the review is placed on it.
+    pub head_oid: String,
     pub comments: Vec<DraftComment>,
     pub replies: Vec<DraftReply>,
 }
 
 impl PendingReview {
+    fn new(head_oid: String) -> Self {
+        PendingReview { head_oid, comments: Vec::new(), replies: Vec::new() }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.comments.is_empty() && self.replies.is_empty()
     }
@@ -47,6 +57,12 @@ impl PrsState {
     /// The PR's pending review, if it has one.
     pub fn review_of(&self, pr: &PrRef) -> Option<&PendingReview> {
         self.drafts.get(pr).filter(|d| !d.is_empty())
+    }
+
+    /// Whether the PR's review has been sent and has no answer yet. Its
+    /// drafts stay as they are until then.
+    pub fn review_sending(&self, pr: &PrRef) -> bool {
+        self.sending.contains(pr)
     }
 
     /// Whether anything typed would be lost by quitting: a pending review, a
@@ -103,18 +119,16 @@ impl App {
         let Some(view) = &mut self.prs.open else { return };
         let Some(path) = view.files.shown_file().map(|f| f.path.clone()) else { return };
         let Some(diff) = &mut view.files.diff else { return };
-        let anchor_at = |row: usize| diff.lines.get(row).and_then(|r| r.anchor());
-        let Some((side, line)) = anchor_at(diff.cursor) else {
-            self.set_status("Only code lines can be commented on", true);
-            return;
+        let placed = match diff.mark {
+            Some(mark) => range_span(&diff.lines, mark, diff.cursor),
+            None => match diff.lines.get(diff.cursor).and_then(|row| row.anchor()) {
+                Some((side, line)) => Ok((side, LineSpan::One(line))),
+                None => Err("Only code lines can be commented on"),
+            },
         };
-        let span = match diff.mark.and_then(anchor_at) {
-            None => LineSpan::One(line),
-            Some((mark_side, _)) if mark_side != side => {
-                self.set_status("A range has to stay on one side of the diff", true);
-                return;
-            }
-            Some((_, mark_line)) => LineSpan::new(mark_line, line),
+        let (side, span) = match placed {
+            Ok(placed) => placed,
+            Err(why) => return self.set_status(why, true),
         };
         self.open_compose(ComposeTarget::LineComment { path, side, span });
         // The box holds the range now.
@@ -166,7 +180,7 @@ impl App {
                     KeyCode::Char('j') | KeyCode::Down => *sel = step(*sel, 1, len),
                     KeyCode::Char('k') | KeyCode::Up => *sel = step(*sel, -1, len),
                     KeyCode::Char('e') => self.edit_selected_draft(),
-                    KeyCode::Char('d') => self.drop_selected_draft(),
+                    KeyCode::Char('d') => self.ask_drop_draft(),
                     KeyCode::Char('R') => view.review_popup = Some(ReviewPopup::Verdict { sel: 0 }),
                     _ => {}
                 }
@@ -221,9 +235,20 @@ impl App {
         }
     }
 
+    /// The open PR, unless its review is out, in which case its drafts are
+    /// left alone and the status says why.
+    fn pr_with_drafts_free(&mut self) -> Option<PrRef> {
+        let pr = self.prs.open.as_ref()?.pr.clone();
+        if self.prs.review_sending(&pr) {
+            self.set_status(STILL_SENDING, true);
+            return None;
+        }
+        Some(pr)
+    }
+
     fn edit_selected_draft(&mut self) {
-        let (Some(view), Some(sel)) = (&self.prs.open, self.panel_sel()) else { return };
-        let Some(review) = self.prs.drafts.get(&view.pr) else { return };
+        let (Some(pr), Some(sel)) = (self.pr_with_drafts_free(), self.panel_sel()) else { return };
+        let Some(review) = self.prs.drafts.get(&pr) else { return };
         match review.comments.get(sel) {
             Some(comment) => {
                 let body = comment.body.clone();
@@ -234,8 +259,17 @@ impl App {
         }
     }
 
-    fn drop_selected_draft(&mut self) {
-        let Some(sel) = self.panel_sel() else { return };
+    /// `d` in the panel: asks before dropping the selected draft.
+    fn ask_drop_draft(&mut self) {
+        let (Some(pr), Some(sel)) = (self.pr_with_drafts_free(), self.panel_sel()) else { return };
+        if self.prs.drafts.get(&pr).is_some_and(|r| sel < r.len()) {
+            self.ask(PendingAction::DropDraft);
+        }
+    }
+
+    /// Drops the draft selected in the panel (the user confirmed it).
+    pub(in crate::app) fn drop_selected_draft(&mut self) {
+        let (Some(_), Some(sel)) = (self.pr_with_drafts_free(), self.panel_sel()) else { return };
         let Some(view) = &mut self.prs.open else { return };
         let Some(review) = self.prs.drafts.get_mut(&view.pr) else { return };
         let comments = review.comments.len();
@@ -260,11 +294,25 @@ impl App {
     }
 
     /// Ctrl+S in a line comment's box: the comment joins the PR's pending
-    /// review, starting one if needed.
-    pub(super) fn add_draft_comment(&mut self, path: String, side: Side, span: LineSpan, body: String) {
-        let Some(pr) = self.prs.open.as_ref().map(|v| v.pr.clone()) else { return };
-        self.prs.drafts.entry(pr.clone()).or_default().comments.push(DraftComment { path, side, span, body });
+    /// review, starting one on the current head commit if needed.
+    pub(super) fn add_draft_comment(
+        &mut self,
+        path: String,
+        side: Side,
+        span: LineSpan,
+        body: String,
+    ) -> Result<(), &'static str> {
+        let Some(view) = &self.prs.open else { return Ok(()) };
+        let pr = view.pr.clone();
+        if self.prs.review_sending(&pr) {
+            return Err(STILL_SENDING);
+        }
+        let Loadable::Ready(detail) = &view.detail else { return Err("The pull request is still loading") };
+        let head_oid = detail.head.oid.clone();
+        let review = self.prs.drafts.entry(pr.clone()).or_insert_with(|| PendingReview::new(head_oid));
+        review.comments.push(DraftComment { path, side, span, body });
         self.added_to_review_status(&pr);
+        Ok(())
     }
 
     /// Ctrl+G in a line comment's box: posts it on its own. A PR with a
@@ -299,8 +347,11 @@ impl App {
 
     /// Ctrl+S in a reply's box: the reply joins the pending review when the
     /// PR has one, and is posted at once otherwise.
-    pub(super) fn send_reply(&mut self, thread_id: String, comment_id: u64, body: String) {
-        let Some(pr) = self.prs.open.as_ref().map(|v| v.pr.clone()) else { return };
+    pub(super) fn send_reply(&mut self, thread_id: String, comment_id: u64, body: String) -> Result<(), &'static str> {
+        let Some(pr) = self.prs.open.as_ref().map(|v| v.pr.clone()) else { return Ok(()) };
+        if self.prs.review_sending(&pr) {
+            return Err(STILL_SENDING);
+        }
         match self.prs.drafts.get_mut(&pr).filter(|d| !d.is_empty()) {
             Some(review) => {
                 review.replies.push(DraftReply { thread_id, body });
@@ -311,11 +362,15 @@ impl App {
                 self.send_from_box(target, body.clone(), PrAction::Reply { comment_id, body });
             }
         }
+        Ok(())
     }
 
     /// Ctrl+S in the box editing a pending comment: replaces its text.
     pub(super) fn edit_draft(&mut self, index: usize, body: String) -> Result<(), &'static str> {
         let Some(pr) = self.prs.open.as_ref().map(|v| v.pr.clone()) else { return Ok(()) };
+        if self.prs.review_sending(&pr) {
+            return Err(STILL_SENDING);
+        }
         let comment = self.prs.drafts.get_mut(&pr).and_then(|d| d.comments.get_mut(index));
         let Some(comment) = comment else { return Err("That comment is no longer in your review") };
         comment.body = body;
@@ -324,20 +379,26 @@ impl App {
     }
 
     /// Ctrl+S in the review message box: sends the review with every pending
-    /// comment and reply, placed on the head commit as of now.
+    /// comment and reply, placed on the commit they were written against.
+    /// A verdict without drafts goes on the current head.
     pub(super) fn send_review(&mut self, event: ReviewEvent, body: String) -> Result<(), &'static str> {
         let Some(view) = &self.prs.open else { return Ok(()) };
+        let pr = view.pr.clone();
+        if self.prs.review_sending(&pr) {
+            return Err(STILL_SENDING);
+        }
         let Loadable::Ready(detail) = &view.detail else { return Err("The pull request is still loading") };
-        let (comments, replies) = match self.prs.drafts.get(&view.pr) {
-            Some(review) => (review.comments.clone(), review.replies.clone()),
-            None => (Vec::new(), Vec::new()),
+        let (head_oid, comments, replies) = match self.prs.review_of(&pr) {
+            Some(review) => (review.head_oid.clone(), review.comments.clone(), review.replies.clone()),
+            None => (detail.head.oid.clone(), Vec::new(), Vec::new()),
         };
         // An approval says enough by itself; the other verdicts need words.
         if event != ReviewEvent::Approve && body.trim().is_empty() && comments.is_empty() && replies.is_empty() {
             return Err("Nothing to send");
         }
         let node_id = detail.node_id.clone();
-        let submission = ReviewSubmission { head_oid: detail.head.oid.clone(), event, body: body.clone(), comments, replies };
+        let submission = ReviewSubmission { head_oid, event, body: body.clone(), comments, replies };
+        self.prs.sending.insert(pr);
         self.send_from_box(ComposeTarget::ReviewBody { event }, body, PrAction::SubmitReview { node_id, submission });
         Ok(())
     }
@@ -358,19 +419,23 @@ mod tests {
     /// Rows: 0 hunk, 1 context 10/10, 2 removed 11, 3 added 11, 4 added 12, 5 context 12/13.
     const PATCH: &str = "@@ -10,3 +10,4 @@\n ctx\n-old\n+new\n+added\n ctx2";
 
-    /// An app with the diff of `src/a.rs` open on PR org/api#7, cursor on row 0.
-    fn app_in_a_diff() -> App {
-        let mut app = app_on_a_pr_with_a_run_check();
-        let view = app.prs.open.as_mut().unwrap();
-        view.tab = PrTab::Files;
-        view.files.set(Ok(vec![PrFile {
+    fn files() -> Vec<PrFile> {
+        vec![PrFile {
             path: "src/a.rs".into(),
             previous_path: None,
             status: FileStatus::Modified,
             additions: 2,
             deletions: 1,
             patch: Some(PATCH.into()),
-        }]));
+        }]
+    }
+
+    /// An app with the diff of `src/a.rs` open on PR org/api#7, cursor on row 0.
+    fn app_in_a_diff() -> App {
+        let mut app = app_on_a_pr_with_a_run_check();
+        let view = app.prs.open.as_mut().unwrap();
+        view.tab = PrTab::Files;
+        view.files.set(Ok(files()));
         press(&mut app, KeyCode::Enter);
         assert!(app.prs.open.as_ref().unwrap().files.diff.is_some());
         app.pending.clear();
@@ -471,6 +536,21 @@ mod tests {
         let mut app = app_in_a_diff();
         press(&mut app, KeyCode::Char('v'));
         assert!(app.prs.open.as_ref().unwrap().files.diff.as_ref().unwrap().mark.is_none(), "a hunk header can't be marked");
+
+        // Context next to removed lines belongs to the old side.
+        go_to_row(&mut app, 1);
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(
+            compose(&app).map(|c| c.target.clone()),
+            Some(ComposeTarget::LineComment {
+                path: "src/a.rs".into(),
+                side: Side::Left,
+                span: LineSpan::Range { start: 10, end: 11 },
+            })
+        );
+        press(&mut app, KeyCode::Esc);
 
         go_to_row(&mut app, 2);
         press(&mut app, KeyCode::Char('v'));
@@ -625,18 +705,102 @@ mod tests {
         ));
     }
 
+    fn sent_head(app: &App) -> Option<String> {
+        match &app.pending[..] {
+            [Command::Pr(PrCommand::Act { action: PrAction::SubmitReview { submission, .. }, .. })] => {
+                Some(submission.head_oid.clone())
+            }
+            _ => None,
+        }
+    }
+
     #[test]
-    fn the_review_is_placed_on_the_head_seen_when_it_is_sent() {
-        let mut app = app_on_a_pr_with_a_run_check();
-        press(&mut app, KeyCode::Char('R'));
-        press(&mut app, KeyCode::Enter);
+    fn a_review_stays_on_the_head_its_first_draft_was_written_on() {
+        let mut app = app_in_a_diff();
+        comment_on_row(&mut app, 4, "first");
         edit_detail(&mut app, |d| d.head.oid = "newer".into());
-        ctrl_s(&mut app);
-        assert!(matches!(
-            &app.pending[..],
-            [Command::Pr(PrCommand::Act { action: PrAction::SubmitReview { submission, .. }, .. })]
-                if submission.head_oid == "newer"
-        ));
+        comment_on_row(&mut app, 2, "second");
+        assert_eq!(drafts(&app).head_oid, "abc");
+        submit(&mut app, 2, "");
+        assert_eq!(sent_head(&app).as_deref(), Some("abc"), "the lines belong to the first head's diff");
+
+        // A verdict with no drafts goes on the head as it is now.
+        let mut app = app_on_a_pr_with_a_run_check();
+        edit_detail(&mut app, |d| d.head.oid = "newer".into());
+        submit(&mut app, 0, "");
+        assert_eq!(sent_head(&app).as_deref(), Some("newer"));
+    }
+
+    /// Closes the PR and opens it again from the list, with the same detail
+    /// and files read back in, and its diff open again.
+    fn reopen(app: &mut App) {
+        let detail = match &app.prs.open.as_ref().unwrap().detail {
+            Loadable::Ready(d) => d.clone(),
+            _ => panic!("the detail is loaded"),
+        };
+        let pr = pr(app);
+        app.prs.list.set(PrGroup::ReviewRequested, Ok(vec![summary("org/api", 7)]));
+        app.prs.list.set(PrGroup::Authored, Ok(vec![]));
+        press(app, KeyCode::Esc);
+        press(app, KeyCode::Esc);
+        assert!(app.prs.open.is_none());
+        press(app, KeyCode::Enter);
+        app.apply(DataMsg::Pr(PrMsg::Detail { pr: pr.clone(), result: Ok(detail) }));
+        press(app, KeyCode::Tab);
+        app.apply(DataMsg::Pr(PrMsg::Files { pr, result: Ok(files()) }));
+        press(app, KeyCode::Enter);
+        assert!(app.prs.open.as_ref().unwrap().inflight.is_none(), "a fresh view knows nothing was sent");
+        app.pending.clear();
+    }
+
+    #[test]
+    fn a_review_being_sent_keeps_its_drafts_as_they_are() {
+        let mut app = app_in_a_diff();
+        comment_on_row(&mut app, 4, "first");
+        submit(&mut app, 2, "");
+        assert!(sent_head(&app).is_some());
+        reopen(&mut app);
+
+        comment_on_row(&mut app, 2, "late");
+        assert_eq!(status(&app), Some(("Your review is still being sent", true)));
+        assert_eq!(compose(&app).map(|c| c.text()).as_deref(), Some("late"), "the text stays in its box");
+        assert_eq!(drafts(&app).len(), 1);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('y'));
+
+        submit(&mut app, 2, "again");
+        assert!(app.pending.is_empty(), "the same drafts are not sent twice");
+        assert_eq!(status(&app), Some(("Your review is still being sent", true)));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('y'));
+
+        press(&mut app, KeyCode::Char('p'));
+        press(&mut app, KeyCode::Char('d'));
+        assert!(app.mode == Mode::Prs, "no question while sending");
+        press(&mut app, KeyCode::Char('e'));
+        assert!(compose(&app).is_none());
+        assert_eq!(status(&app), Some(("Your review is still being sent", true)));
+        assert_eq!(drafts(&app).len(), 1);
+
+        let pr = pr(&app);
+        app.apply(DataMsg::Pr(PrMsg::ActDone { pr: pr.clone(), kind: PrActionKind::SubmitReview, result: Ok(()) }));
+        assert!(!app.prs.drafts.contains_key(&pr));
+        assert!(!app.prs.review_sending(&pr));
+    }
+
+    #[test]
+    fn a_failed_review_frees_its_drafts_again() {
+        let mut app = app_in_a_diff();
+        comment_on_row(&mut app, 4, "first");
+        submit(&mut app, 2, "");
+        let pr = pr(&app);
+        assert!(app.prs.review_sending(&pr));
+        app.apply(DataMsg::Pr(PrMsg::ActDone { pr: pr.clone(), kind: PrActionKind::SubmitReview, result: Err("no".into()) }));
+        assert!(!app.prs.review_sending(&pr));
+        assert_eq!(drafts(&app).len(), 1);
+        press(&mut app, KeyCode::Esc);
+        comment_on_row(&mut app, 2, "second");
+        assert_eq!(drafts(&app).len(), 2, "drafts can be added again");
     }
 
     #[test]
@@ -663,9 +827,16 @@ mod tests {
 
         press(&mut app, KeyCode::Char('k'));
         press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.pending_action.as_ref().map(|a| a.prompt()).as_deref(), Some("Drop this comment?"));
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(drafts(&app).len(), 2, "no keeps it");
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.mode == Mode::Prs);
         let bodies: Vec<&str> = drafts(&app).comments.iter().map(|c| c.body.as_str()).collect();
         assert_eq!(bodies, ["second!"]);
         press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('y'));
         assert!(!app.prs.drafts.contains_key(&pr(&app)), "an empty review is no review");
         assert!(app.pending.is_empty());
     }

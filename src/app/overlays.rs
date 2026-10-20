@@ -20,6 +20,8 @@ pub enum PendingAction {
     Pr { pr: PrRef, action: PrAction, label: String },
     /// Throw away what was typed in the comment box.
     DiscardCompose,
+    /// Drop the draft selected in the pending-review panel.
+    DropDraft,
 }
 
 impl PendingAction {
@@ -32,6 +34,7 @@ impl PendingAction {
             PendingAction::Approve { label, .. } => format!("Approve run?  {label}"),
             PendingAction::Pr { label, .. } => label.clone(),
             PendingAction::DiscardCompose => "Discard what you typed?".to_string(),
+            PendingAction::DropDraft => "Drop this comment?".to_string(),
         }
     }
 }

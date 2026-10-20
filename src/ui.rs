@@ -3043,6 +3043,30 @@ mod tests {
     }
 
     #[test]
+    fn the_verdict_picker_warns_when_the_branch_moved_under_the_review() {
+        use crate::app::{DataMsg, PrMsg};
+        use crossterm::event::KeyCode;
+        const WARNING: &str = "The branch has new commits since you started this review.";
+        let mut app = files_app(vec![pr_file("a.rs", Some("@@ -1 +1 @@\n-a\n+b"))]);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "note");
+        ctrl(&mut app, 's');
+        press(&mut app, KeyCode::Char('R'));
+        assert!(!screen(&mut app, 140, 30).contains(WARNING));
+        press(&mut app, KeyCode::Esc);
+
+        let mut detail = pr_detail();
+        detail.head.oid = "newer".into();
+        let pr = app.prs.open.as_ref().unwrap().pr.clone();
+        app.apply(DataMsg::Pr(PrMsg::Detail { pr, result: Ok(Box::new(detail)) }));
+        press(&mut app, KeyCode::Char('R'));
+        let out = screen(&mut app, 140, 30);
+        assert!(out.contains(WARNING), "{out}");
+    }
+
+    #[test]
     fn a_refresh_keeps_the_open_diff_on_its_file_and_the_count_right() {
         use crossterm::event::KeyCode;
         let patch = "@@ -1,4 +1,4 @@\n a\n b\n c\n-d\n+e";

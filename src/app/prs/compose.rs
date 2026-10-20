@@ -142,14 +142,8 @@ impl App {
                     self.send_from_box(ComposeTarget::PrComment, text.clone(), PrAction::Comment { body: text });
                     Ok(())
                 }
-                ComposeTarget::LineComment { path, side, span } => {
-                    self.add_draft_comment(path, side, span, text);
-                    Ok(())
-                }
-                ComposeTarget::Reply { thread_id, comment_id } => {
-                    self.send_reply(thread_id, comment_id, text);
-                    Ok(())
-                }
+                ComposeTarget::LineComment { path, side, span } => self.add_draft_comment(path, side, span, text),
+                ComposeTarget::Reply { thread_id, comment_id } => self.send_reply(thread_id, comment_id, text),
                 ComposeTarget::EditDraft { index } => self.edit_draft(index, text),
                 ComposeTarget::ReviewBody { event } => self.send_review(event, text),
             }
