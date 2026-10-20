@@ -1,6 +1,6 @@
 //! Runs the PR commands against GitHub on the async runtime.
 
-use crate::app::{DataMsg, PrAction, PrCommand, PrMsg};
+use crate::app::{DataMsg, PrAction, PrActionKind, PrCommand, PrMsg};
 use crate::github::Github;
 use crate::pulls::model::{PrGroup, PrRef};
 use tokio::sync::mpsc::UnboundedSender;
@@ -34,8 +34,21 @@ pub fn run_command(cmd: PrCommand, gh: &Github, tx: &UnboundedSender<DataMsg>) {
             let (gh, tx) = (gh.clone(), tx.clone());
             tokio::spawn(async move {
                 let kind = action.kind();
+                let delete_after = match &action {
+                    PrAction::Merge { delete_branch, .. } => delete_branch.clone(),
+                    _ => None,
+                };
                 let result = act(&gh, &pr, action).await.map_err(|e| e.to_string());
-                let _ = tx.send(DataMsg::Pr(PrMsg::ActDone { pr, kind, result }));
+                let merged = result.is_ok();
+                let _ = tx.send(DataMsg::Pr(PrMsg::ActDone { pr: pr.clone(), kind, result }));
+                // The branch goes only once the merge is in, and its answer comes apart.
+                if let (true, Some(branch)) = (merged, delete_after) {
+                    let result = gh
+                        .delete_branch(&pr.repo, &branch)
+                        .await
+                        .map_err(|e| format!("Merged, but deleting the branch failed: {e}"));
+                    let _ = tx.send(DataMsg::Pr(PrMsg::ActDone { pr, kind: PrActionKind::DeleteBranch, result }));
+                }
             });
         }
         PrCommand::FetchDetail(pr) => {
@@ -53,16 +66,8 @@ async fn act(gh: &Github, pr: &PrRef, action: PrAction) -> anyhow::Result<()> {
         PrAction::Comment { body } => gh.comment_on_pr(pr, &body).await,
         PrAction::SetDraft { node_id, draft } => gh.set_draft(&node_id, draft).await,
         PrAction::UpdateBranch { head_oid } => gh.update_branch(pr, &head_oid).await,
-        PrAction::Merge { method, head_oid, delete_branch } => {
-            gh.merge_pr(pr, method, &head_oid).await?;
-            // The merge is done by now, so a failure here says so.
-            if let Some(branch) = delete_branch {
-                gh.delete_branch(&pr.repo, &branch)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Merged, but deleting the branch failed: {e}"))?;
-            }
-            Ok(())
-        }
+        // The branch, if asked for, is deleted by the caller once this is in.
+        PrAction::Merge { method, head_oid, .. } => gh.merge_pr(pr, method, &head_oid).await,
         PrAction::Enqueue { node_id, head_oid } => gh.enqueue_pr(&node_id, &head_oid).await,
         PrAction::Dequeue { node_id } => gh.dequeue_pr(&node_id).await,
         PrAction::LineComment { head_oid, comment } => gh.post_line_comment(pr, &head_oid, &comment).await,

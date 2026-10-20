@@ -673,7 +673,16 @@ impl Github {
 
     pub async fn delete_branch(&self, repo: &str, branch: &str) -> Result<()> {
         let req = self.client.delete(branch_ref_url(repo, branch)?);
-        ensure_ok(self.send(req).await?).await.map(|_| ())
+        let resp = self.send(req).await?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let body = resp.text().await.unwrap_or_default();
+        if branch_already_gone(status, &body) {
+            return Ok(());
+        }
+        Err(anyhow!("GitHub API {status}: {}", crate::github::first_line(&body)))
     }
 
     pub async fn enqueue_pr(&self, node_id: &str, head_oid: &str) -> Result<()> {
@@ -776,6 +785,14 @@ fn line_comment_body(head_oid: &str, comment: &DraftComment) -> serde_json::Valu
     body
 }
 
+/// Whether a refused branch deletion means the branch is already gone, which
+/// is what was wanted: a repo that deletes merged branches itself got there
+/// first.
+fn branch_already_gone(status: reqwest::StatusCode, body: &str) -> bool {
+    let not_there = status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY;
+    not_there && body.contains("Reference does not exist")
+}
+
 /// The REST address of a branch. Each part of the name is escaped, so a `#`
 /// or `?` in it stays in the path.
 fn branch_ref_url(repo: &str, branch: &str) -> Result<reqwest::Url> {
@@ -848,6 +865,18 @@ mod tests {
                 assert!(declared.contains(u), "{name} uses ${u} without declaring it");
             }
         }
+    }
+
+    #[test]
+    fn a_branch_already_deleted_counts_as_deleted() {
+        use reqwest::StatusCode;
+        let gone = r#"{"message":"Reference does not exist","documentation_url":"https://docs.github.com"}"#;
+        assert!(branch_already_gone(StatusCode::UNPROCESSABLE_ENTITY, gone));
+        assert!(branch_already_gone(StatusCode::NOT_FOUND, gone));
+        assert!(!branch_already_gone(StatusCode::NOT_FOUND, r#"{"message":"Not Found"}"#));
+        let protected = r#"{"message":"Cannot delete this protected branch"}"#;
+        assert!(!branch_already_gone(StatusCode::UNPROCESSABLE_ENTITY, protected));
+        assert!(!branch_already_gone(StatusCode::FORBIDDEN, gone));
     }
 
     #[test]

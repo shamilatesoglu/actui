@@ -26,7 +26,8 @@ pub enum PrAction {
     SetDraft { node_id: String, draft: bool },
     UpdateBranch { head_oid: String },
     RerunFailed { run_ids: Vec<u64> },
-    /// Merges the PR, then deletes the named branch if one is given.
+    /// Merges the PR, then deletes the named branch if one is given. The two
+    /// are answered apart, so a failed deletion doesn't hide the merge.
     Merge { method: MergeMethod, head_oid: String, delete_branch: Option<String> },
     Enqueue { node_id: String, head_oid: String },
     Dequeue { node_id: String },
@@ -47,6 +48,8 @@ pub enum PrActionKind {
     UpdateBranch,
     RerunFailed,
     Merge,
+    /// The branch deletion asked for with a merge, once the merge is in.
+    DeleteBranch,
     Enqueue,
     Dequeue,
     LineComment,
@@ -86,6 +89,7 @@ impl PrActionKind {
             PrActionKind::UpdateBranch => "Branch updated",
             PrActionKind::RerunFailed => "Re-running failed checks",
             PrActionKind::Merge => "Merged",
+            PrActionKind::DeleteBranch => "Branch deleted",
             PrActionKind::Enqueue => "Added to the merge queue",
             PrActionKind::Dequeue => "Removed from the merge queue",
             PrActionKind::LineComment => "Line comment posted",

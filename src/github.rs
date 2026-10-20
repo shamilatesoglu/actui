@@ -895,7 +895,7 @@ fn backoff_secs(retry_after: Option<&str>, reset_epoch: Option<&str>, now_epoch:
         .clamp(1, 3600)
 }
 
-fn first_line(s: &str) -> String {
+pub(crate) fn first_line(s: &str) -> String {
     // Try to surface the API "message" field, else first line.
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
         if let Some(m) = v.get("message").and_then(|m| m.as_str()) {

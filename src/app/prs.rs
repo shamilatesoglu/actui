@@ -1128,6 +1128,20 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_branch_deletion_still_counts_the_merge() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        let pr = app.prs.open.as_ref().unwrap().pr.clone();
+        app.prs.open = None;
+        app.apply(DataMsg::Pr(PrMsg::ActDone { pr: pr.clone(), kind: PrActionKind::Merge, result: Ok(()) }));
+        assert!(matches!(&app.pending[..], [Command::Pr(PrCommand::FetchList)]), "the list drops the merged PR");
+        app.pending.clear();
+        let result = Err("Merged, but deleting the branch failed: GitHub API 403 Forbidden: no".to_string());
+        app.apply(DataMsg::Pr(PrMsg::ActDone { pr, kind: PrActionKind::DeleteBranch, result }));
+        assert!(app.status_msg.as_ref().is_some_and(|(m, err, _)| m.contains("deleting the branch failed") && *err));
+        assert!(app.pending.is_empty());
+    }
+
+    #[test]
     fn the_merge_dialog_takes_every_key_and_esc_closes_it() {
         let mut app = app_on_a_pr_with_a_run_check();
         edit_detail(&mut app, |d| d.queue = QueueState::NoQueue);
