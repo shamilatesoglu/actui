@@ -40,7 +40,7 @@ pub(super) fn conversation(d: &PrDetail) -> Vec<(DateTime<Utc>, ConvEntry<'_>)> 
 }
 
 pub(super) fn draw_conversation(f: &mut Frame, scroll: &mut Scroll, d: &PrDetail, area: Rect) {
-    draw_scrolling_text(f, scroll, conversation_lines(d), area);
+    draw_scrolling_text(f, scroll, || conversation_lines(d), area);
 }
 
 fn conversation_lines(d: &PrDetail) -> Vec<Line<'static>> {

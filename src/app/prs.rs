@@ -11,6 +11,7 @@ pub use protocol::{PrCommand, PrMsg};
 use super::{App, Command, CursorHold, Focus, Mode};
 use crate::github::Run;
 use crate::pulls::model::{CheckState, PrDetail, PrGroup, PrRef, PrSummary};
+use ratatui::text::Line;
 use ratatui::widgets::ListState;
 
 /// Something a request is out reading.
@@ -162,20 +163,77 @@ impl PrTab {
     }
 }
 
-/// How far a text is scrolled. The bounds come from the last frame.
+/// A scrolling text: how far it is scrolled, and the lines last built for it
+/// with their wrapped height. Building and measuring them is the costly part
+/// of a frame, so they are kept until the width changes or `forget` is called.
 #[derive(Default)]
 pub struct Scroll {
-    pub offset: u16,
-    /// The most `offset` can be.
-    pub max: u16,
+    offset: u16,
+    /// The most `offset` can be, as of the last frame.
+    max: u16,
     /// Rows the text area showed.
-    pub page: u16,
+    page: u16,
+    built: Option<Built>,
+    #[cfg(test)]
+    pub builds: u32,
+}
+
+struct Built {
+    width: u16,
+    rows: usize,
+    lines: Vec<Line<'static>>,
 }
 
 impl Scroll {
     pub fn by(&mut self, delta: i32) {
         let next = (self.offset as i64 + delta as i64).clamp(0, self.max as i64);
         self.offset = next as u16;
+    }
+
+    pub fn offset(&self) -> u16 {
+        self.offset
+    }
+
+    #[cfg(test)]
+    pub fn max(&self) -> u16 {
+        self.max
+    }
+
+    pub fn page(&self) -> u16 {
+        self.page
+    }
+
+    /// Drops the built lines, because the data they came from changed.
+    pub fn forget(&mut self) {
+        self.built = None;
+    }
+
+    /// The lines for a text area `width` wide, and their wrapped height.
+    /// `build` and `measure` run only when nothing is kept for this width.
+    pub fn lines(
+        &mut self,
+        width: u16,
+        build: impl FnOnce() -> Vec<Line<'static>>,
+        measure: impl FnOnce(&[Line<'static>]) -> usize,
+    ) -> (&[Line<'static>], usize) {
+        if self.built.as_ref().is_none_or(|b| b.width != width) {
+            let lines = build();
+            let rows = measure(&lines);
+            self.built = Some(Built { width, rows, lines });
+            #[cfg(test)]
+            {
+                self.builds += 1;
+            }
+        }
+        let built = self.built.as_ref().expect("just built");
+        (&built.lines, built.rows)
+    }
+
+    /// Takes in the size of the text and of the area showing it.
+    pub fn fit(&mut self, rows: usize, height: u16) {
+        self.max = rows.saturating_sub(height as usize).min(u16::MAX as usize) as u16;
+        self.page = height;
+        self.offset = self.offset.min(self.max);
     }
 }
 
@@ -226,7 +284,7 @@ impl PrView {
 
     /// Scrolls the conversation by whole pages (`pages` may be negative).
     pub fn page_conversation(&mut self, pages: i32) {
-        let page = self.conversation.page.saturating_sub(1).max(1) as i32;
+        let page = self.conversation.page().saturating_sub(1).max(1) as i32;
         self.conversation.by(pages.saturating_mul(page));
     }
 
@@ -248,6 +306,8 @@ impl PrView {
                 let kept = self.checks.selected().filter(|&i| i < detail.checks.len());
                 self.checks.select(kept.or(if detail.checks.is_empty() { None } else { Some(0) }));
                 self.detail = Loadable::Ready(detail);
+                self.overview.forget();
+                self.conversation.forget();
                 self.sync_threads();
             }
             Err(e) if !matches!(self.detail, Loadable::Ready(_)) => self.detail = Loadable::Failed(e),

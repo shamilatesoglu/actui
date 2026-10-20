@@ -2742,8 +2742,31 @@ mod tests {
         assert!(screen(&mut app, 100, 20).contains("note 30"));
         press(&mut app, KeyCode::Char('g'));
         assert!(!screen(&mut app, 100, 20).contains("note 30"));
+        assert!(screen(&mut app, 100, 20).contains("note 1"));
         press(&mut app, KeyCode::PageDown);
-        assert!(screen(&mut app, 100, 20).contains("note 4"));
+        let paged = screen(&mut app, 100, 20);
+        assert!(!paged.contains("note 1"), "the first notes are paged away: {paged}");
+        assert!(paged.contains("note 5"), "{paged}");
+    }
+
+    #[test]
+    fn the_conversation_is_built_once_until_the_detail_or_width_changes() {
+        use crate::app::{DataMsg, PrMsg};
+        use crossterm::event::KeyCode;
+        let mut app = files_app_with(vec![], pr_detail());
+        press(&mut app, KeyCode::Tab);
+        let builds = |app: &App| app.prs.open.as_ref().unwrap().conversation.builds;
+        screen(&mut app, 100, 20);
+        screen(&mut app, 100, 20);
+        press(&mut app, KeyCode::Char('j'));
+        screen(&mut app, 100, 20);
+        assert_eq!(builds(&app), 1, "redrawing and scrolling reuse the built lines");
+        screen(&mut app, 90, 20);
+        assert_eq!(builds(&app), 2, "a new width rebuilds");
+        let pr = app.prs.open.as_ref().unwrap().pr.clone();
+        app.apply(DataMsg::Pr(PrMsg::Detail { pr, result: Ok(Box::new(pr_detail())) }));
+        screen(&mut app, 90, 20);
+        assert_eq!(builds(&app), 3, "a refreshed detail rebuilds");
     }
 
     #[test]

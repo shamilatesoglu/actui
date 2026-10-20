@@ -21,7 +21,8 @@ pub(super) fn draw_overview(
     let [text_area, checks_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(check_rows)]).areas(area);
 
-    draw_scrolling_text(f, &mut view.overview, overview_lines(&view.pr, detail), text_area);
+    let pr = &view.pr;
+    draw_scrolling_text(f, &mut view.overview, || overview_lines(pr, detail), text_area);
 
     draw_checks(f, &detail.checks, &mut view.checks, checks_area, spin);
 }
@@ -268,8 +269,8 @@ mod tests {
             format!("{:?}", term.backend().buffer())
         };
         draw(&mut view);
-        assert!(view.overview.max > 0);
-        view.overview.offset = view.overview.max;
+        assert!(view.overview.max() > 0);
+        view.overview.by(i32::MAX);
         assert!(draw(&mut view).contains("THEEND"));
     }
 

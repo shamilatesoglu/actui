@@ -98,12 +98,16 @@ pub(super) fn draw_open_pr(f: &mut Frame, app: &mut App, area: Rect) {
 
 /// Draws `lines` wrapped in `area`, scrolled by `scroll`, and records in
 /// `scroll` how far the text can go so the last line can be reached.
-fn draw_scrolling_text(f: &mut Frame, scroll: &mut Scroll, lines: Vec<Line<'static>>, area: Rect) {
-    let rows = wrapped_rows(&lines, area.width);
-    scroll.max = rows.saturating_sub(area.height as usize).min(u16::MAX as usize) as u16;
-    scroll.page = area.height;
-    scroll.offset = scroll.offset.min(scroll.max);
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll.offset, 0)), area);
+fn draw_scrolling_text(
+    f: &mut Frame,
+    scroll: &mut Scroll,
+    build: impl FnOnce() -> Vec<Line<'static>>,
+    area: Rect,
+) {
+    let (lines, rows) = scroll.lines(area.width, build, |lines| wrapped_rows(lines, area.width));
+    let lines = lines.to_vec();
+    scroll.fit(rows, area.height);
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll.offset(), 0)), area);
 }
 
 /// How many rows `lines` take once wrapped to `width` the way the paragraph
