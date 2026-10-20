@@ -163,7 +163,8 @@ fn parse_search(data: serde_json::Value) -> Result<Vec<PrSummary>> {
         if node.as_object().is_some_and(|o| o.is_empty()) {
             continue;
         }
-        let node: PrNode = serde_json::from_value(node).context("bad pull request in search")?;
+        let node: PrNode = serde_json::from_value(node)
+            .map_err(|e| anyhow!("bad pull request in search: {e}"))?;
         prs.push(PrSummary::from(node));
     }
     Ok(prs)
@@ -191,7 +192,9 @@ mod tests {
     fn a_node_that_fails_to_parse_is_an_error() {
         let data = serde_json::json!({"search":{"nodes":[{"id":"PR_1","number":"twelve"}]}});
         let err = parse_search(data).unwrap_err();
-        assert_eq!(err.to_string(), "bad pull request in search");
+        let msg = err.to_string();
+        assert!(msg.starts_with("bad pull request in search: "), "{msg}");
+        assert!(msg.contains("twelve"), "says what was wrong: {msg}");
     }
 
     #[test]

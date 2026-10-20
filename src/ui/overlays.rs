@@ -373,6 +373,7 @@ pub(super) fn draw_help(f: &mut Frame) {
         help_row("A", "artifacts · ⏎ downloads one"),
         help_row("s", "self-hosted runners of your orgs"),
         help_row("  ↳ in runners", "⏎ details · o open on GitHub · r reload"),
+        help_row("P", "your open PRs and review requests"),
         help_row("w", "duration chart of the run's workflow"),
         help_row("  ↳ in chart", "h/l move · ⏎ go to run · [ ] workflow"),
         help_row("", "o open the run · r reload"),
