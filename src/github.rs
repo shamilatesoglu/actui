@@ -57,7 +57,7 @@ pub fn resolve_token() -> Result<String> {
 
 #[derive(Clone)]
 pub struct Github {
-    client: Client,
+    pub(crate) client: Client,
     /// Bearer token, re-resolvable if it expires mid-session (applied per request).
     token: Arc<Mutex<String>>,
     /// Per-key ETag cache for conditional requests.
@@ -104,7 +104,7 @@ impl Github {
     /// off, attaches the current token, records `X-RateLimit-*`/`X-Poll-Interval`
     /// headers, transparently re-resolves the token once on `401`, and converts a
     /// primary/secondary rate limit into a back-off + error.
-    async fn send(&self, req: RequestBuilder) -> Result<Response> {
+    pub(crate) async fn send(&self, req: RequestBuilder) -> Result<Response> {
         if let Some(d) = self.pause_remaining() {
             return Err(anyhow!("backing off; retry in {}s", d.as_secs()));
         }
@@ -786,7 +786,7 @@ impl Github {
 /// Ensure a response is a success, otherwise surface GitHub's own error
 /// `message` field (like `check`) instead of reqwest's generic status error,
 /// which discards the body. Returns the response on success for chaining.
-async fn ensure_ok(resp: Response) -> Result<Response> {
+pub(crate) async fn ensure_ok(resp: Response) -> Result<Response> {
     let status = resp.status();
     if status.is_success() {
         return Ok(resp);

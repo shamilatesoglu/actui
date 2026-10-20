@@ -3,6 +3,7 @@
 mod app;
 mod config;
 mod github;
+mod pulls;
 mod state;
 mod ui;
 
