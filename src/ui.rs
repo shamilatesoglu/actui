@@ -1263,7 +1263,11 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                     "w durations",
                     "p repos",
                 ]));
-                (hints, vec!["? help", "q quit"])
+                let mut keep = vec!["? help", "q quit"];
+                if app.prs.jump.is_some() {
+                    keep.insert(0, "Esc back to PR");
+                }
+                (hints, keep)
             }
             Focus::Jobs => (
                 owned(&[
@@ -2497,6 +2501,19 @@ mod tests {
         assert!(matches!(app.mode, Mode::Prs));
         let out = screen(&mut app, 140, 24);
         assert!(out.contains("Review requested"), "back on the list");
+    }
+
+    #[test]
+    fn the_footer_offers_the_way_back_to_the_pr_after_a_jump() {
+        use crate::app::{DataMsg, PrMsg};
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut app = prs_app();
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        let pr = app.prs.open.as_ref().unwrap().pr.clone();
+        app.apply(DataMsg::Pr(PrMsg::Detail { pr, result: Ok(Box::new(pr_detail())) }));
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.mode, crate::app::Mode::Normal));
+        assert!(screen(&mut app, 140, 24).contains("Esc back to PR"));
     }
 
     #[test]

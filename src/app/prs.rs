@@ -6,7 +6,8 @@ mod protocol;
 
 pub use protocol::{PrCommand, PrMsg};
 
-use super::{App, Command};
+use super::{App, Command, CursorHold, Focus, Mode};
+use crate::github::Run;
 use crate::pulls::model::{CheckState, PrDetail, PrGroup, PrRef, PrSummary};
 use ratatui::widgets::ListState;
 
@@ -217,12 +218,22 @@ impl PrView {
     }
 }
 
+/// A visit to the runs screen from a PR's check.
+pub struct RunJump {
+    pub run_id: u64,
+    /// The run was not on the runs list and was added for the visit, so
+    /// leaving takes it out again.
+    pub stray: bool,
+}
+
 /// Everything the PRs screens show.
 #[derive(Default)]
 pub struct PrsState {
     pub list: PrList,
     /// The PR opened from the list, if any.
     pub open: Option<PrView>,
+    /// Set while the runs screen shows a check's run, so Esc can come back.
+    pub jump: Option<RunJump>,
 }
 
 impl PrsState {
@@ -244,6 +255,80 @@ impl App {
         }
     }
 
+    /// Goes to a run on the runs screen, reading it first if it is not listed.
+    pub(super) fn jump_to_run(&mut self, repo: String, run_id: u64) {
+        self.prs.jump = Some(RunJump { run_id, stray: false });
+        self.mode = Mode::Normal;
+        self.focus = Focus::Runs;
+        if self.runs.iter().any(|r| r.id == run_id) {
+            self.select_jump_run(run_id);
+        } else {
+            self.pending.push(Command::Pr(PrCommand::FetchRun { repo, run_id }));
+        }
+    }
+
+    /// Puts the runs cursor on the run and keeps it there through sweeps.
+    fn select_jump_run(&mut self, run_id: u64) {
+        self.cursor_hold = CursorHold::PickedRun;
+        self.recompute_view_keeping(Some(run_id));
+    }
+
+    fn apply_jump_run(&mut self, result: Result<Box<Run>, String>) {
+        let Some(jump) = &self.prs.jump else { return };
+        let run_id = jump.run_id;
+        let listed = self.runs.iter().any(|r| r.id == run_id);
+        match result {
+            Ok(run) if run.id == run_id => {
+                if !listed {
+                    self.runs.push(*run);
+                    self.resort();
+                    if let Some(jump) = &mut self.prs.jump {
+                        jump.stray = true;
+                    }
+                }
+                self.select_jump_run(run_id);
+            }
+            Ok(_) => {}
+            // A sweep has listed the run since, so the failed read no longer matters.
+            Err(_) if listed => {}
+            Err(e) => {
+                self.prs.jump = None;
+                self.mode = Mode::Prs;
+                self.set_status(format!("Run {run_id}: {e}"), true);
+            }
+        }
+    }
+
+    /// Ends a visit to a check's run, taking out the run if the visit added it.
+    pub(super) fn end_run_jump(&mut self) {
+        let Some(jump) = self.prs.jump.take() else { return };
+        let keep = self.run_to_keep();
+        if jump.stray {
+            self.runs.retain(|r| r.id != jump.run_id);
+        }
+        self.recompute_view_keeping(keep);
+    }
+
+    /// The run a visit added, if it belongs to `repo`, to put back after that
+    /// repo's runs are replaced.
+    pub(super) fn stray_run_of(&self, repo: &str) -> Option<Run> {
+        let jump = self.prs.jump.as_ref().filter(|j| j.stray)?;
+        self.runs.iter().find(|r| r.id == jump.run_id && r.repository.full_name == repo).cloned()
+    }
+
+    /// Puts back a visit's run that a sweep of its repo replaced. If the sweep
+    /// listed it, it is a normal run from then on.
+    pub(super) fn restore_stray_run(&mut self, stray: Option<Run>) {
+        let Some(run) = stray else { return };
+        if self.runs.iter().any(|r| r.id == run.id) {
+            if let Some(jump) = &mut self.prs.jump {
+                jump.stray = false;
+            }
+        } else {
+            self.runs.push(run);
+        }
+    }
+
     pub(super) fn apply_pr(&mut self, msg: PrMsg) {
         match msg {
             PrMsg::List { group, result } => {
@@ -252,6 +337,7 @@ impl App {
                 }
                 self.prs.list.set(group, result);
             }
+            PrMsg::Run(result) => self.apply_jump_run(result),
             PrMsg::Detail { pr, result } => {
                 // An answer for a PR that has since been closed or swapped is dropped.
                 if !self.prs.open.as_ref().is_some_and(|v| v.pr == pr) {
@@ -271,7 +357,9 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::{DataMsg, Filter, Mode};
     use crate::pulls::model::{ChecksState, ReviewDecision};
+    use crossterm::event::{KeyCode, KeyEvent};
     use chrono::Utc;
 
     fn summary(repo: &str, n: u64) -> PrSummary {
@@ -285,6 +373,163 @@ mod tests {
             checks: ChecksState::Passing,
             review: ReviewDecision::NotRequired,
         }
+    }
+
+    fn run_in(repo: &str, id: u64, conclusion: &str) -> crate::github::Run {
+        crate::github::Run {
+            id,
+            name: Some("CI".into()),
+            display_title: "fix".into(),
+            head_branch: Some("main".into()),
+            head_sha: "a1b2c3d".into(),
+            run_number: 7,
+            workflow_id: 11,
+            event: "push".into(),
+            status: "completed".into(),
+            conclusion: Some(conclusion.into()),
+            html_url: String::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            run_started_at: None,
+            actor: None,
+            repository: crate::github::RunRepo { full_name: repo.into() },
+        }
+    }
+
+    /// An app showing a PR whose only check is Actions run 555.
+    fn app_on_a_pr_with_a_run_check() -> App {
+        use crate::pulls::model::*;
+        let mut app = App::new(&crate::config::Config::default());
+        let pr = PrRef { repo: "org/api".into(), number: 7 };
+        let detail = PrDetail {
+            node_id: "PR_7".into(),
+            title: "Fix login".into(),
+            body: String::new(),
+            author: "ana".into(),
+            url: pr.url(),
+            head: HeadRef { branch: "main".into(), repo: "org/api".into(), oid: "abc".into() },
+            base_branch: "release".into(),
+            draft: false,
+            labels: vec![],
+            merge_status: MergeStatus::Blocked,
+            reviewers: vec![],
+            checks: vec![Check {
+                name: "Unit tests".into(),
+                state: CheckState::Passed,
+                target: CheckTarget::ActionsRun { run_id: 555 },
+            }],
+            comments: vec![],
+            reviews: vec![],
+            threads: vec![],
+            merge_methods: vec![MergeMethod::Squash],
+            queue: QueueState::Queued { position: 2 },
+        };
+        let mut view = PrView::new(pr);
+        view.set_detail(Ok(Box::new(detail)));
+        app.prs.open = Some(view);
+        app.mode = Mode::Prs;
+        app
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_key(KeyEvent::from(code));
+    }
+
+    #[test]
+    fn a_check_run_outside_the_list_is_fetched_and_shown() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        app.apply(DataMsg::Runs { repo: "org/api".into(), runs: vec![run_in("org/api", 1, "failure")] });
+        app.set_filter(Filter::Failed);
+        app.pending.clear();
+
+        press(&mut app, KeyCode::Enter);
+        assert!(app.mode == Mode::Normal);
+        assert!(
+            matches!(&app.pending[..], [Command::Pr(PrCommand::FetchRun { repo, run_id: 555 })] if repo == "org/api")
+        );
+
+        app.apply(DataMsg::Pr(PrMsg::Run(Ok(Box::new(run_in("org/api", 555, "success"))))));
+        assert_eq!(app.selected_run().map(|r| r.id), Some(555));
+        assert_eq!(app.filter, Filter::Failed, "the filter is left alone");
+    }
+
+    #[test]
+    fn a_loaded_check_run_is_selected_without_a_fetch() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        app.apply(DataMsg::Runs {
+            repo: "org/api".into(),
+            runs: vec![run_in("org/api", 1, "failure"), run_in("org/api", 555, "success")],
+        });
+        app.set_filter(Filter::Failed);
+        app.pending.clear();
+
+        press(&mut app, KeyCode::Enter);
+        assert!(app.pending.is_empty());
+        assert_eq!(app.selected_run().map(|r| r.id), Some(555));
+
+        // A sweep of the repo does not move the cursor off it.
+        app.apply(DataMsg::Runs {
+            repo: "org/api".into(),
+            runs: vec![run_in("org/api", 1, "failure"), run_in("org/api", 555, "success")],
+        });
+        assert_eq!(app.selected_run().map(|r| r.id), Some(555));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.mode == Mode::Prs);
+        assert!(app.runs.iter().any(|r| r.id == 555), "a run that was already loaded stays");
+    }
+
+    #[test]
+    fn a_sweep_does_not_drop_a_fetched_run() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        press(&mut app, KeyCode::Enter);
+        app.apply(DataMsg::Pr(PrMsg::Run(Ok(Box::new(run_in("org/api", 555, "success"))))));
+        app.apply(DataMsg::Runs { repo: "org/api".into(), runs: vec![run_in("org/api", 1, "failure")] });
+        assert_eq!(app.selected_run().map(|r| r.id), Some(555));
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.runs.iter().any(|r| r.id == 555));
+    }
+
+    #[test]
+    fn esc_from_a_jumped_run_returns_to_the_pr_and_drops_the_stray_run() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        press(&mut app, KeyCode::Enter);
+        app.apply(DataMsg::Pr(PrMsg::Run(Ok(Box::new(run_in("org/api", 555, "success"))))));
+        assert!(app.runs.iter().any(|r| r.id == 555));
+
+        press(&mut app, KeyCode::Esc);
+        assert!(app.mode == Mode::Prs);
+        assert!(app.prs.open.is_some());
+        assert!(app.prs.jump.is_none());
+        assert!(!app.runs.iter().any(|r| r.id == 555));
+    }
+
+    #[test]
+    fn a_failed_run_fetch_stays_on_the_pr_with_the_error() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        press(&mut app, KeyCode::Enter);
+        app.apply(DataMsg::Pr(PrMsg::Run(Err("404 Not Found".into()))));
+        assert!(app.mode == Mode::Prs);
+        assert!(app.prs.jump.is_none());
+        assert!(app.status_msg.as_ref().is_some_and(|(m, err, _)| m.contains("404") && *err));
+    }
+
+    #[test]
+    fn checks_without_a_run_open_a_link_or_say_so() {
+        use crate::pulls::model::{Check, CheckState, CheckTarget};
+        let mut app = app_on_a_pr_with_a_run_check();
+        let check = |target| Check { name: "x".into(), state: CheckState::Passed, target };
+        let set = |app: &mut App, target| {
+            if let Some(Loadable::Ready(d)) = app.prs.open.as_mut().map(|v| &mut v.detail) {
+                d.checks = vec![check(target)];
+            }
+        };
+        set(&mut app, CheckTarget::Link("https://ci.example/1".into()));
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(&app.pending[..], [Command::OpenUrl(u)] if u == "https://ci.example/1"));
+        set(&mut app, CheckTarget::Nothing);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.mode == Mode::Prs);
+        assert!(app.status_msg.as_ref().is_some_and(|(m, _, _)| m == "That check has no page to open"));
     }
 
     #[test]

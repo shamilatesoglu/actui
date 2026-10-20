@@ -16,6 +16,13 @@ pub fn run_command(cmd: PrCommand, gh: &Github, tx: &UnboundedSender<DataMsg>) {
                 });
             }
         }
+        PrCommand::FetchRun { repo, run_id } => {
+            let (gh, tx) = (gh.clone(), tx.clone());
+            tokio::spawn(async move {
+                let result = gh.workflow_run(&repo, run_id).await.map(Box::new).map_err(|e| e.to_string());
+                let _ = tx.send(DataMsg::Pr(PrMsg::Run(result)));
+            });
+        }
         PrCommand::FetchDetail(pr) => {
             let (gh, tx) = (gh.clone(), tx.clone());
             tokio::spawn(async move {

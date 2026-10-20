@@ -385,7 +385,10 @@ impl App {
             // Esc dismisses progressively: a kept search filter, then the repo
             // scope, then focus.
             KeyCode::Esc => {
-                if !self.search.is_empty() {
+                if self.prs.jump.is_some() && self.focus == Focus::Runs {
+                    self.end_run_jump();
+                    self.mode = Mode::Prs;
+                } else if !self.search.is_empty() {
                     self.search.clear();
                     self.recompute_view();
                 } else if self.repos.scope().is_some() {

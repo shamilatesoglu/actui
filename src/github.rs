@@ -719,6 +719,14 @@ impl Github {
         Ok(found)
     }
 
+    /// One run by id, for a run that is not on the runs list.
+    pub async fn workflow_run(&self, repo: &str, run_id: u64) -> Result<Run> {
+        let resp = self
+            .send(self.client.get(format!("{API}/repos/{repo}/actions/runs/{run_id}")))
+            .await?;
+        Ok(ensure_ok(resp).await?.json().await?)
+    }
+
     /// Artifacts produced by a run.
     pub async fn list_artifacts(&self, full_name: &str, run_id: u64) -> Result<Vec<Artifact>> {
         #[derive(Deserialize)]

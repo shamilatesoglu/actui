@@ -1,6 +1,7 @@
 //! Keys and clicks on the PRs screens.
 
-use super::{PrCommand, PrTab, PrView};
+use super::{Loadable, PrCommand, PrTab, PrView};
+use crate::pulls::model::CheckTarget;
 use crate::app::{App, Command, Filter, Mode};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Position;
@@ -8,6 +9,7 @@ use ratatui::layout::Position;
 impl App {
     /// Opens the PRs list and reads it again.
     pub(in crate::app) fn open_prs(&mut self) {
+        self.end_run_jump();
         self.mode = Mode::Prs;
         self.pending.push(Command::Pr(PrCommand::FetchList));
     }
@@ -60,7 +62,22 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up if view.tab == PrTab::Overview => view.scroll_overview(-1),
             KeyCode::Char('J') if view.tab == PrTab::Overview => view.move_check(1),
             KeyCode::Char('K') if view.tab == PrTab::Overview => view.move_check(-1),
+            KeyCode::Enter if view.tab == PrTab::Overview => self.open_selected_check(),
             _ => {}
+        }
+    }
+
+    /// Acts on the check picked with J/K: its Actions run opens on the runs
+    /// screen, any other page opens in the browser.
+    fn open_selected_check(&mut self) {
+        let Some(view) = &self.prs.open else { return };
+        let Loadable::Ready(detail) = &view.detail else { return };
+        let Some(check) = view.checks.selected().and_then(|i| detail.checks.get(i)) else { return };
+        let (repo, target) = (view.pr.repo.clone(), check.target.clone());
+        match target {
+            CheckTarget::ActionsRun { run_id } => self.jump_to_run(repo, run_id),
+            CheckTarget::Link(url) => self.pending.push(Command::OpenUrl(url)),
+            CheckTarget::Nothing => self.set_status("That check has no page to open", true),
         }
     }
 

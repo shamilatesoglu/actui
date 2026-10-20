@@ -692,8 +692,10 @@ impl App {
     fn ingest_runs(&mut self, repo: String, runs: Vec<Run>) {
         // Read the cursor's run before the list moves under it.
         let keep = self.run_to_keep();
+        let stray = self.stray_run_of(&repo);
         self.runs.retain(|r| r.repository.full_name != repo);
         self.runs.extend(runs);
+        self.restore_stray_run(stray);
         self.reconcile_pending_dispatches(&repo);
         self.resort();
         self.recompute_view_keeping(keep);
@@ -907,14 +909,16 @@ impl App {
         let resort = std::mem::take(&mut self.resort_repos);
         self.repos.rebuild(&self.runs, resort, &self.state);
         let q = self.search.to_lowercase();
+        // The run a PR's check led to shows whatever the filters say.
+        let jumped = self.prs.jump.as_ref().map(|j| j.run_id);
         self.view = self
             .runs
             .iter()
             .enumerate()
-            .filter(|(_, r)| self.repos.in_scope(&r.repository.full_name))
-            .filter(|(_, r)| self.filter.matches(r.state()))
+            .filter(|(_, r)| jumped == Some(r.id) || self.repos.in_scope(&r.repository.full_name))
+            .filter(|(_, r)| jumped == Some(r.id) || self.filter.matches(r.state()))
             .filter(|(_, r)| {
-                if q.is_empty() {
+                if q.is_empty() || jumped == Some(r.id) {
                     return true;
                 }
                 fuzzy(&r.repository.full_name, &q)
