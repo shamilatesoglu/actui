@@ -281,6 +281,12 @@ impl PrView {
         }
     }
 
+    /// Whether a box is open over the PR: the comment box, the merge box or
+    /// a review box.
+    pub fn has_box(&self) -> bool {
+        self.compose.is_some() || self.merge_dialog.is_some() || self.review_popup.is_some()
+    }
+
     pub fn cycle_tab(&mut self, delta: i32) {
         let at = PrTab::ALL.iter().position(|t| *t == self.tab).unwrap_or(0) as i32;
         self.tab = PrTab::ALL[(at + delta).rem_euclid(PrTab::ALL.len() as i32) as usize];

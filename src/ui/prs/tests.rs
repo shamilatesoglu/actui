@@ -174,6 +174,52 @@ fn enter_opens_the_pr_overview() {
     assert!(out.contains("Review requested"), "back on the list");
 }
 
+/// Clicks the first column of `label` on the screen as drawn.
+fn click_label(app: &mut App, label: &str) {
+    let out = screen(app, 140, 30);
+    let row = row_of(&out, label);
+    let at = column_of(out.lines().nth(row as usize).unwrap(), label) as u16;
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), at, row));
+}
+
+#[test]
+fn tab_clicks_leave_an_open_box_alone() {
+    use crate::app::{DataMsg, Mode, PrMsg};
+    use crate::pulls::model::QueueState;
+    use crossterm::event::{KeyCode, KeyEvent};
+    let mut app = prs_app();
+    app.handle_key(KeyEvent::from(KeyCode::Enter));
+    let pr = app.prs.open.as_ref().unwrap().pr.clone();
+    let mut detail = pr_detail();
+    detail.queue = QueueState::NoQueue;
+    app.apply(DataMsg::Pr(PrMsg::Detail { pr, result: Ok(Box::new(detail)) }));
+    app.handle_key(KeyEvent::from(KeyCode::Char('c')));
+    for c in "half a thought".chars() {
+        app.handle_key(KeyEvent::from(KeyCode::Char(c)));
+    }
+    for label in ["⇄ PRs", "⚙ Runners", "◷ Duration", "Running"] {
+        click_label(&mut app, label);
+        assert!(app.mode == Mode::Prs, "a click on {label} keeps the PR screen");
+        let compose = app.prs.open.as_ref().and_then(|v| v.compose.as_ref());
+        assert_eq!(compose.map(|c| c.text()).as_deref(), Some("half a thought"), "after {label}");
+    }
+
+    // The merge box and the review boxes are kept the same way.
+    app.prs.open.as_mut().unwrap().compose = None;
+    app.handle_key(KeyEvent::from(KeyCode::Char('m')));
+    click_label(&mut app, "⚙ Runners");
+    assert!(app.prs.open.as_ref().is_some_and(|v| v.merge_dialog.is_some()));
+    app.handle_key(KeyEvent::from(KeyCode::Esc));
+    app.handle_key(KeyEvent::from(KeyCode::Char('R')));
+    click_label(&mut app, "Running");
+    assert!(app.prs.open.as_ref().is_some_and(|v| v.review_popup.is_some()));
+
+    // With nothing open, the tabs work as before.
+    app.handle_key(KeyEvent::from(KeyCode::Esc));
+    click_label(&mut app, "Running");
+    assert!(app.mode == Mode::Normal);
+}
+
 #[test]
 fn the_comment_box_and_a_discard_question_draw_over_the_pr() {
     use crate::app::{DataMsg, PrMsg};

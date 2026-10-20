@@ -266,6 +266,11 @@ impl App {
     }
 
     pub(in crate::app) fn click_prs(&mut self, x: u16, y: u16) {
+        // A box over the PR takes the keys, so a click elsewhere must not
+        // close it and lose what it holds.
+        if self.prs.open.as_ref().is_some_and(PrView::has_box) {
+            return;
+        }
         let pos = Position::new(x, y);
         if self.hit.prs_tab.contains(pos) {
             self.close_prs();
