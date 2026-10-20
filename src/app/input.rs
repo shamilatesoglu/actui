@@ -24,9 +24,7 @@ impl App {
             Mode::Search => self.key_search(key),
             // Tab turns the page; any other key closes the help.
             Mode::Help if key.code == KeyCode::Tab => self.help_page = self.help_page.other(),
-            Mode::Help => {
-                self.mode = Mode::Normal;
-            }
+            Mode::Help => self.mode = self.help_from,
             Mode::Logs => self.key_logs(key),
             Mode::Dispatch => self.key_dispatch(key),
             Mode::Confirm => self.key_confirm(key),
@@ -236,7 +234,11 @@ impl App {
     fn mouse_click(&mut self, x: u16, y: u16) -> bool {
         match self.mode {
             // Any-key overlays dismiss on click too.
-            Mode::Help | Mode::Errors => {
+            Mode::Help => {
+                self.mode = self.help_from;
+                true
+            }
+            Mode::Errors => {
                 self.mode = Mode::Normal;
                 true
             }
@@ -413,10 +415,7 @@ impl App {
                     self.mode = Mode::Errors;
                 }
             }
-            KeyCode::Char('?') => {
-                self.help_page = HelpPage::default();
-                self.mode = Mode::Help;
-            }
+            KeyCode::Char('?') => self.show_help(HelpPage::default()),
             // Enter / l: drill from runs into jobs, or open the focused job's logs.
             KeyCode::Enter | KeyCode::Char('l') => match self.focus {
                 Focus::Repos => self.focus = Focus::Runs,
@@ -917,6 +916,13 @@ impl App {
         } else {
             self.ask(PendingAction::Quit { unsent });
         }
+    }
+
+    /// Opens the help on `page` over the current screen; closing it returns there.
+    pub(super) fn show_help(&mut self, page: HelpPage) {
+        self.help_page = page;
+        self.help_from = self.mode;
+        self.mode = Mode::Help;
     }
 
     /// Asks a yes/no question over the current screen; the answer returns there.

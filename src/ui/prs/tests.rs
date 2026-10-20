@@ -219,6 +219,15 @@ fn tab_clicks_leave_an_open_box_alone() {
 }
 
 #[test]
+fn question_mark_shows_the_pr_keys_over_the_pr() {
+    use crossterm::event::{KeyCode, KeyEvent};
+    let mut app = prs_app();
+    app.handle_key(KeyEvent::from(KeyCode::Char('?')));
+    let out = screen(&mut app, 120, 40);
+    assert!(out.contains("every review thread, outdated ones too"), "the PR page of the help: {out}");
+}
+
+#[test]
 fn the_comment_box_and_a_discard_question_draw_over_the_pr() {
     use crate::app::{DataMsg, PrMsg};
     use crossterm::event::{KeyCode, KeyEvent};

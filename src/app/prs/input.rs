@@ -1,7 +1,7 @@
 //! Keys and clicks on the PRs screens.
 
 use super::{ComposeTarget, DiffView, Loadable, PrAction, PrCommand, PrTab, PrView};
-use crate::app::PendingAction;
+use crate::app::{HelpPage, PendingAction};
 use crate::pulls::model::{CheckState, CheckTarget, MergeStatus, PrDetail};
 use crate::app::{App, Command, Filter, Mode};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -63,6 +63,7 @@ impl App {
         }
         match key.code {
             KeyCode::Char('q' | 'P') => self.close_prs(),
+            KeyCode::Char('?') => self.show_help(HelpPage::PullRequests),
             // A filter tab takes you back to the runs it filters.
             KeyCode::Char(c @ '1'..='5') => {
                 self.close_prs();

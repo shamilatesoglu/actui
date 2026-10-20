@@ -377,10 +377,15 @@ impl PrsState {
 }
 
 impl App {
-    /// Whether the PRs screens are what shows, which includes a question
-    /// asked over them.
+    /// Whether the PRs screens are what shows, which includes a question or
+    /// the help over them.
     pub fn shows_prs(&self) -> bool {
-        self.mode == Mode::Prs || (self.mode == Mode::Confirm && self.confirm_from == Mode::Prs)
+        match self.mode {
+            Mode::Prs => true,
+            Mode::Confirm => self.confirm_from == Mode::Prs,
+            Mode::Help => self.help_from == Mode::Prs,
+            _ => false,
+        }
     }
 
     /// Reads the open PR again; the refresh timer calls this.
@@ -756,6 +761,27 @@ mod tests {
         press(&mut app, KeyCode::Char('q'));
         assert!(!app.should_quit, "asks instead of quitting");
         assert!(app.mode == Mode::Confirm);
+    }
+
+    #[test]
+    fn question_mark_on_the_pr_screens_opens_the_pr_keys_and_comes_back() {
+        use crate::app::HelpPage;
+        let mut app = app_on_a_pr_with_a_run_check();
+        press(&mut app, KeyCode::Char('?'));
+        assert!(app.mode == Mode::Help);
+        assert!(app.help_page == HelpPage::PullRequests);
+        assert!(app.shows_prs(), "the PR stays behind the help");
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.mode == Mode::Prs, "back on the PR");
+        assert!(app.prs.open.is_some());
+        assert!(app.pending.is_empty(), "the key that closed the help did nothing else");
+
+        // The runs screen still opens the first page and returns to the runs.
+        app.mode = Mode::Normal;
+        press(&mut app, KeyCode::Char('?'));
+        assert!(app.help_page == HelpPage::Keys);
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.mode == Mode::Normal);
     }
 
     #[test]

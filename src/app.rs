@@ -242,6 +242,8 @@ pub struct App {
     timing_cache: HashMap<u64, TimingHistory>,
     pub pending_action: Option<PendingAction>,
     pub help_page: HelpPage,
+    /// The mode closing the help returns to.
+    help_from: Mode,
     /// The mode a confirm prompt returns to.
     confirm_from: Mode,
     pub pending_open_log_id: Option<u64>,
@@ -328,6 +330,7 @@ impl App {
             timing_cache: HashMap::new(),
             pending_action: None,
             help_page: HelpPage::default(),
+            help_from: Mode::Normal,
             confirm_from: Mode::Normal,
             pending_open_log_id: None,
             logs_fetch_due: None,
