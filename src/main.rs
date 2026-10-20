@@ -302,6 +302,10 @@ async fn run(
                     last_pickup = std::time::Instant::now();
                 }
                 // An open PR with checks still running is watched closely.
+                if app.prs.open.is_none() {
+                    // Counts from the moment a PR opens, which fetches it itself.
+                    last_pr = std::time::Instant::now();
+                }
                 let pr_iv = if app.prs.open_checks_pending() { focused_iv } else { broad_iv };
                 if !throttled && app.prs.open.is_some() && last_pr.elapsed() >= pr_iv.max(floor) {
                     app.queue_pr_refresh();

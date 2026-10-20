@@ -5,7 +5,8 @@ use crate::app::PrView;
 use crate::pulls::model::{
     blocked_reason, Check, CheckState, PrDetail, PrRef, QueueState, Verdict,
 };
-use ratatui::widgets::ListState;
+use ratatui::buffer::Buffer;
+use ratatui::widgets::{ListState, Widget};
 
 /// Draws the overview in `area`: the text scrolls above, the checks list sits
 /// below it with its own cursor.
@@ -22,7 +23,7 @@ pub(super) fn draw_overview(
         Layout::vertical([Constraint::Min(1), Constraint::Length(check_rows)]).areas(area);
 
     let lines = overview_lines(&view.pr, detail);
-    let rows: usize = lines.iter().map(|l| wrapped_rows(l, text_area.width as usize)).sum();
+    let rows = wrapped_rows(&lines, text_area.width);
     view.overview_max_scroll = rows.saturating_sub(text_area.height as usize).min(u16::MAX as usize) as u16;
     view.overview_scroll = view.overview_scroll.min(view.overview_max_scroll);
     let text = Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((view.overview_scroll, 0));
@@ -57,11 +58,22 @@ fn check_line(check: &Check, spin: &'static str) -> Line<'static> {
     Line::from(vec![Span::styled(glyph, Style::default().fg(color)), Span::raw(format!(" {}", check.name))])
 }
 
-/// Rows a line takes once wrapped to `width`. Wrapping at word boundaries can
-/// use a row more than this, which only means the last row of a long text
-/// takes one more scroll to reach.
-fn wrapped_rows(line: &Line, width: usize) -> usize {
-    line.width().div_ceil(width.max(1)).max(1)
+/// How many rows `lines` take once wrapped to `width` the way the paragraph
+/// wraps them. Counted by drawing into a scratch buffer, since the word
+/// breaking is the paragraph's own.
+fn wrapped_rows(lines: &[Line], width: u16) -> usize {
+    if width == 0 {
+        return 0;
+    }
+    // Even breaking every word mid-way takes under two rows per width's worth.
+    let most: usize = lines.iter().map(|l| 2 * l.width().div_ceil(width as usize) + 1).sum();
+    let area = Rect::new(0, 0, width, most.min(u16::MAX as usize) as u16);
+    let mut buf = Buffer::empty(area);
+    Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false }).render(area, &mut buf);
+    (0..area.height)
+        .rev()
+        .find(|&y| (0..width).any(|x| buf[(x, y)].symbol() != " "))
+        .map_or(0, |y| y as usize + 1)
 }
 
 fn verdict_glyph(verdict: Verdict) -> (&'static str, &'static str, Color) {
@@ -98,7 +110,7 @@ fn overview_lines(pr: &PrRef, d: &PrDetail) -> Vec<Line<'static>> {
 
     for (i, r) in d.reviewers.iter().enumerate() {
         let (glyph, words, color) = verdict_glyph(r.verdict);
-        let label = if i == 0 { "reviewers" } else { "" };
+        let label = if i == 0 { "review" } else { "" };
         lines.push(Line::from(vec![
             Span::styled(format!("{label:>LABEL_W$}  "), Style::default().fg(dim())),
             Span::styled(glyph, Style::default().fg(color)),
@@ -109,7 +121,7 @@ fn overview_lines(pr: &PrRef, d: &PrDetail) -> Vec<Line<'static>> {
 
     lines.push(Line::default());
     let body = markdown_lines(&d.body);
-    if body.is_empty() {
+    if d.body.trim().is_empty() {
         lines.push(Line::styled("No description.", Style::default().fg(dim())));
     } else {
         lines.extend(body);
@@ -227,6 +239,29 @@ fn links_as_text(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pulls::model::{HeadRef, MergeStatus};
+
+    fn detail() -> PrDetail {
+        PrDetail {
+            node_id: "PR_7".into(),
+            title: "Fix login".into(),
+            body: String::new(),
+            author: "ana".into(),
+            url: "https://github.com/org/api/pull/7".into(),
+            head: HeadRef { branch: "main".into(), repo: "org/api".into(), oid: "abc".into() },
+            base_branch: "release".into(),
+            draft: false,
+            labels: vec![],
+            merge_status: MergeStatus::Clean,
+            reviewers: vec![],
+            checks: vec![],
+            comments: vec![],
+            reviews: vec![],
+            threads: vec![],
+            merge_methods: vec![],
+            queue: QueueState::NoQueue,
+        }
+    }
 
     #[test]
     fn markdown_hides_template_comments_and_carriage_returns() {
@@ -236,6 +271,38 @@ mod tests {
         assert_eq!(texts, ["Summary", "Fixes #3 (https://x/3)", "let a = 1;"]);
         assert!(lines.iter().flat_map(|l| &l.spans).all(|s| !s.content.contains('\r')));
         assert!(lines[0].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn a_long_description_scrolls_to_its_last_word() {
+        let mut detail = detail();
+        detail.body = (1..=60).map(|n| format!("word{n}")).collect::<Vec<_>>().join(" ") + " THEEND";
+        let mut view = PrView {
+            pr: PrRef { repo: "org/api".into(), number: 7 },
+            detail: crate::app::Loadable::Loading,
+            tab: crate::app::PrTab::Overview,
+            overview_scroll: 0,
+            overview_max_scroll: 0,
+            checks: ListState::default(),
+        };
+        let draw = |view: &mut PrView| {
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(23, 12)).unwrap();
+            term.draw(|f| draw_overview(f, view, &detail, f.area(), "*")).unwrap();
+            format!("{:?}", term.backend().buffer())
+        };
+        draw(&mut view);
+        assert!(view.overview_max_scroll > 0);
+        view.overview_scroll = view.overview_max_scroll;
+        assert!(draw(&mut view).contains("THEEND"));
+    }
+
+    #[test]
+    fn a_blank_description_reads_as_none() {
+        let mut detail = detail();
+        detail.body = "  \n\r\n ".into();
+        let lines = overview_lines(&PrRef { repo: "org/api".into(), number: 7 }, &detail);
+        let last: String = lines.last().unwrap().spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(last, "No description.");
     }
 
     #[test]
