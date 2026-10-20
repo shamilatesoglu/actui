@@ -594,8 +594,45 @@ impl Github {
         let req = self.client.put(url).json(&serde_json::json!({ "expected_head_sha": head_oid }));
         ensure_ok(self.send(req).await?).await.map(|_| ())
     }
+
+    /// Merges the PR. GitHub refuses if the branch moved since the given head
+    /// commit was read.
+    pub async fn merge_pr(&self, pr: &PrRef, method: MergeMethod, head_oid: &str) -> Result<()> {
+        let url = format!("{REST_URL}/repos/{}/pulls/{}/merge", pr.repo, pr.number);
+        let body = serde_json::json!({ "merge_method": method.api_name(), "sha": head_oid });
+        ensure_ok(self.send(self.client.put(url).json(&body)).await?).await.map(|_| ())
+    }
+
+    pub async fn delete_branch(&self, repo: &str, branch: &str) -> Result<()> {
+        let req = self.client.delete(branch_ref_url(repo, branch)?);
+        ensure_ok(self.send(req).await?).await.map(|_| ())
+    }
+
+    pub async fn enqueue_pr(&self, node_id: &str, head_oid: &str) -> Result<()> {
+        let vars = serde_json::json!({ "id": node_id, "oid": head_oid });
+        self.graphql::<serde_json::Value>(ENQUEUE, vars).await.map(|_| ())
+    }
+
+    pub async fn dequeue_pr(&self, node_id: &str) -> Result<()> {
+        self.graphql::<serde_json::Value>(DEQUEUE, serde_json::json!({ "id": node_id })).await.map(|_| ())
+    }
 }
 
+/// The REST address of a branch. Each part of the name is escaped, so a `#`
+/// or `?` in it stays in the path.
+fn branch_ref_url(repo: &str, branch: &str) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(REST_URL)?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow!("{REST_URL} is not a base URL"))?
+        .extend(["repos"])
+        .extend(repo.split('/'))
+        .extend(["git", "refs", "heads"])
+        .extend(branch.split('/'));
+    Ok(url)
+}
+
+const ENQUEUE: &str = "mutation($id: ID!, $oid: GitObjectID!) { enqueuePullRequest(input: { pullRequestId: $id, expectedHeadOid: $oid }) { clientMutationId } }";
+const DEQUEUE: &str = "mutation($id: ID!) { dequeuePullRequest(input: { id: $id }) { clientMutationId } }";
 const MARK_READY: &str = "mutation($id: ID!) { markPullRequestReadyForReview(input: { pullRequestId: $id }) { clientMutationId } }";
 const CONVERT_TO_DRAFT: &str = "mutation($id: ID!) { convertPullRequestToDraft(input: { pullRequestId: $id }) { clientMutationId } }";
 
@@ -622,6 +659,8 @@ mod tests {
             ("DETAIL_QUERY", DETAIL_QUERY),
             ("MARK_READY", MARK_READY),
             ("CONVERT_TO_DRAFT", CONVERT_TO_DRAFT),
+            ("ENQUEUE", ENQUEUE),
+            ("DEQUEUE", DEQUEUE),
         ];
         for (name, op) in operations {
             let open = op.find('(').unwrap_or_else(|| panic!("{name} has no variable list"));
@@ -638,6 +677,12 @@ mod tests {
                 assert!(declared.contains(u), "{name} uses ${u} without declaring it");
             }
         }
+    }
+
+    #[test]
+    fn a_branch_name_is_escaped_into_its_ref_address() {
+        let url = branch_ref_url("org/api", "fix/a#1 b?").unwrap();
+        assert_eq!(url.as_str(), "https://api.github.com/repos/org/api/git/refs/heads/fix/a%231%20b%3F");
     }
 
     #[test]

@@ -263,6 +263,7 @@ mod tests {
             checks: ListState::default(),
             files: Default::default(),
             compose: None,
+            merge_dialog: None,
             inflight: None,
         };
         let draw = |view: &mut PrView| {

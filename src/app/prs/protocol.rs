@@ -1,7 +1,7 @@
 //! What the PRs screens ask the workers for, and what comes back.
 
 use crate::github::Run;
-use crate::pulls::model::{PrDetail, PrFile, PrGroup, PrRef, PrSummary};
+use crate::pulls::model::{MergeMethod, PrDetail, PrFile, PrGroup, PrRef, PrSummary};
 
 /// Work the PRs screens request from the GitHub worker.
 pub enum PrCommand {
@@ -24,6 +24,10 @@ pub enum PrAction {
     SetDraft { node_id: String, draft: bool },
     UpdateBranch { head_oid: String },
     RerunFailed { run_ids: Vec<u64> },
+    /// Merges the PR, then deletes the named branch if one is given.
+    Merge { method: MergeMethod, head_oid: String, delete_branch: Option<String> },
+    Enqueue { node_id: String, head_oid: String },
+    Dequeue { node_id: String },
 }
 
 /// Which change an answer is about.
@@ -34,6 +38,9 @@ pub enum PrActionKind {
     ConvertToDraft,
     UpdateBranch,
     RerunFailed,
+    Merge,
+    Enqueue,
+    Dequeue,
 }
 
 impl PrAction {
@@ -44,6 +51,9 @@ impl PrAction {
             PrAction::SetDraft { draft: true, .. } => PrActionKind::ConvertToDraft,
             PrAction::UpdateBranch { .. } => PrActionKind::UpdateBranch,
             PrAction::RerunFailed { .. } => PrActionKind::RerunFailed,
+            PrAction::Merge { .. } => PrActionKind::Merge,
+            PrAction::Enqueue { .. } => PrActionKind::Enqueue,
+            PrAction::Dequeue { .. } => PrActionKind::Dequeue,
         }
     }
 }
@@ -57,6 +67,9 @@ impl PrActionKind {
             PrActionKind::ConvertToDraft => "Converted to draft",
             PrActionKind::UpdateBranch => "Branch updated",
             PrActionKind::RerunFailed => "Re-running failed checks",
+            PrActionKind::Merge => "Merged",
+            PrActionKind::Enqueue => "Added to the merge queue",
+            PrActionKind::Dequeue => "Removed from the merge queue",
         }
     }
 }

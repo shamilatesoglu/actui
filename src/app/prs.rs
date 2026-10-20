@@ -4,10 +4,12 @@
 mod compose;
 mod diff;
 mod input;
+mod merge;
 mod protocol;
 
 pub use compose::{Compose, ComposeTarget};
 pub use diff::{DiffLine, DiffView, FilesState};
+pub use merge::MergeDialog;
 pub use protocol::{PrAction, PrActionKind, PrCommand, PrMsg};
 
 use super::{App, Command, CursorHold, Focus, Mode};
@@ -250,6 +252,8 @@ pub struct PrView {
     pub files: FilesState,
     /// The box being written in, if one is open.
     pub compose: Option<Compose>,
+    /// The box that picks how to merge, if one is open.
+    pub merge_dialog: Option<MergeDialog>,
     /// What was sent from a box and has no answer yet, kept so a failure can
     /// put it back.
     pub inflight: Option<(ComposeTarget, String)>,
@@ -266,6 +270,7 @@ impl PrView {
             checks: ListState::default(),
             files: FilesState::default(),
             compose: None,
+            merge_dialog: None,
             inflight: None,
         }
     }
@@ -507,7 +512,9 @@ impl App {
 mod tests {
     use super::*;
     use crate::app::{DataMsg, Filter, Mode, PendingAction};
-    use crate::pulls::model::{Check, CheckState, CheckTarget, ChecksState, MergeStatus, ReviewDecision};
+    use crate::pulls::model::{
+        Check, CheckState, CheckTarget, ChecksState, MergeMethod, MergeStatus, QueueState, ReviewDecision,
+    };
     use crossterm::event::{KeyCode, KeyEvent};
     use chrono::Utc;
 
@@ -862,6 +869,135 @@ mod tests {
             &app.pending[..],
             [Command::Pr(PrCommand::Act { action: PrAction::RerunFailed { run_ids }, .. })] if run_ids == &[10, 11]
         ));
+    }
+
+    fn merge_dialog(app: &App) -> &MergeDialog {
+        app.prs.open.as_ref().unwrap().merge_dialog.as_ref().expect("the merge dialog is open")
+    }
+
+    #[test]
+    fn a_fork_pr_offers_no_branch_deletion() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        edit_detail(&mut app, |d| {
+            d.queue = QueueState::NoQueue;
+            d.head.repo = "fork/api".into();
+        });
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(merge_dialog(&app).delete_branch, None);
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(merge_dialog(&app).delete_branch, None, "d does nothing for a fork");
+
+        let mut app = app_on_a_pr_with_a_run_check();
+        edit_detail(&mut app, |d| d.queue = QueueState::NoQueue);
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(merge_dialog(&app).delete_branch, Some(false));
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(merge_dialog(&app).delete_branch, Some(true));
+    }
+
+    #[test]
+    fn merge_offers_only_allowed_methods_default_first() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        edit_detail(&mut app, |d| {
+            d.queue = QueueState::NoQueue;
+            d.merge_methods = vec![MergeMethod::Squash, MergeMethod::Rebase];
+        });
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(merge_dialog(&app).methods, [MergeMethod::Squash, MergeMethod::Rebase]);
+        assert_eq!(merge_dialog(&app).sel, 0);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.prs.open.as_ref().unwrap().merge_dialog.is_none());
+        assert!(matches!(
+            &app.pending[..],
+            [Command::Pr(PrCommand::Act {
+                action: PrAction::Merge { method: MergeMethod::Rebase, head_oid, delete_branch: Some(branch) },
+                ..
+            })] if head_oid == "abc" && branch == "main"
+        ));
+    }
+
+    #[test]
+    fn the_merge_dialog_takes_every_key_and_esc_closes_it() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        edit_detail(&mut app, |d| d.queue = QueueState::NoQueue);
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Char('c'));
+        assert!(app.mode == Mode::Prs && app.prs.open.is_some());
+        assert!(app.prs.open.as_ref().unwrap().compose.is_none());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.prs.open.as_ref().unwrap().merge_dialog.is_none());
+        assert!(app.pending.is_empty());
+    }
+
+    #[test]
+    fn a_draft_or_conflicting_pr_cannot_be_merged() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        edit_detail(&mut app, |d| {
+            d.queue = QueueState::NoQueue;
+            d.draft = true;
+        });
+        press(&mut app, KeyCode::Char('m'));
+        assert!(app.prs.open.as_ref().unwrap().merge_dialog.is_none() && app.mode == Mode::Prs);
+        assert!(app.status_msg.as_ref().is_some_and(|(_, err, _)| *err));
+
+        app.status_msg = None;
+        edit_detail(&mut app, |d| {
+            d.draft = false;
+            d.merge_status = MergeStatus::Conflicts;
+        });
+        press(&mut app, KeyCode::Char('m'));
+        assert!(app.prs.open.as_ref().unwrap().merge_dialog.is_none() && app.mode == Mode::Prs);
+        assert!(app.status_msg.as_ref().is_some_and(|(_, err, _)| *err));
+        assert!(app.pending.is_empty());
+    }
+
+    #[test]
+    fn a_queue_repo_queues_instead_of_merging() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        edit_detail(&mut app, |d| d.queue = QueueState::NotQueued);
+        press(&mut app, KeyCode::Char('m'));
+        assert!(app.prs.open.as_ref().unwrap().merge_dialog.is_none());
+        assert_eq!(
+            app.pending_action.as_ref().map(|a| a.prompt()).as_deref(),
+            Some("Add org/api#7 to the merge queue?")
+        );
+        press(&mut app, KeyCode::Char('y'));
+        assert!(matches!(
+            &app.pending[..],
+            [Command::Pr(PrCommand::Act { action: PrAction::Enqueue { node_id, head_oid }, .. })]
+                if node_id == "PR_7" && head_oid == "abc"
+        ));
+    }
+
+    #[test]
+    fn a_queued_pr_can_be_taken_out_of_the_queue() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(
+            app.pending_action.as_ref().map(|a| a.prompt()).as_deref(),
+            Some("Remove org/api#7 from the merge queue?")
+        );
+        press(&mut app, KeyCode::Char('y'));
+        assert!(matches!(
+            &app.pending[..],
+            [Command::Pr(PrCommand::Act { action: PrAction::Dequeue { node_id }, .. })] if node_id == "PR_7"
+        ));
+    }
+
+    #[test]
+    fn a_refused_merge_shows_why_and_refreshes() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        let pr = app.prs.open.as_ref().unwrap().pr.clone();
+        app.apply(DataMsg::Pr(PrMsg::ActDone {
+            pr,
+            kind: PrActionKind::Merge,
+            result: Err("Head branch was modified".into()),
+        }));
+        assert!(app.status_msg.as_ref().is_some_and(|(m, err, _)| m.contains("Head branch was modified") && *err));
+        assert!(matches!(&app.pending[..], [Command::Pr(PrCommand::FetchDetail(_))]));
     }
 
     #[test]

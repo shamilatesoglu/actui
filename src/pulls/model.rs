@@ -104,7 +104,6 @@ pub struct PrDetail {
     pub reviews: Vec<Review>,
     pub threads: Vec<ReviewThread>,
     /// The methods the repo allows, the viewer's default first.
-    #[allow(dead_code)] // the merge action offers them
     pub merge_methods: Vec<MergeMethod>,
     pub queue: QueueState,
 }
@@ -246,12 +245,20 @@ pub enum MergeMethod {
 
 impl MergeMethod {
     /// The name the REST API takes for `merge_method`.
-    #[allow(dead_code)] // the merge action sends it
     pub fn api_name(self) -> &'static str {
         match self {
             MergeMethod::Merge => "merge",
             MergeMethod::Squash => "squash",
             MergeMethod::Rebase => "rebase",
+        }
+    }
+
+    /// What the merge box calls it.
+    pub fn title(self) -> &'static str {
+        match self {
+            MergeMethod::Merge => "Create a merge commit",
+            MergeMethod::Squash => "Squash and merge",
+            MergeMethod::Rebase => "Rebase and merge",
         }
     }
 }

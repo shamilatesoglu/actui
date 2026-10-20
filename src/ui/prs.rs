@@ -8,11 +8,13 @@ mod overview;
 
 use super::*;
 use crate::app::{App, Loadable, PrRow, PrTab, PrView, Scroll};
-use crate::pulls::model::{Check, CheckState, CheckTarget, ChecksState, MergeStatus, PrSummary, ReviewDecision};
+use crate::pulls::model::{
+    Check, CheckState, CheckTarget, ChecksState, MergeStatus, PrSummary, QueueState, ReviewDecision,
+};
 use conversation::{conversation, draw_conversation};
 use diff::draw_files;
 use overview::draw_overview;
-pub(super) use overlays::draw_compose;
+pub(super) use overlays::{draw_compose, draw_merge_dialog};
 use ratatui::buffer::Buffer;
 use ratatui::widgets::Widget;
 
@@ -217,6 +219,14 @@ pub(super) fn open_pr_hints(view: &PrView) -> Vec<String> {
     if view.compose.is_some() {
         return owned(&["Ctrl+S send", "Esc cancel"]);
     }
+    if let Some(dialog) = &view.merge_dialog {
+        let mut hints = owned(&["j/k method"]);
+        if dialog.delete_branch.is_some() {
+            hints.push("d delete branch".to_string());
+        }
+        hints.extend(owned(&["⏎ merge", "Esc cancel"]));
+        return hints;
+    }
     let mut hints = match (view.tab, &view.files.diff) {
         (PrTab::Files, Some(diff)) if diff.searching => owned(&["type to search", "⏎ keep", "Esc drop"]),
         (PrTab::Files, Some(_)) => owned(&["j/k move", "g/G ends", "/ search", "n/N next match", "h back to files"]),
@@ -229,6 +239,14 @@ pub(super) fn open_pr_hints(view: &PrView) -> Vec<String> {
     // Keys that only apply some of the time are listed when they do.
     if let (Loadable::Ready(detail), true) = (&view.detail, view.tab != PrTab::Files) {
         let at = hints.len() - 2;
+        if !detail.draft && detail.merge_status != MergeStatus::Conflicts {
+            let key = match detail.queue {
+                QueueState::NoQueue => "m merge",
+                QueueState::NotQueued => "m queue",
+                QueueState::Queued { .. } => "m unqueue",
+            };
+            hints.insert(at, key.to_string());
+        }
         if detail.merge_status == MergeStatus::Behind {
             hints.insert(at, "u update branch".to_string());
         }

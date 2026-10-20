@@ -268,6 +268,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_body(f, app, chunks[2]);
     draw_footer(f, app, chunks[3]);
     prs::draw_compose(f, app);
+    prs::draw_merge_dialog(f, app);
 
     match app.mode {
         Mode::Help => draw_help(f),
@@ -2547,6 +2548,60 @@ mod tests {
         app.apply(DataMsg::Pr(PrMsg::Detail { pr, result: Ok(Box::new(detail)) }));
         let out = screen(&mut app, 200, 24);
         assert!(out.contains("u update branch") && out.contains("x re-run failed"));
+    }
+
+    #[test]
+    fn the_merge_box_lists_methods_warns_when_blocked_and_hides_branch_deletion_for_forks() {
+        use crate::app::{DataMsg, PrMsg};
+        use crate::pulls::model::{MergeMethod, QueueState};
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut app = prs_app();
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        let pr = app.prs.open.as_ref().unwrap().pr.clone();
+        let mut detail = pr_detail();
+        detail.queue = QueueState::NoQueue;
+        detail.merge_methods = vec![MergeMethod::Squash, MergeMethod::Rebase];
+        app.apply(DataMsg::Pr(PrMsg::Detail { pr: pr.clone(), result: Ok(Box::new(detail.clone())) }));
+        assert!(screen(&mut app, 200, 24).contains("m merge"), "the footer offers it");
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('m')));
+        let out = screen(&mut app, 140, 30);
+        assert!(out.contains("Merge org/api#7"));
+        assert!(out.contains("Squash and merge") && out.contains("Rebase and merge"));
+        assert!(!out.contains("Create a merge commit"), "only the allowed methods");
+        // The warning wraps in the box, so its two ends are checked.
+        assert!(out.contains("Blocked: changes requested. Merging works only"));
+        assert!(out.contains("protection."));
+        assert!(out.contains("[ ] Delete branch main after merging"));
+        app.handle_key(KeyEvent::from(KeyCode::Char('d')));
+        assert!(screen(&mut app, 140, 30).contains("[x] Delete branch main"));
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+
+        detail.head.repo = "fork/api".into();
+        app.apply(DataMsg::Pr(PrMsg::Detail { pr, result: Ok(Box::new(detail)) }));
+        app.handle_key(KeyEvent::from(KeyCode::Char('m')));
+        let out = screen(&mut app, 140, 30);
+        assert!(out.contains("Squash and merge"));
+        assert!(!out.to_lowercase().contains("delete branch"), "{out}");
+    }
+
+    #[test]
+    fn the_footer_names_the_queue_key_by_what_it_does() {
+        use crate::app::{DataMsg, PrMsg};
+        use crate::pulls::model::QueueState;
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut app = prs_app();
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        let pr = app.prs.open.as_ref().unwrap().pr.clone();
+        let mut detail = pr_detail();
+        for (queue, hint) in [(QueueState::NotQueued, "m queue"), (QueueState::Queued { position: 1 }, "m unqueue")] {
+            detail.queue = queue;
+            app.apply(DataMsg::Pr(PrMsg::Detail { pr: pr.clone(), result: Ok(Box::new(detail.clone())) }));
+            assert!(screen(&mut app, 200, 24).contains(hint), "{hint}");
+        }
+        detail.draft = true;
+        app.apply(DataMsg::Pr(PrMsg::Detail { pr, result: Ok(Box::new(detail)) }));
+        assert!(!screen(&mut app, 200, 24).contains("m unqueue"), "not offered on a draft");
     }
 
     #[test]

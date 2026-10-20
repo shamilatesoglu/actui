@@ -53,6 +53,18 @@ async fn act(gh: &Github, pr: &PrRef, action: PrAction) -> anyhow::Result<()> {
         PrAction::Comment { body } => gh.comment_on_pr(pr, &body).await,
         PrAction::SetDraft { node_id, draft } => gh.set_draft(&node_id, draft).await,
         PrAction::UpdateBranch { head_oid } => gh.update_branch(pr, &head_oid).await,
+        PrAction::Merge { method, head_oid, delete_branch } => {
+            gh.merge_pr(pr, method, &head_oid).await?;
+            // The merge is done by now, so a failure here says so.
+            if let Some(branch) = delete_branch {
+                gh.delete_branch(&pr.repo, &branch)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Merged, but deleting the branch failed: {e}"))?;
+            }
+            Ok(())
+        }
+        PrAction::Enqueue { node_id, head_oid } => gh.enqueue_pr(&node_id, &head_oid).await,
+        PrAction::Dequeue { node_id } => gh.dequeue_pr(&node_id).await,
         PrAction::RerunFailed { run_ids } => {
             // Every run gets its turn; the first failure is the one reported.
             let mut first_error = None;

@@ -45,6 +45,11 @@ impl App {
             self.key_compose(key);
             return;
         }
+        // So does the merge box.
+        if self.prs.open.as_ref().is_some_and(|v| v.merge_dialog.is_some()) {
+            self.key_merge_dialog(key);
+            return;
+        }
         // So does a search box.
         if let Some(diff) = self.prs.open.as_mut().and_then(|v| v.files.diff.as_mut()).filter(|d| d.searching) {
             key_search_box(diff, key);
@@ -100,6 +105,7 @@ impl App {
             KeyCode::Char('G') | KeyCode::End if view.tab == PrTab::Conversation => view.scroll_text(i32::MAX),
             KeyCode::Char('c') if view.tab != PrTab::Files => self.open_compose(ComposeTarget::PrComment),
             KeyCode::Char('D') => self.ask_toggle_draft(),
+            KeyCode::Char('m') => self.start_merge(),
             KeyCode::Char('u') => self.ask_update_branch(),
             KeyCode::Char('x') => self.ask_rerun_failed(),
             KeyCode::Char('J') if view.tab == PrTab::Overview => view.move_check(1),
@@ -110,7 +116,7 @@ impl App {
     }
 
     /// Asks before changing a PR, with `label` as the question.
-    fn ask_pr(&mut self, action: PrAction, label: String) {
+    pub(super) fn ask_pr(&mut self, action: PrAction, label: String) {
         let Some(view) = &self.prs.open else { return };
         let pr = view.pr.clone();
         self.ask(PendingAction::Pr { pr, action, label });
@@ -151,7 +157,7 @@ impl App {
     }
 
     /// The open PR's detail, or a status line saying it is not there yet.
-    fn ready_detail(&mut self) -> Option<&PrDetail> {
+    pub(super) fn ready_detail(&mut self) -> Option<&PrDetail> {
         let ready = matches!(self.prs.open.as_ref().map(|v| &v.detail), Some(Loadable::Ready(_)));
         if !ready {
             self.set_status("The pull request is still loading", true);
