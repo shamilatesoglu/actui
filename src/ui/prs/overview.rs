@@ -224,7 +224,6 @@ mod tests {
             title: "Fix login".into(),
             body: String::new(),
             author: "ana".into(),
-            url: "https://github.com/org/api/pull/7".into(),
             head: HeadRef { branch: "main".into(), repo: "org/api".into(), oid: "abc".into() },
             base_branch: "release".into(),
             draft: false,

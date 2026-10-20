@@ -9,7 +9,6 @@ fn pr(repo: &str, number: u64, title: &str) -> crate::pulls::model::PrSummary {
     use crate::pulls::model::*;
     PrSummary {
         pr: PrRef { repo: repo.into(), number },
-        node_id: format!("PR_{number}"),
         title: title.into(),
         author: "ana".into(),
         updated_at: Utc::now(),
@@ -105,7 +104,6 @@ fn pr_detail() -> crate::pulls::model::PrDetail {
         title: "Fix login".into(),
         body: "Stops the loop.\n<!-- template -->".into(),
         author: "ana".into(),
-        url: "https://github.com/org/api/pull/7".into(),
         head: HeadRef { branch: "main".into(), repo: "org/api".into(), oid: "abc".into() },
         base_branch: "release".into(),
         draft: false,
@@ -501,8 +499,7 @@ fn a_detail_refresh_that_adds_a_thread_marks_the_open_diff() {
         resolved: false,
         outdated: false,
         path: "a.rs".into(),
-        line: Some(1),
-        start_line: None,
+        lines: Some(crate::pulls::model::LineSpan::One(1)),
         side: Side::Right,
         comments: vec![],
     }];
@@ -518,8 +515,7 @@ fn thread_at(path: &str, line: Option<u32>, outdated: bool) -> crate::pulls::mod
         resolved: false,
         outdated,
         path: path.into(),
-        line,
-        start_line: None,
+        lines: line.map(crate::pulls::model::LineSpan::One),
         side: Side::Right,
         comments: vec![Comment {
             id: 1,
@@ -547,6 +543,19 @@ fn an_outdated_thread_still_shows_in_the_conversation() {
     let mut app = files_app_with(vec![], pr_detail());
     press(&mut app, crossterm::event::KeyCode::Tab);
     assert!(!screen(&mut app, 140, 24).contains("⏎ threads"), "no threads, no hint");
+}
+
+#[test]
+fn a_thread_on_several_lines_shows_its_range() {
+    let mut detail = pr_detail();
+    let mut thread = thread_at("src/new.rs", Some(12), false);
+    thread.lines = Some(crate::pulls::model::LineSpan::new(10, 12));
+    detail.threads = vec![thread];
+    let mut app = files_app_with(vec![], detail);
+    press(&mut app, crossterm::event::KeyCode::Tab);
+    assert!(screen(&mut app, 140, 24).contains("src/new.rs:10-12"));
+    press(&mut app, crossterm::event::KeyCode::Enter);
+    assert!(screen(&mut app, 140, 30).contains("Review thread"), "Enter opens it");
 }
 
 #[test]
@@ -679,8 +688,7 @@ fn rows_with_review_threads_show_a_marker() {
         resolved: false,
         outdated: false,
         path: "a.rs".into(),
-        line: Some(1),
-        start_line: None,
+        lines: Some(crate::pulls::model::LineSpan::One(1)),
         side: Side::Right,
         comments: vec![],
     }];

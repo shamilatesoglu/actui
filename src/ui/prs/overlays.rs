@@ -1,6 +1,6 @@
 //! Boxes drawn over the PR screens.
 
-use super::conversation::thread_lines;
+use super::conversation::{thread_lines, thread_place};
 use super::*;
 use crate::app::{Compose, ThreadPopup};
 use crate::pulls::model::{blocked_reason, PrDetail, PrRef, ReviewEvent};
@@ -124,7 +124,7 @@ fn draw_pending_panel(f: &mut Frame, sel: usize, pr: &PrRef, detail: Option<&PrD
     let thread_place = |id: &str| {
         let thread = detail.and_then(|d| d.threads.iter().find(|t| t.id == id));
         match thread {
-            Some(t) => format!("reply on {}{}", t.path, t.line.map(|n| format!(":{n}")).unwrap_or_default()),
+            Some(t) => format!("reply on {}", thread_place(t)),
             None => "reply".to_string(),
         }
     };

@@ -73,11 +73,17 @@ fn conversation_lines(d: &PrDetail) -> Vec<Line<'static>> {
     lines
 }
 
-pub(super) fn thread_lines(t: &ReviewThread, lines: &mut Vec<Line<'static>>) {
-    let place = match t.line {
-        Some(n) => format!("{}:{n}", t.path),
+/// Where a thread was left: `path:12`, `path:10-12` for a range, or the
+/// path alone when its lines are gone.
+pub(super) fn thread_place(t: &ReviewThread) -> String {
+    match t.lines {
+        Some(span) => format!("{}:{}", t.path, span.label()),
         None => t.path.clone(),
-    };
+    }
+}
+
+pub(super) fn thread_lines(t: &ReviewThread, lines: &mut Vec<Line<'static>>) {
+    let place = thread_place(t);
     let mut spans = vec![Span::styled(place, Style::default().fg(accent()).add_modifier(Modifier::BOLD))];
     for (on, tag) in [(t.outdated, "outdated"), (t.resolved, "resolved")] {
         if on {
@@ -122,7 +128,6 @@ mod tests {
             title: "Fix login".into(),
             body: String::new(),
             author: "ana".into(),
-            url: "https://github.com/org/api/pull/7".into(),
             head: HeadRef { branch: "main".into(), repo: "org/api".into(), oid: "abc".into() },
             base_branch: "release".into(),
             draft: false,
@@ -161,8 +166,7 @@ mod tests {
             resolved: false,
             outdated: false,
             path: "a.rs".into(),
-            line: Some(1),
-            start_line: None,
+            lines: Some(crate::pulls::model::LineSpan::One(1)),
             side: Side::Right,
             comments: vec![comment("third", at(10))],
         }];

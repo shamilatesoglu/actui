@@ -94,7 +94,7 @@ fn row_of(lines: &[DiffLine], side: Side, line: u32) -> Option<usize> {
 pub fn thread_rows(lines: &[DiffLine], threads: &[ReviewThread], path: &str) -> HashMap<usize, Vec<usize>> {
     let mut rows: HashMap<usize, Vec<usize>> = HashMap::new();
     for (i, thread) in threads.iter().enumerate() {
-        let Some(line) = thread.line.filter(|_| thread.path == path) else { continue };
+        let Some(line) = thread.lines.filter(|_| thread.path == path).map(LineSpan::end) else { continue };
         if let Some(at) = row_of(lines, thread.side, line) {
             rows.entry(at).or_default().push(i);
         }
@@ -347,8 +347,7 @@ mod tests {
             resolved: false,
             outdated: line.is_none(),
             path: path.into(),
-            line,
-            start_line: None,
+            lines: line.map(crate::pulls::model::LineSpan::One),
             side,
             comments: Vec::<Comment>::new(),
         }
@@ -412,15 +411,15 @@ mod tests {
     fn an_old_side_range_takes_in_context_by_old_numbers() {
         // 0 hunk, 1 removed 1, 2 context 2/1, 3 removed 3.
         let lines = parse_patch("@@ -1,3 +1,1 @@\n-a\n b\n-c");
-        assert_eq!(range_span(&lines, 1, 3), Ok((Side::Left, LineSpan::Range { start: 1, end: 3 })));
-        assert_eq!(range_span(&lines, 2, 3), Ok((Side::Left, LineSpan::Range { start: 2, end: 3 })));
+        assert_eq!(range_span(&lines, 1, 3), Ok((Side::Left, LineSpan::new(1, 3))));
+        assert_eq!(range_span(&lines, 2, 3), Ok((Side::Left, LineSpan::new(2, 3))));
     }
 
     #[test]
     fn a_new_side_range_takes_in_context_by_new_numbers() {
         // 0 hunk, 1 added 1, 2 context 1/2, 3 added 3.
         let lines = parse_patch("@@ -1,1 +1,3 @@\n+a\n b\n+c");
-        assert_eq!(range_span(&lines, 3, 1), Ok((Side::Right, LineSpan::Range { start: 1, end: 3 })));
+        assert_eq!(range_span(&lines, 3, 1), Ok((Side::Right, LineSpan::new(1, 3))));
         assert_eq!(range_span(&lines, 2, 2), Ok((Side::Right, LineSpan::One(2))), "context alone is the new side");
     }
 

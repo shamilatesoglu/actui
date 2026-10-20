@@ -562,7 +562,6 @@ mod tests {
     pub(super) fn summary(repo: &str, n: u64) -> PrSummary {
         PrSummary {
             pr: PrRef { repo: repo.into(), number: n },
-            node_id: format!("PR_{n}"),
             title: format!("change {n}"),
             author: "ana".into(),
             updated_at: Utc::now(),
@@ -603,7 +602,6 @@ mod tests {
             title: "Fix login".into(),
             body: String::new(),
             author: "ana".into(),
-            url: pr.url(),
             head: HeadRef { branch: "main".into(), repo: "org/api".into(), oid: "abc".into() },
             base_branch: "release".into(),
             draft: false,

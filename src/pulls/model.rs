@@ -71,9 +71,6 @@ pub enum ReviewDecision {
 #[derive(Clone, Debug)]
 pub struct PrSummary {
     pub pr: PrRef,
-    /// GraphQL node id, used by mutations.
-    #[allow(dead_code)] // nothing mutates yet
-    pub node_id: String,
     pub title: String,
     pub author: String,
     pub updated_at: DateTime<Utc>,
@@ -90,8 +87,6 @@ pub struct PrDetail {
     pub title: String,
     pub body: String,
     pub author: String,
-    #[allow(dead_code)] // the Files and Conversation tabs link to it
-    pub url: String,
     pub head: HeadRef,
     pub base_branch: String,
     pub draft: bool,
@@ -195,7 +190,6 @@ pub enum CheckTarget {
     Nothing,
 }
 
-#[allow(dead_code)] // the Conversation tab shows them
 #[derive(Clone, Debug)]
 pub struct Comment {
     /// The REST `databaseId`.
@@ -205,7 +199,6 @@ pub struct Comment {
     pub created_at: DateTime<Utc>,
 }
 
-#[allow(dead_code)] // the Conversation tab shows them
 #[derive(Clone, Debug)]
 pub struct Review {
     pub author: String,
@@ -214,16 +207,14 @@ pub struct Review {
     pub submitted_at: DateTime<Utc>,
 }
 
-#[allow(dead_code)] // the Files and Conversation tabs show them
 #[derive(Clone, Debug)]
 pub struct ReviewThread {
     pub id: String,
     pub resolved: bool,
     pub outdated: bool,
     pub path: String,
-    /// `None` when the lines the thread was left on are gone.
-    pub line: Option<u32>,
-    pub start_line: Option<u32>,
+    /// The lines the thread was left on; `None` when they are gone.
+    pub lines: Option<LineSpan>,
     pub side: Side,
     pub comments: Vec<Comment>,
 }
@@ -248,8 +239,15 @@ impl Side {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LineSpan {
     One(u32),
-    /// `start` is before `end`.
-    Range { start: u32, end: u32 },
+    Range(LineRange),
+}
+
+/// Two or more lines, `start` before `end`. Only `LineSpan::new` builds one,
+/// so the order always holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LineRange {
+    start: u32,
+    end: u32,
 }
 
 impl LineSpan {
@@ -257,15 +255,15 @@ impl LineSpan {
     pub fn new(a: u32, b: u32) -> LineSpan {
         match a.cmp(&b) {
             std::cmp::Ordering::Equal => LineSpan::One(a),
-            std::cmp::Ordering::Less => LineSpan::Range { start: a, end: b },
-            std::cmp::Ordering::Greater => LineSpan::Range { start: b, end: a },
+            std::cmp::Ordering::Less => LineSpan::Range(LineRange { start: a, end: b }),
+            std::cmp::Ordering::Greater => LineSpan::Range(LineRange { start: b, end: a }),
         }
     }
 
     /// The last line, which is where GitHub shows the comment.
     pub fn end(self) -> u32 {
         match self {
-            LineSpan::One(line) | LineSpan::Range { end: line, .. } => line,
+            LineSpan::One(line) | LineSpan::Range(LineRange { end: line, .. }) => line,
         }
     }
 
@@ -273,7 +271,7 @@ impl LineSpan {
     pub fn start(self) -> Option<u32> {
         match self {
             LineSpan::One(_) => None,
-            LineSpan::Range { start, .. } => Some(start),
+            LineSpan::Range(range) => Some(range.start),
         }
     }
 
@@ -281,7 +279,7 @@ impl LineSpan {
     pub fn label(self) -> String {
         match self {
             LineSpan::One(line) => line.to_string(),
-            LineSpan::Range { start, end } => format!("{start}-{end}"),
+            LineSpan::Range(LineRange { start, end }) => format!("{start}-{end}"),
         }
     }
 }
@@ -476,8 +474,8 @@ mod tests {
     #[test]
     fn a_span_is_one_line_or_a_sorted_range() {
         assert_eq!(LineSpan::new(12, 12), LineSpan::One(12));
-        assert_eq!(LineSpan::new(12, 10), LineSpan::Range { start: 10, end: 12 });
-        assert_eq!(LineSpan::new(10, 12), LineSpan::Range { start: 10, end: 12 });
+        assert_eq!(LineSpan::new(12, 10), LineSpan::new(10, 12));
+        assert_eq!(LineSpan::new(12, 10).label(), "10-12");
         assert_eq!((LineSpan::new(12, 10).start(), LineSpan::new(12, 10).end()), (Some(10), 12));
         assert_eq!(LineSpan::One(3).start(), None);
         let draft = DraftComment { path: "a.rs".into(), side: Side::Left, span: LineSpan::new(4, 2), body: String::new() };

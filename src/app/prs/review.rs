@@ -518,8 +518,7 @@ mod tests {
                 resolved: false,
                 outdated: false,
                 path: "src/a.rs".into(),
-                line: Some(12),
-                start_line: None,
+                lines: Some(crate::pulls::model::LineSpan::One(12)),
                 side: Side::Right,
                 comments: vec![Comment { id: 42, author: "bob".into(), body: "why?".into(), created_at: Utc::now() }],
             }];
@@ -560,7 +559,7 @@ mod tests {
             Some(ComposeTarget::LineComment {
                 path: "src/a.rs".into(),
                 side: Side::Right,
-                span: LineSpan::Range { start: 11, end: 12 },
+                span: LineSpan::new(11, 12),
             })
         );
     }
@@ -581,7 +580,7 @@ mod tests {
             Some(ComposeTarget::LineComment {
                 path: "src/a.rs".into(),
                 side: Side::Left,
-                span: LineSpan::Range { start: 10, end: 11 },
+                span: LineSpan::new(10, 11),
             })
         );
         press(&mut app, KeyCode::Esc);
@@ -903,7 +902,7 @@ mod tests {
             let mut outdated = d.threads[0].clone();
             outdated.id = "PRRT_old".into();
             outdated.outdated = true;
-            outdated.line = None;
+            outdated.lines = None;
             outdated.comments[0].id = 41;
             outdated.comments[0].created_at = Utc::now() - chrono::Duration::hours(1);
             d.threads.push(outdated);

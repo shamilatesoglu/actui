@@ -106,7 +106,7 @@ impl Github {
     }
 }
 
-const SEARCH_QUERY: &str = "query($q: String!) { search(query: $q, type: ISSUE, first: 50) { nodes {     ... on PullRequest { id number title url isDraft updatedAt reviewDecision     author { login } repository { nameWithOwner }     commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } } } } }";
+const SEARCH_QUERY: &str = "query($q: String!) { search(query: $q, type: ISSUE, first: 50) { nodes {     ... on PullRequest { number title isDraft updatedAt reviewDecision     author { login } repository { nameWithOwner }     commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } } } } }";
 
 #[derive(Deserialize)]
 struct SearchData {
@@ -121,7 +121,6 @@ struct SearchNodes {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PrNode {
-    id: String,
     number: u64,
     title: String,
     is_draft: bool,
@@ -192,7 +191,6 @@ impl From<PrNode> for PrSummary {
             .and_then(|c| c.commit.status_check_rollup.as_ref());
         PrSummary {
             pr: PrRef { repo: node.repository.name_with_owner, number: node.number },
-            node_id: node.id,
             title: node.title,
             author: node.author.map_or_else(|| "ghost".into(), |a| a.login),
             updated_at: node.updated_at,
@@ -225,7 +223,7 @@ fn parse_search(data: serde_json::Value, errors: Vec<String>) -> Result<Vec<PrSu
     }
 }
 
-const DETAIL_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { nameWithOwner mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed viewerDefaultMergeMethod pullRequest(number: $number) { id title body url isDraft baseRefName headRefName headRefOid mergeStateStatus isMergeQueueEnabled mergeQueueEntry { position } author { login } headRepository { nameWithOwner } labels(first: 30) { nodes { name } } reviewRequests(first: 30) { nodes { requestedReviewer { __typename ... on User { login } ... on Team { slug } } } } latestOpinionatedReviews(first: 50) { nodes { author { login } state } } reviews(last: 100) { nodes { author { login } state body submittedAt } } comments(last: 100) { nodes { databaseId author { login } body createdAt } } reviewThreads(first: 100) { nodes { id isResolved isOutdated path line startLine diffSide comments(first: 50) { nodes { databaseId author { login } body createdAt } } } } commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes { __typename ... on CheckRun { name status conclusion detailsUrl checkSuite { workflowRun { databaseId } } } ... on StatusContext { context state targetUrl } } } } } } } } } }";
+const DETAIL_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { nameWithOwner mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed viewerDefaultMergeMethod pullRequest(number: $number) { id title body isDraft baseRefName headRefName headRefOid mergeStateStatus isMergeQueueEnabled mergeQueueEntry { position } author { login } headRepository { nameWithOwner } labels(first: 30) { nodes { name } } reviewRequests(first: 30) { nodes { requestedReviewer { __typename ... on User { login } ... on Team { slug } } } } latestOpinionatedReviews(first: 50) { nodes { author { login } state } } reviews(last: 100) { nodes { author { login } state body submittedAt } } comments(last: 100) { nodes { databaseId author { login } body createdAt } } reviewThreads(first: 100) { nodes { id isResolved isOutdated path line startLine diffSide comments(first: 50) { nodes { databaseId author { login } body createdAt } } } } commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes { __typename ... on CheckRun { name status conclusion detailsUrl checkSuite { workflowRun { databaseId } } } ... on StatusContext { context state targetUrl } } } } } } } } } }";
 
 /// A GraphQL connection. Its nodes can be `null` (an item the viewer may not
 /// see), and those are left out.
@@ -264,7 +262,6 @@ struct DetailNode {
     id: String,
     title: String,
     body: String,
-    url: String,
     is_draft: bool,
     base_ref_name: String,
     head_ref_name: String,
@@ -520,8 +517,8 @@ fn parse_detail(data: serde_json::Value) -> Result<PrDetail> {
             resolved: t.is_resolved,
             outdated: t.is_outdated,
             path: t.path,
-            line: t.line,
-            start_line: t.start_line,
+            // A thread on one line has no start line.
+            lines: t.line.map(|end| LineSpan::new(t.start_line.unwrap_or(end), end)),
             side: if t.diff_side == "LEFT" { Side::Left } else { Side::Right },
             comments: t.comments.items().map(comment).collect(),
         })
@@ -538,7 +535,6 @@ fn parse_detail(data: serde_json::Value) -> Result<PrDetail> {
         title: pr.title,
         body: pr.body,
         author: login(pr.author),
-        url: pr.url,
         head: HeadRef {
             branch: pr.head_ref_name,
             // A deleted fork has no repository; the branch is shown as the PR's own.
@@ -929,11 +925,11 @@ mod tests {
             serde_json::json!({ "path": "src/a.rs", "line": 12, "side": "LEFT", "body": "why?" })
         );
         assert_eq!(
-            draft_thread(&comment(LineSpan::Range { start: 10, end: 12 })),
+            draft_thread(&comment(LineSpan::new(10, 12))),
             serde_json::json!({ "path": "src/a.rs", "line": 12, "side": "LEFT", "startLine": 10, "startSide": "LEFT", "body": "why?" })
         );
         assert_eq!(
-            line_comment_body("abc", &comment(LineSpan::Range { start: 10, end: 12 })),
+            line_comment_body("abc", &comment(LineSpan::new(10, 12))),
             serde_json::json!({
                 "body": "why?", "commit_id": "abc", "path": "src/a.rs",
                 "side": "LEFT", "line": 12, "start_line": 10, "start_side": "LEFT",
@@ -1068,7 +1064,7 @@ mod tests {
             "a team shows as its slug, and a new request replaces an old verdict"
         );
         assert_eq!(d.threads.len(), 1);
-        assert!(d.threads[0].line.is_none() && d.threads[0].outdated);
+        assert!(d.threads[0].lines.is_none() && d.threads[0].outdated);
         assert_eq!(d.threads[0].comments[0].id, 42);
         assert_eq!(d.comments[0].id, 41);
         assert_eq!(d.reviews.len(), 1, "a pending review is its author's draft");
@@ -1119,6 +1115,19 @@ mod tests {
         let msg = detail_answer(data, vec![]).unwrap_err().to_string();
         assert!(msg.starts_with("bad pull request response: "), "{msg}");
         assert!(msg.contains("invalid type"), "names the cause: {msg}");
+    }
+
+    #[test]
+    fn a_thread_on_several_lines_keeps_its_range() {
+        let mut data = detail_fixture();
+        let thread = &mut data["repository"]["pullRequest"]["reviewThreads"]["nodes"][0];
+        thread["line"] = 12.into();
+        thread["startLine"] = 10.into();
+        let d = detail_answer(data.clone(), vec![]).unwrap();
+        assert_eq!(d.threads[0].lines, Some(LineSpan::new(10, 12)));
+        data["repository"]["pullRequest"]["reviewThreads"]["nodes"][0]["startLine"] = serde_json::Value::Null;
+        let d = detail_answer(data, vec![]).unwrap();
+        assert_eq!(d.threads[0].lines, Some(LineSpan::One(12)));
     }
 
     #[test]
