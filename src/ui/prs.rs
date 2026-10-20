@@ -8,7 +8,7 @@ mod overview;
 
 use super::*;
 use crate::app::{App, Loadable, PrRow, PrTab, PrView, Scroll};
-use crate::pulls::model::{ChecksState, PrSummary, ReviewDecision};
+use crate::pulls::model::{Check, CheckState, CheckTarget, ChecksState, MergeStatus, PrSummary, ReviewDecision};
 use conversation::{conversation, draw_conversation};
 use diff::draw_files;
 use overview::draw_overview;
@@ -217,7 +217,7 @@ pub(super) fn open_pr_hints(view: &PrView) -> Vec<String> {
     if view.compose.is_some() {
         return owned(&["Ctrl+S send", "Esc cancel"]);
     }
-    match (view.tab, &view.files.diff) {
+    let mut hints = match (view.tab, &view.files.diff) {
         (PrTab::Files, Some(diff)) if diff.searching => owned(&["type to search", "⏎ keep", "Esc drop"]),
         (PrTab::Files, Some(_)) => owned(&["j/k move", "g/G ends", "/ search", "n/N next match", "h back to files"]),
         (PrTab::Files, None) => owned(&["Tab next tab", "j/k move", "⏎ open diff", "o open on GitHub", "r refresh"]),
@@ -225,5 +225,17 @@ pub(super) fn open_pr_hints(view: &PrView) -> Vec<String> {
             owned(&["Tab next tab", "j/k scroll", "c comment", "PgUp/PgDn page", "g/G ends", "o open on GitHub", "r refresh"])
         }
         _ => owned(&["Tab next tab", "j/k scroll", "J/K checks", "c comment", "D draft", "o open on GitHub", "r refresh"]),
+    };
+    // Keys that only apply some of the time are listed when they do.
+    if let (Loadable::Ready(detail), true) = (&view.detail, view.tab != PrTab::Files) {
+        let at = hints.len() - 2;
+        if detail.merge_status == MergeStatus::Behind {
+            hints.insert(at, "u update branch".to_string());
+        }
+        let failed = |c: &&Check| c.state == CheckState::Failed && matches!(c.target, CheckTarget::ActionsRun { .. });
+        if detail.checks.iter().any(|c| failed(&c)) {
+            hints.insert(at, "x re-run failed".to_string());
+        }
     }
+    hints
 }

@@ -2529,6 +2529,27 @@ mod tests {
     }
 
     #[test]
+    fn the_footer_lists_update_and_rerun_keys_when_they_apply() {
+        use crate::app::{DataMsg, PrMsg};
+        use crate::pulls::model::{CheckState, MergeStatus};
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut app = prs_app();
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        let pr = app.prs.open.as_ref().unwrap().pr.clone();
+        let mut detail = pr_detail();
+        app.apply(DataMsg::Pr(PrMsg::Detail { pr: pr.clone(), result: Ok(Box::new(detail.clone())) }));
+        let out = screen(&mut app, 200, 24);
+        assert!(!out.contains("u update branch") && !out.contains("x re-run failed"));
+
+        detail.merge_status = MergeStatus::Behind;
+        detail.checks[0].state = CheckState::Failed;
+        detail.checks[0].target = crate::pulls::model::CheckTarget::ActionsRun { run_id: 5 };
+        app.apply(DataMsg::Pr(PrMsg::Detail { pr, result: Ok(Box::new(detail)) }));
+        let out = screen(&mut app, 200, 24);
+        assert!(out.contains("u update branch") && out.contains("x re-run failed"));
+    }
+
+    #[test]
     fn the_footer_offers_the_way_back_to_the_pr_after_a_jump() {
         use crate::app::{DataMsg, PrMsg};
         use crossterm::event::{KeyCode, KeyEvent};

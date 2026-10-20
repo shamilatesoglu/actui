@@ -596,12 +596,49 @@ impl Github {
     }
 }
 
-const MARK_READY: &str = "mutation(: ID!) { markPullRequestReadyForReview(input: { pullRequestId:  }) { clientMutationId } }";
-const CONVERT_TO_DRAFT: &str = "mutation(: ID!) { convertPullRequestToDraft(input: { pullRequestId:  }) { clientMutationId } }";
+const MARK_READY: &str = "mutation($id: ID!) { markPullRequestReadyForReview(input: { pullRequestId: $id }) { clientMutationId } }";
+const CONVERT_TO_DRAFT: &str = "mutation($id: ID!) { convertPullRequestToDraft(input: { pullRequestId: $id }) { clientMutationId } }";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `$names` in a piece of GraphQL, in order, without repeats.
+    fn variables(text: &str) -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+        for part in text.split('$').skip(1) {
+            let name: String = part.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            if !found.contains(&name) {
+                found.push(name);
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn every_operation_declares_the_variables_it_uses_and_uses_those_it_declares() {
+        let operations = [
+            ("SEARCH_QUERY", SEARCH_QUERY),
+            ("DETAIL_QUERY", DETAIL_QUERY),
+            ("MARK_READY", MARK_READY),
+            ("CONVERT_TO_DRAFT", CONVERT_TO_DRAFT),
+        ];
+        for (name, op) in operations {
+            let open = op.find('(').unwrap_or_else(|| panic!("{name} has no variable list"));
+            let close = op.find(") {").unwrap_or_else(|| panic!("{name} has no body"));
+            let declared = variables(&op[open..close]);
+            let used = variables(&op[close..]);
+            assert!(!declared.is_empty(), "{name} declares no variable");
+            assert!(declared.iter().all(|d| d.chars().next().is_some()), "{name} has an empty variable name");
+            assert_eq!(declared.len(), op[open..close].matches('$').count(), "{name} repeats a declaration");
+            for d in &declared {
+                assert!(used.contains(d), "{name} declares ${d} but never uses it");
+            }
+            for u in &used {
+                assert!(declared.contains(u), "{name} uses ${u} without declaring it");
+            }
+        }
+    }
 
     #[test]
     fn a_file_without_a_patch_parses_with_none() {
