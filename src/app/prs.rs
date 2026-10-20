@@ -360,6 +360,9 @@ pub struct PrsState {
     sending: HashSet<PrRef>,
     /// Each PR's text that left its box and is not safe yet.
     pub outbox: HashMap<PrRef, Outbox>,
+    /// Set while the PRs must not be polled: the GraphQL quota is nearly
+    /// spent, or all polling is held back.
+    pub paused: bool,
 }
 
 impl PrsState {
@@ -1125,6 +1128,19 @@ mod tests {
         }));
         assert!(app.status_msg.as_ref().is_some_and(|(m, err, _)| m.contains("Head branch was modified") && *err));
         assert!(matches!(&app.pending[..], [Command::Pr(PrCommand::FetchDetail(_))]));
+    }
+
+    #[test]
+    fn a_paused_pr_list_is_left_out_of_the_broad_sweep() {
+        let mut app = App::new(&crate::config::Config::default());
+        app.loading = false;
+        app.queue_broad_refresh();
+        assert!(app.pending.iter().any(|c| matches!(c, Command::Pr(PrCommand::FetchList))));
+        app.pending.clear();
+        app.prs.paused = true;
+        app.queue_broad_refresh();
+        assert!(app.pending.iter().any(|c| matches!(c, Command::Refresh { .. })), "the runs are still read");
+        assert!(!app.pending.iter().any(|c| matches!(c, Command::Pr(_))));
     }
 
     #[test]

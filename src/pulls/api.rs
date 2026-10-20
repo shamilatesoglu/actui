@@ -19,6 +19,16 @@ struct GraphqlResponse<T> {
 #[derive(Deserialize)]
 struct GraphqlError {
     message: String,
+    /// `RATE_LIMITED` when the GraphQL quota is spent.
+    #[serde(rename = "type")]
+    kind: Option<String>,
+}
+
+/// Whether a GraphQL response says the GraphQL quota is spent. GitHub sends
+/// that as an error next to a 200 status, so the headers alone miss it.
+fn says_rate_limited(body: &str) -> bool {
+    serde_json::from_str::<GraphqlResponse<serde::de::IgnoredAny>>(body)
+        .is_ok_and(|resp| resp.errors.iter().any(|e| e.kind.as_deref() == Some("RATE_LIMITED")))
 }
 
 /// Returns the `data` of a GraphQL response. Errors next to data are partial
@@ -51,7 +61,13 @@ impl Github {
             .client
             .post(GRAPHQL_URL)
             .json(&serde_json::json!({ "query": query, "variables": variables }));
-        Ok(ensure_ok(self.send(req).await?).await?.text().await?)
+        let resp = ensure_ok(self.send(req).await?).await?;
+        let headers = resp.headers().clone();
+        let body = resp.text().await?;
+        if says_rate_limited(&body) {
+            self.note_graphql_limited(&headers);
+        }
+        Ok(body)
     }
 
     pub(crate) async fn graphql<T: DeserializeOwned>(
@@ -558,6 +574,28 @@ impl From<RawFile> for PrFile {
     }
 }
 
+/// What reading the first page of a PR's files leaves to do.
+#[derive(Debug)]
+enum FirstPage<T> {
+    /// Unchanged: the whole list kept from last time stands, and no other
+    /// page needs reading. Each file's links name the head commit, so an
+    /// unchanged first page means the head, and every page, is unchanged.
+    Unchanged(Vec<T>),
+    /// Changed; `more` says whether further pages may follow.
+    Changed { files: Vec<T>, more: bool },
+}
+
+/// Decides from the first page's answer and the list kept from last time.
+fn first_page<T: Clone>(page: Cond<Vec<T>>, kept: Option<&Vec<T>>) -> Result<FirstPage<T>> {
+    match page {
+        Cond::NotModified => kept
+            .cloned()
+            .map(FirstPage::Unchanged)
+            .ok_or_else(|| anyhow!("GitHub says the files are unchanged, but none were kept")),
+        Cond::Modified(files) => Ok(FirstPage::Changed { more: files.len() == FILES_PER_PAGE, files }),
+    }
+}
+
 impl Github {
     /// The files a PR changes, with their diffs. The first page is conditional,
     /// so reading an unchanged PR again costs no rate limit.
@@ -565,32 +603,32 @@ impl Github {
         let url = format!("{REST_URL}/repos/{}/pulls/{}/files", pr.repo, pr.number);
         let query = |page: u32| vec![("per_page", FILES_PER_PAGE.to_string()), ("page", page.to_string())];
         let key = format!("prfiles:{}", pr.label());
-        let first = match self.cond_get::<serde_json::Value>(&key, url.clone(), &query(1)).await? {
-            Cond::Modified(page) => {
-                self.pr_files_cache.lock().unwrap().insert(key.clone(), page.clone());
-                page
+        let first = self.cond_get::<Vec<serde_json::Value>>(&key, url.clone(), &query(1)).await?;
+        let step = first_page(first, self.pr_files_cache.lock().unwrap().get(&key))?;
+        let raw = match step {
+            FirstPage::Unchanged(raw) => return parse_files(raw),
+            FirstPage::Changed { files, more: false } => files,
+            FirstPage::Changed { mut files, more: true } => {
+                let mut page = 1;
+                let mut last_len = FILES_PER_PAGE;
+                while last_len == FILES_PER_PAGE && page < FILES_MAX_PAGES {
+                    page += 1;
+                    let req = self.client.get(&url).query(&query(page));
+                    let batch: Vec<serde_json::Value> = ensure_ok(self.send(req).await?).await?.json().await?;
+                    last_len = batch.len();
+                    files.extend(batch);
+                }
+                files
             }
-            Cond::NotModified => self
-                .pr_files_cache
-                .lock()
-                .unwrap()
-                .get(&key)
-                .cloned()
-                .ok_or_else(|| anyhow!("GitHub says the files are unchanged, but none were kept"))?,
         };
-        let first: Vec<RawFile> = serde_json::from_value(first).context("bad files response")?;
-        let mut files: Vec<PrFile> = first.into_iter().map(PrFile::from).collect();
-        let mut page = 1;
-        let mut last_len = files.len();
-        while last_len == FILES_PER_PAGE && page < FILES_MAX_PAGES {
-            page += 1;
-            let req = self.client.get(&url).query(&query(page));
-            let raw: Vec<RawFile> = ensure_ok(self.send(req).await?).await?.json().await?;
-            last_len = raw.len();
-            files.extend(raw.into_iter().map(PrFile::from));
-        }
-        Ok(files)
+        self.pr_files_cache.lock().unwrap().insert(key, raw.clone());
+        parse_files(raw)
     }
+}
+
+fn parse_files(raw: Vec<serde_json::Value>) -> Result<Vec<PrFile>> {
+    let raw: Vec<RawFile> = serde_json::from_value(serde_json::Value::Array(raw)).context("bad files response")?;
+    Ok(raw.into_iter().map(PrFile::from).collect())
 }
 
 impl Github {
@@ -822,6 +860,34 @@ mod tests {
         assert_eq!(files[1].status, FileStatus::Renamed);
     }
 
+    fn some_files(n: usize) -> Vec<PrFile> {
+        let file = |i: usize| PrFile {
+            path: format!("f{i}.rs"),
+            previous_path: None,
+            status: FileStatus::Modified,
+            additions: 1,
+            deletions: 0,
+            patch: None,
+        };
+        (0..n).map(file).collect()
+    }
+
+    #[test]
+    fn an_unchanged_first_page_reuses_the_whole_kept_list() {
+        let kept = some_files(250);
+        let step = first_page(Cond::NotModified, Some(&kept)).unwrap();
+        assert!(matches!(step, FirstPage::Unchanged(ref files) if files.len() == 250), "{step:?}");
+        assert!(first_page::<PrFile>(Cond::NotModified, None).is_err());
+    }
+
+    #[test]
+    fn a_changed_full_first_page_reads_on_and_a_short_one_stops() {
+        let step = first_page(Cond::Modified(some_files(FILES_PER_PAGE)), None).unwrap();
+        assert!(matches!(step, FirstPage::Changed { more: true, .. }));
+        let step = first_page(Cond::Modified(some_files(3)), Some(&some_files(250))).unwrap();
+        assert!(matches!(step, FirstPage::Changed { more: false, ref files } if files.len() == 3));
+    }
+
     #[test]
     fn graphql_errors_become_the_error_message() {
         let body = r#"{"data":null,"errors":[{"message":"Field 'nope' doesn't exist"}]}"#;
@@ -859,6 +925,15 @@ mod tests {
             })
         );
         assert!(line_comment_body("abc", &comment(LineSpan::One(3))).get("start_line").is_none());
+    }
+
+    #[test]
+    fn a_rate_limited_reply_is_recognised() {
+        let limited = r#"{"data":null,"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}"#;
+        assert!(says_rate_limited(limited));
+        let other = r#"{"data":null,"errors":[{"type":"NOT_FOUND","message":"nope"}]}"#;
+        assert!(!says_rate_limited(other));
+        assert!(!says_rate_limited(r#"{"data":{"n":1}}"#));
     }
 
     #[test]

@@ -267,6 +267,8 @@ async fn run(
                 // Pause all polling on a rate-limit back-off or when quota is low.
                 let low = app.rate.as_ref().is_some_and(|r| r.remaining < 50);
                 let throttled = paused.is_some() || low;
+                // The PR screens spend GraphQL points, which run out apart from REST's.
+                app.prs.paused = throttled || gh.prs_paused();
 
                 // Honor X-Poll-Interval as a floor (absent on Actions endpoints today).
                 let floor = Duration::from_secs(gh.poll_interval_secs());
@@ -307,7 +309,7 @@ async fn run(
                     last_pr = std::time::Instant::now();
                 }
                 let pr_iv = if app.prs.open_checks_pending() { focused_iv } else { broad_iv };
-                if !throttled && app.prs.open.is_some() && last_pr.elapsed() >= pr_iv.max(floor) {
+                if !app.prs.paused && app.prs.open.is_some() && last_pr.elapsed() >= pr_iv.max(floor) {
                     app.queue_pr_refresh();
                     last_pr = std::time::Instant::now();
                 }

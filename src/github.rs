@@ -16,9 +16,19 @@ const API: &str = "https://api.github.com";
 /// Shared rate-limit accounting, updated from response headers.
 #[derive(Default)]
 struct RateState {
+    /// The REST quota, which the header shows and polling pauses on.
     rate: Option<RateLimit>,
     /// When set and in the future, we are backing off (primary/secondary limit).
     pause_until: Option<Instant>,
+    /// The GraphQL quota, counted apart from REST's. Only the PR screens
+    /// spend it, so running low pauses only them.
+    graphql: Option<GraphqlQuota>,
+}
+
+/// GraphQL points left, and when they refill.
+struct GraphqlQuota {
+    remaining: u32,
+    refills_at: Instant,
 }
 
 /// Result of a conditional (ETag) request.
@@ -68,9 +78,9 @@ pub struct Github {
     tags_cache: Arc<Mutex<HashMap<String, Vec<Tag>>>>,
     /// Last runner list per repo, returned when that repo's runners are unchanged.
     repo_runners_cache: Arc<Mutex<HashMap<String, Vec<Runner>>>>,
-    /// First page of a PR's changed files by `repo#number`, as the API sent it,
-    /// returned when it is unchanged.
-    pub(crate) pr_files_cache: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+    /// Every changed file of a PR by `repo#number`, as the API sent them,
+    /// returned when the first page is unchanged.
+    pub(crate) pr_files_cache: Arc<Mutex<HashMap<String, Vec<serde_json::Value>>>>,
     /// Largest `X-Poll-Interval` (seconds) GitHub has asked us to honor; 0 = unset.
     poll_interval: Arc<AtomicU64>,
     rate_state: Arc<Mutex<RateState>>,
@@ -162,6 +172,11 @@ impl Github {
             let remaining_zero =
                 h.get("x-ratelimit-remaining").and_then(|v| v.to_str().ok()) == Some("0");
             let has_retry = h.contains_key("retry-after");
+            // A spent GraphQL quota pauses only the PR screens, which
+            // `record_rate` has seen to; the runs keep polling.
+            if rate_resource(h) == Some("graphql") && remaining_zero && !has_retry && status == StatusCode::FORBIDDEN {
+                return Err(anyhow!("GraphQL rate limit reached"));
+            }
             if status == StatusCode::TOO_MANY_REQUESTS || remaining_zero || has_retry {
                 self.note_rate_limited(h);
                 return Err(anyhow!("rate limited; backing off"));
@@ -191,6 +206,20 @@ impl Github {
         self.rate_state.lock().unwrap().rate.clone()
     }
 
+    /// Whether PR polling should wait: the GraphQL quota is nearly spent and
+    /// has not refilled yet.
+    pub fn prs_paused(&self) -> bool {
+        let st = self.rate_state.lock().unwrap();
+        st.graphql.as_ref().is_some_and(|q| q.remaining < 50 && q.refills_at > Instant::now())
+    }
+
+    /// GitHub answered a GraphQL request with `RATE_LIMITED`: no points are
+    /// left until the quota refills.
+    pub(crate) fn note_graphql_limited(&self, headers: &reqwest::header::HeaderMap) {
+        let refills_at = refills_at(headers);
+        self.rate_state.lock().unwrap().graphql = Some(GraphqlQuota { remaining: 0, refills_at });
+    }
+
     /// Seconds we should keep backing off for, if a limit was hit; None = clear.
     pub fn pause_remaining(&self) -> Option<Duration> {
         let until = self.rate_state.lock().unwrap().pause_until?;
@@ -198,13 +227,19 @@ impl Github {
         (until > now).then(|| until - now)
     }
 
-    /// Update the cached rate snapshot from `X-RateLimit-*` headers.
+    /// Update the cached rate snapshot from `X-RateLimit-*` headers, into the
+    /// reading of the quota they count against.
     fn record_rate(&self, headers: &reqwest::header::HeaderMap) {
         let get = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u32>().ok());
-        if let (Some(remaining), Some(limit)) =
-            (get("x-ratelimit-remaining"), get("x-ratelimit-limit"))
-        {
-            self.rate_state.lock().unwrap().rate = Some(RateLimit { limit, remaining });
+        let (Some(remaining), Some(limit)) = (get("x-ratelimit-remaining"), get("x-ratelimit-limit")) else {
+            return;
+        };
+        let mut st = self.rate_state.lock().unwrap();
+        match rate_resource(headers) {
+            None | Some("core") => st.rate = Some(RateLimit { limit, remaining }),
+            Some("graphql") => st.graphql = Some(GraphqlQuota { remaining, refills_at: refills_at(headers) }),
+            // Search and the rest have quotas of their own, which nothing here polls.
+            Some(_) => {}
         }
     }
 
@@ -810,6 +845,18 @@ pub(crate) async fn ensure_ok(resp: Response) -> Result<Response> {
 /// Like `ensure_ok` but for mutating endpoints that return no body of interest.
 async fn check(resp: Response) -> Result<()> {
     ensure_ok(resp).await.map(|_| ())
+}
+
+/// Which quota a response counts against, from `X-RateLimit-Resource`.
+fn rate_resource(headers: &reqwest::header::HeaderMap) -> Option<&str> {
+    headers.get("x-ratelimit-resource").and_then(|v| v.to_str().ok())
+}
+
+/// When the quota a response counts against refills, from `X-RateLimit-Reset`.
+fn refills_at(headers: &reqwest::header::HeaderMap) -> Instant {
+    let reset = headers.get("x-ratelimit-reset").and_then(|v| v.to_str().ok());
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    Instant::now() + Duration::from_secs(backoff_secs(None, reset, now))
 }
 
 /// Seconds to back off after a rate-limit response: prefer `Retry-After`
@@ -1455,5 +1502,52 @@ jobs: {}
         assert_eq!(backoff_secs(None, Some("999999999"), 0), 3600);
         // A garbage Retry-After is ignored and falls through to the default.
         assert_eq!(backoff_secs(Some("soon"), None, 0), 60);
+    }
+
+    /// Rate headers as GitHub sends them, refilling in ten minutes.
+    fn rate_headers(resource: Option<&str>, remaining: u32) -> HeaderMap {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let mut h = HeaderMap::new();
+        h.insert("x-ratelimit-limit", HeaderValue::from_static("5000"));
+        h.insert("x-ratelimit-remaining", HeaderValue::from(remaining));
+        h.insert("x-ratelimit-reset", HeaderValue::from(now + 600));
+        if let Some(resource) = resource {
+            h.insert("x-ratelimit-resource", HeaderValue::from_str(resource).unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn only_the_rest_quota_is_the_reading_shown_and_paused_on() {
+        let gh = Github::new("token").unwrap();
+        gh.record_rate(&rate_headers(Some("core"), 4000));
+        assert_eq!(gh.rate().map(|r| r.remaining), Some(4000));
+        gh.record_rate(&rate_headers(Some("graphql"), 10));
+        assert_eq!(gh.rate().map(|r| r.remaining), Some(4000), "a GraphQL reply leaves it alone");
+        gh.record_rate(&rate_headers(Some("search"), 3));
+        assert_eq!(gh.rate().map(|r| r.remaining), Some(4000), "so does a search");
+        gh.record_rate(&rate_headers(None, 3999));
+        assert_eq!(gh.rate().map(|r| r.remaining), Some(3999), "no resource named means REST");
+    }
+
+    #[test]
+    fn a_low_graphql_quota_pauses_only_the_pr_screens_until_it_refills() {
+        let gh = Github::new("token").unwrap();
+        gh.record_rate(&rate_headers(Some("graphql"), 4000));
+        assert!(!gh.prs_paused());
+        gh.record_rate(&rate_headers(Some("graphql"), 49));
+        assert!(gh.prs_paused());
+        assert!(gh.pause_remaining().is_none(), "runs keep polling");
+        gh.record_rate(&rate_headers(Some("graphql"), 4999));
+        assert!(!gh.prs_paused(), "a refilled quota resumes");
+    }
+
+    #[test]
+    fn a_graphql_reply_saying_rate_limited_pauses_the_pr_screens() {
+        let gh = Github::new("token").unwrap();
+        gh.record_rate(&rate_headers(Some("graphql"), 4000));
+        gh.note_graphql_limited(&rate_headers(Some("graphql"), 4000));
+        assert!(gh.prs_paused());
+        assert!(gh.pause_remaining().is_none());
     }
 }

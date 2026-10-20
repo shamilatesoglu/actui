@@ -1150,7 +1150,9 @@ impl App {
             return;
         }
         self.pending.push(Command::Refresh { deep: self.repos.scope().map(str::to_string) });
-        self.pending.push(Command::Pr(PrCommand::FetchList));
+        if !self.prs.paused {
+            self.pending.push(Command::Pr(PrCommand::FetchList));
+        }
         self.queue_selected_jobs();
     }
 
