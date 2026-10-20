@@ -66,15 +66,27 @@ impl PrsState {
     }
 
     /// How many pieces of text quitting would lose: the drafts of every
-    /// pending review, a box with text in it, and a message sent and not yet
-    /// answered.
+    /// pending review, a box with new text in it, and messages sent and not
+    /// yet posted.
     pub fn unsent_count(&self) -> usize {
         let typed = |text: &str| usize::from(!text.trim().is_empty());
-        let open = self.open.as_ref().map_or(0, |v| {
-            v.compose.as_ref().map_or(0, |c| typed(&c.text()))
-                + v.inflight.as_ref().map_or(0, |(_, text)| typed(text))
-        });
-        self.drafts.values().map(PendingReview::len).sum::<usize>() + open
+        let sent: usize = self.outbox.values().map(|o| typed(o.text())).sum();
+        self.drafts.values().map(PendingReview::len).sum::<usize>() + usize::from(self.box_has_new_text()) + sent
+    }
+
+    /// Whether closing the open box would lose text: it holds typed text, or
+    /// a draft's text it has changed.
+    pub fn box_has_new_text(&self) -> bool {
+        let Some(view) = &self.open else { return false };
+        let Some(compose) = &view.compose else { return false };
+        let text = compose.text();
+        match compose.target {
+            ComposeTarget::EditDraft { index } => {
+                let draft = self.drafts.get(&view.pr).and_then(|d| d.comments.get(index));
+                draft.is_none_or(|c| c.body != text)
+            }
+            _ => !text.trim().is_empty(),
+        }
     }
 
     pub fn has_unsent(&self) -> bool {
@@ -753,7 +765,6 @@ mod tests {
         press(app, KeyCode::Tab);
         app.apply(DataMsg::Pr(PrMsg::Files { pr, result: Ok(files()) }));
         press(app, KeyCode::Enter);
-        assert!(app.prs.open.as_ref().unwrap().inflight.is_none(), "a fresh view knows nothing was sent");
         app.pending.clear();
     }
 
@@ -765,18 +776,16 @@ mod tests {
         assert!(sent_head(&app).is_some());
         reopen(&mut app);
 
-        comment_on_row(&mut app, 2, "late");
-        assert_eq!(status(&app), Some(("Your review is still being sent", true)));
-        assert_eq!(compose(&app).map(|c| c.text()).as_deref(), Some("late"), "the text stays in its box");
+        // The reopened PR still knows its review is out, so no box opens on it.
+        go_to_row(&mut app, 2);
+        press(&mut app, KeyCode::Char('c'));
+        assert!(compose(&app).is_none());
+        assert_eq!(status(&app), Some(("Still sending your last message", true)));
         assert_eq!(drafts(&app).len(), 1);
-        press(&mut app, KeyCode::Esc);
-        press(&mut app, KeyCode::Char('y'));
 
         submit(&mut app, 2, "again");
         assert!(app.pending.is_empty(), "the same drafts are not sent twice");
-        assert_eq!(status(&app), Some(("Your review is still being sent", true)));
-        press(&mut app, KeyCode::Esc);
-        press(&mut app, KeyCode::Char('y'));
+        assert!(compose(&app).is_none());
 
         press(&mut app, KeyCode::Char('p'));
         press(&mut app, KeyCode::Char('d'));
@@ -886,6 +895,17 @@ mod tests {
         assert_eq!(app.prs.open.as_ref().map(|v| v.pr.clone()), Some(pr.clone()));
         assert_eq!(app.prs.drafts[&pr].comments[0].body, "keep me");
         assert!(app.prs.has_unsent());
+    }
+
+    #[test]
+    fn a_box_editing_a_draft_counts_only_once_changed() {
+        let mut app = app_in_a_diff();
+        comment_on_row(&mut app, 4, "first");
+        press(&mut app, KeyCode::Char('p'));
+        press(&mut app, KeyCode::Char('e'));
+        assert_eq!(app.prs.unsent_count(), 1, "the box holds the draft it was opened on");
+        type_text(&mut app, "!");
+        assert_eq!(app.prs.unsent_count(), 2, "the changed text would be lost too");
     }
 
     #[test]

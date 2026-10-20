@@ -24,6 +24,7 @@ impl App {
         if let Some(pr) = self.prs.list.selected().map(|p| p.pr.clone()) {
             self.pending.push(Command::Pr(PrCommand::FetchDetail(pr.clone())));
             self.prs.open = Some(PrView::new(pr));
+            self.give_back_refused();
         }
     }
 

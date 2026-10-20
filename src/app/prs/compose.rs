@@ -64,6 +64,30 @@ pub struct Compose {
     pub editor: TextArea<'static>,
 }
 
+/// Text sent from a box, and the box it came from.
+pub struct SentText {
+    pub target: ComposeTarget,
+    pub text: String,
+}
+
+/// A PR's text that left its box and is not safe yet. It is kept per PR, so
+/// leaving the PR before GitHub answers loses nothing.
+pub enum Outbox {
+    /// Sent, with no answer yet.
+    Sending(SentText),
+    /// Refused while its PR was closed; it goes back in a box when the PR
+    /// opens again.
+    Refused(SentText),
+}
+
+impl Outbox {
+    pub fn text(&self) -> &str {
+        match self {
+            Outbox::Sending(sent) | Outbox::Refused(sent) => &sent.text,
+        }
+    }
+}
+
 impl Compose {
     pub fn new(target: ComposeTarget, text: &str) -> Self {
         let mut editor = TextArea::from(text.lines());
@@ -86,18 +110,30 @@ impl App {
     /// Opens a box on the open PR holding `text`.
     pub(super) fn open_compose_with(&mut self, target: ComposeTarget, text: &str) {
         let Some(view) = &mut self.prs.open else { return };
-        if view.inflight.is_some() {
+        if matches!(self.prs.outbox.get(&view.pr), Some(Outbox::Sending(_))) {
             self.set_status("Still sending your last message", true);
             return;
         }
         view.compose = Some(Compose::new(target, text));
     }
 
+    /// Puts text GitHub refused back in a box on the open PR, if that is its
+    /// PR and no box is open there.
+    pub(super) fn give_back_refused(&mut self) {
+        let Some(view) = self.prs.open.as_mut().filter(|v| v.compose.is_none()) else { return };
+        if !matches!(self.prs.outbox.get(&view.pr), Some(Outbox::Refused(_))) {
+            return;
+        }
+        if let Some(Outbox::Refused(sent)) = self.prs.outbox.remove(&view.pr) {
+            view.compose = Some(Compose::new(sent.target, &sent.text));
+        }
+    }
+
     /// Takes a key while a box is open. Everything but the send keys and Esc
     /// is typing, so keys that mean more elsewhere stay in the box.
     pub(super) fn key_compose(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let unchanged = self.compose_unchanged();
+        let unchanged = !self.prs.box_has_new_text();
         let Some(view) = &mut self.prs.open else { return };
         let Some(compose) = &mut view.compose else { return };
         match key.code {
@@ -110,22 +146,6 @@ impl App {
             _ => {
                 compose.editor.input(key);
             }
-        }
-    }
-
-    /// Whether closing the box loses nothing: it is empty, or still holds the
-    /// draft it was opened to edit.
-    fn compose_unchanged(&self) -> bool {
-        let Some(view) = &self.prs.open else { return true };
-        let Some(compose) = &view.compose else { return true };
-        match compose.target {
-            ComposeTarget::EditDraft { index } => self
-                .prs
-                .drafts
-                .get(&view.pr)
-                .and_then(|d| d.comments.get(index))
-                .is_some_and(|c| c.body == compose.text()),
-            _ => compose.editor.is_empty(),
         }
     }
 
@@ -164,9 +184,9 @@ impl App {
     /// Sends a box's text as `action`, keeping the text so a failure can put
     /// it back in a box like it.
     pub(super) fn send_from_box(&mut self, target: ComposeTarget, text: String, action: PrAction) {
-        let Some(view) = &mut self.prs.open else { return };
+        let Some(view) = &self.prs.open else { return };
         let pr: PrRef = view.pr.clone();
-        view.inflight = Some((target, text));
+        self.prs.outbox.insert(pr.clone(), Outbox::Sending(SentText { target, text }));
         self.pending.push(Command::Pr(PrCommand::Act { pr, action }));
         self.set_status("Sending…", false);
     }

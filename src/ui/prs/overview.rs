@@ -265,7 +265,6 @@ mod tests {
             compose: None,
             merge_dialog: None,
             review_popup: None,
-            inflight: None,
         };
         let draw = |view: &mut PrView| {
             let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(23, 12)).unwrap();

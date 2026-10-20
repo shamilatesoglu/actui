@@ -8,7 +8,7 @@ mod merge;
 mod protocol;
 mod review;
 
-pub use compose::{Compose, ComposeTarget};
+pub use compose::{Compose, ComposeTarget, Outbox};
 pub use diff::{draft_rows, DiffLine, DiffView, FilesState};
 pub use merge::MergeDialog;
 pub use protocol::{PrAction, PrActionKind, PrCommand, PrMsg};
@@ -259,9 +259,6 @@ pub struct PrView {
     pub merge_dialog: Option<MergeDialog>,
     /// The review box open over the PR, if any.
     pub review_popup: Option<ReviewPopup>,
-    /// What was sent from a box and has no answer yet, kept so a failure can
-    /// put it back.
-    pub inflight: Option<(ComposeTarget, String)>,
 }
 
 impl PrView {
@@ -277,7 +274,6 @@ impl PrView {
             compose: None,
             merge_dialog: None,
             review_popup: None,
-            inflight: None,
         }
     }
 
@@ -362,6 +358,8 @@ pub struct PrsState {
     pub drafts: HashMap<PrRef, PendingReview>,
     /// PRs whose review has been sent and has no answer yet.
     sending: HashSet<PrRef>,
+    /// Each PR's text that left its box and is not safe yet.
+    pub outbox: HashMap<PrRef, Outbox>,
 }
 
 impl PrsState {
@@ -520,18 +518,22 @@ impl App {
                 self.prs.drafts.remove(&pr);
             }
         }
-        let Some(view) = self.prs.open.as_mut().filter(|v| v.pr == pr) else {
+        // Text sent from a box is safe once posted. Refused, it goes back in a
+        // box: now if its PR is open, or when it opens next.
+        let answered = matches!(self.prs.outbox.get(&pr), Some(Outbox::Sending(s)) if s.target.sends() == Some(kind));
+        if answered {
+            if let (Some(Outbox::Sending(sent)), Err(_)) = (self.prs.outbox.remove(&pr), &result) {
+                self.prs.outbox.insert(pr.clone(), Outbox::Refused(sent));
+            }
+            self.give_back_refused();
+        }
+        let Some(view) = self.prs.open.as_ref().filter(|v| v.pr == pr) else {
             // The list still shows a PR merged after its view was closed.
             if merged {
                 self.pending.push(Command::Pr(PrCommand::FetchList));
             }
             return;
         };
-        if let Some((target, text)) = view.inflight.take_if(|(target, _)| target.sends() == Some(kind)) {
-            if result.is_err() {
-                view.compose = Some(Compose::new(target, &text));
-            }
-        }
         self.pending.push(Command::Pr(PrCommand::FetchDetail(pr.clone())));
         if matches!(view.files.files, Loadable::Ready(_)) {
             self.pending.push(Command::Pr(PrCommand::FetchFiles(pr)));
@@ -752,8 +754,56 @@ mod tests {
         app.apply(DataMsg::Pr(PrMsg::ActDone { pr, kind: PrActionKind::Comment, result: Err("boom".into()) }));
         let view = app.prs.open.as_ref().unwrap();
         assert_eq!(view.compose.as_ref().map(|c| c.text()).as_deref(), Some("hello"));
-        assert!(view.inflight.is_none());
+        assert!(app.prs.outbox.is_empty());
         assert!(app.status_msg.as_ref().is_some_and(|(m, err, _)| m.contains("boom") && *err));
+    }
+
+    /// Lists the open PR so Esc and Enter can leave and reopen it.
+    fn list_the_open_pr(app: &mut App) {
+        app.prs.list.set(PrGroup::ReviewRequested, Ok(vec![summary("org/api", 7)]));
+        app.prs.list.set(PrGroup::Authored, Ok(vec![]));
+    }
+
+    fn compose_text(app: &App) -> Option<String> {
+        app.prs.open.as_ref()?.compose.as_ref().map(|c| c.text())
+    }
+
+    #[test]
+    fn a_comment_refused_after_leaving_its_pr_comes_back_on_reopening() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        list_the_open_pr(&mut app);
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "hello");
+        ctrl_s(&mut app);
+        let pr = app.prs.open.as_ref().unwrap().pr.clone();
+        press(&mut app, KeyCode::Esc);
+        assert!(app.prs.open.is_none(), "back on the list");
+        assert_eq!(app.prs.unsent_count(), 1, "the quit question counts it while it is out");
+
+        app.apply(DataMsg::Pr(PrMsg::ActDone { pr, kind: PrActionKind::Comment, result: Err("boom".into()) }));
+        assert!(app.status_msg.as_ref().is_some_and(|(m, err, _)| m.contains("boom") && *err));
+        assert_eq!(app.prs.unsent_count(), 1, "and keeps counting it once refused");
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(compose_text(&app).as_deref(), Some("hello"), "the box has the text back");
+        assert_eq!(app.prs.unsent_count(), 1, "counted once, in its box");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.mode == Mode::Confirm, "closing the box asks first");
+    }
+
+    #[test]
+    fn a_comment_posted_after_leaving_its_pr_is_no_longer_counted() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        list_the_open_pr(&mut app);
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "hello");
+        ctrl_s(&mut app);
+        let pr = app.prs.open.as_ref().unwrap().pr.clone();
+        press(&mut app, KeyCode::Esc);
+        app.apply(DataMsg::Pr(PrMsg::ActDone { pr, kind: PrActionKind::Comment, result: Ok(()) }));
+        assert_eq!(app.prs.unsent_count(), 0);
+        press(&mut app, KeyCode::Enter);
+        assert!(compose_text(&app).is_none());
     }
 
     #[test]
@@ -767,7 +817,7 @@ mod tests {
 
         app.apply(DataMsg::Pr(PrMsg::ActDone { pr, kind: PrActionKind::Comment, result: Ok(()) }));
         let view = app.prs.open.as_ref().unwrap();
-        assert!(view.compose.is_none() && view.inflight.is_none());
+        assert!(view.compose.is_none() && app.prs.outbox.is_empty());
         assert!(app.status_msg.as_ref().is_some_and(|(m, err, _)| m == "Comment posted" && !*err));
         assert!(matches!(&app.pending[..], [Command::Pr(PrCommand::FetchDetail(_))]));
     }
