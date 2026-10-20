@@ -968,6 +968,26 @@ pub struct Job {
     /// Per-step status/timing — updates live while the job runs.
     #[serde(default)]
     pub steps: Vec<Step>,
+    #[serde(flatten)]
+    pub runner: JobRunner,
+}
+
+/// The labels a job asked for, and the runner GitHub gave it once one picked
+/// it up.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct JobRunner {
+    /// `None` until a runner takes the job, and for jobs that never ran.
+    #[serde(default, rename = "runner_name", deserialize_with = "non_empty")]
+    pub name: Option<String>,
+    #[serde(default, rename = "runner_group_name", deserialize_with = "non_empty")]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+/// GitHub sends an unset runner as `null` on some responses and `""` on others.
+fn non_empty<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<String>, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.filter(|s| !s.is_empty()))
 }
 
 impl Job {

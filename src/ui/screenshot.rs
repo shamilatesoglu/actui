@@ -74,6 +74,7 @@ fn demo() -> App {
         started_at: Some(now - Duration::seconds(ago)),
         completed_at: (took > 0).then(|| now - Duration::seconds(ago - took)),
         steps: Vec::new(),
+        runner: Default::default(),
     };
 
     let cfg = crate::config::Config { pinned: vec!["org/api".into()], ..Default::default() };

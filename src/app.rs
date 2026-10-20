@@ -1464,6 +1464,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             steps: Vec::new(),
+            runner: Default::default(),
         }
     }
 

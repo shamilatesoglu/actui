@@ -694,10 +694,15 @@ fn draw_jobs(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let jobs_len = app.jobs.len();
+    let runner = app.selected_job().map(runner_lines).unwrap_or_default();
+    // Long label lists wrap, but never past three rows: the log preview
+    // below matters more.
+    let runner_h = wrapped_height(&runner, inner.width).min(3);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(jobs_len.clamp(3, 6) as u16),
+            Constraint::Length(runner_h),
             Constraint::Min(3),
         ])
         .split(inner);
@@ -727,6 +732,8 @@ fn draw_jobs(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(list, chunks[0], &mut app.jobs_state);
     fade_rows(f, chunks[0], app.jobs_state.offset(), &fetching);
 
+    f.render_widget(Paragraph::new(runner).wrap(Wrap { trim: false }), chunks[1]);
+
     // Title + body track the selected job: a log with error-looking lines is
     // titled "Possible Errors · N" and lists every spot one appears. The count
     // is a guess from the text, so the title says so — `v` is the pane that
@@ -755,8 +762,8 @@ fn draw_jobs(f: &mut Frame, app: &mut App, area: Rect) {
         .borders(Borders::TOP)
         .border_style(Style::default().fg(dim()))
         .title(Span::styled(title, title_style));
-    let preview_inner = preview_block.inner(chunks[1]);
-    f.render_widget(preview_block, chunks[1]);
+    let preview_inner = preview_block.inner(chunks[2]);
+    f.render_widget(preview_block, chunks[2]);
 
     if let Some(msg) = body_msg {
         f.render_widget(
@@ -766,6 +773,41 @@ fn draw_jobs(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         f.render_widget(Paragraph::new(body).wrap(Wrap { trim: true }), preview_inner);
     }
+}
+
+/// The runner a job ran on, its group and its labels. A queued job has no
+/// runner yet, so it shows the labels it is waiting for one to match.
+fn runner_lines(j: &Job) -> Vec<Line<'static>> {
+    let r = &j.runner;
+    let mut lines = Vec::new();
+    if let Some(name) = &r.name {
+        let mut spans = vec![
+            Span::styled(format!("{:>LABEL_W$}  ", "runner"), Style::default().fg(dim())),
+            Span::raw(name.clone()),
+        ];
+        if let Some(group) = &r.group {
+            spans.push(Span::styled(format!(" · {group}"), Style::default().fg(dim())));
+        }
+        lines.push(Line::from(spans));
+    } else if j.status == "queued" || j.status == "waiting" {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:>LABEL_W$}  ", "runner"), Style::default().fg(dim())),
+            Span::styled("waiting for one with", Style::default().fg(Color::Yellow)),
+        ]));
+    }
+    if !r.labels.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:>LABEL_W$}  ", "labels"), Style::default().fg(dim())),
+            Span::raw(r.labels.join(", ")),
+        ]));
+    }
+    lines
+}
+
+/// Rows `lines` take once wrapped to `width`.
+fn wrapped_height(lines: &[Line], width: u16) -> u16 {
+    let width = width.max(1) as usize;
+    lines.iter().map(|l| l.width().max(1).div_ceil(width) as u16).sum()
 }
 
 /// Draw a scrollbar for a list that has outgrown its pane, and record where it
@@ -2042,6 +2084,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             steps: Vec::new(),
+            runner: Default::default(),
         }];
         app.jobs_run_id = Some(1);
         app.steps_view = Some(StepsView {
@@ -2064,6 +2107,45 @@ mod tests {
         println!("{out}");
         assert!(!out.contains("All repos"));
         assert!(out.contains("Live steps · build"), "the steps pane stays");
+    }
+
+    #[test]
+    fn a_job_names_its_runner_or_the_labels_it_waits_for() {
+        use crate::github::JobRunner;
+
+        let mut app = demo_app();
+        let labels = vec!["self-hosted".to_string(), "linux".to_string()];
+        let mut job = crate::github::Job {
+            id: 9,
+            name: "build".into(),
+            status: "completed".into(),
+            html_url: String::new(),
+            check_run_url: String::new(),
+            conclusion: Some("success".into()),
+            started_at: None,
+            completed_at: None,
+            steps: Vec::new(),
+            runner: JobRunner {
+                name: Some("rack-04".into()),
+                group: Some("Default".into()),
+                labels: labels.clone(),
+            },
+        };
+        app.jobs = vec![job.clone()];
+        app.jobs_run_id = app.selected_run().map(|r| r.id);
+        app.jobs_state.select(Some(0));
+        let out = screen(&mut app, 140, 30);
+        println!("{out}");
+        assert!(out.contains("runner  rack-04 · Default"));
+        assert!(out.contains("labels  self-hosted, linux"));
+
+        job.status = "queued".into();
+        job.runner = JobRunner { name: None, group: None, labels };
+        app.jobs = vec![job];
+        let out = screen(&mut app, 140, 30);
+        println!("{out}");
+        assert!(out.contains("runner  waiting for one with"));
+        assert!(out.contains("labels  self-hosted, linux"));
     }
 
     #[test]
