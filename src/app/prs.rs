@@ -1279,6 +1279,13 @@ mod tests {
     }
 
     #[test]
+    fn the_pr_list_is_read_once_the_user_is_known() {
+        let mut app = App::new(&crate::config::Config::default());
+        app.apply(DataMsg::User("ana".into()));
+        assert!(matches!(&app.pending[..], [Command::Pr(PrCommand::FetchList)]), "the tab's count shows at once");
+    }
+
+    #[test]
     fn a_paused_pr_list_is_left_out_of_the_broad_sweep() {
         let mut app = App::new(&crate::config::Config::default());
         app.loading = false;

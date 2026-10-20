@@ -437,7 +437,11 @@ impl App {
 
     pub fn apply(&mut self, msg: DataMsg) {
         match msg {
-            DataMsg::User(u) => self.user = u,
+            DataMsg::User(u) => {
+                self.user = u;
+                // Signed in: the PRs tab's count can show without waiting for a sweep.
+                self.pending.push(Command::Pr(PrCommand::FetchList));
+            }
             DataMsg::Repos(names) => {
                 self.listing_repos = false;
                 for name in &names {
