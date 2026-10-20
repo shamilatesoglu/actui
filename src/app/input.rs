@@ -878,22 +878,34 @@ impl App {
                             self.pending.push(Command::Approve { repo, run_id });
                             self.set_status(format!("Approving {label}…"), false);
                         }
+                        PendingAction::Pr { pr, action, .. } => {
+                            self.pending.push(Command::Pr(PrCommand::Act { pr, action }));
+                            self.set_status("Working…", false);
+                        }
+                        PendingAction::DiscardCompose => self.discard_compose(),
                     }
                 }
-                self.mode = self.overlay_return_mode();
+                self.mode = self.confirm_from;
             }
             KeyCode::Char('n') | KeyCode::Esc | KeyCode::Backspace => {
                 self.pending_action = None;
-                self.mode = self.overlay_return_mode();
+                self.mode = self.confirm_from;
             }
             _ => {}
         }
     }
 
+    /// Asks a yes/no question over the current screen; the answer returns there.
+    pub(super) fn ask(&mut self, action: PendingAction) {
+        self.pending_action = Some(action);
+        self.confirm_from = self.mode;
+        self.mode = Mode::Confirm;
+    }
+
     /// Mode to restore after a confirm/overlay closes: back to the logs/steps
     /// view if one is open (e.g. cancel invoked while watching live steps),
     /// otherwise the normal two-pane view.
-    fn overlay_return_mode(&self) -> Mode {
+    pub(super) fn overlay_return_mode(&self) -> Mode {
         if self.steps_view.is_some() || self.logs.is_some() {
             Mode::Logs
         } else {
@@ -1020,12 +1032,12 @@ impl App {
             self.set_status("Run is not active — nothing to cancel", true);
             return;
         }
-        self.pending_action = Some(PendingAction::Cancel {
+        let action = PendingAction::Cancel {
             repo: run.repository.full_name.clone(),
             run_id: run.id,
             label: format!("{} #{}", run.workflow_name(), run.run_number),
-        });
-        self.mode = Mode::Confirm;
+        };
+        self.ask(action);
     }
 
     fn confirm_rerun(&mut self, failed_only: bool) {
@@ -1033,12 +1045,11 @@ impl App {
         let label = format!("{} #{}", run.workflow_name(), run.run_number);
         let repo = run.repository.full_name.clone();
         let run_id = run.id;
-        self.pending_action = Some(if failed_only {
+        self.ask(if failed_only {
             PendingAction::RerunFailed { repo, run_id, label }
         } else {
             PendingAction::Rerun { repo, run_id, label }
         });
-        self.mode = Mode::Confirm;
     }
 
     /// Re-run just the selected job (requires a job to be selected).
@@ -1050,8 +1061,7 @@ impl App {
             self.set_status("Select a job first (Tab to focus Jobs)", true);
             return;
         };
-        self.pending_action = Some(PendingAction::RerunJob { repo, job_id, label });
-        self.mode = Mode::Confirm;
+        self.ask(PendingAction::RerunJob { repo, job_id, label });
     }
 
     /// Approve a run that's held for approval. Only runs actually awaiting

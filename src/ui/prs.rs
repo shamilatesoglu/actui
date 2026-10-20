@@ -3,6 +3,7 @@
 
 mod conversation;
 mod diff;
+mod overlays;
 mod overview;
 
 use super::*;
@@ -11,6 +12,7 @@ use crate::pulls::model::{ChecksState, PrSummary, ReviewDecision};
 use conversation::{conversation, draw_conversation};
 use diff::draw_files;
 use overview::draw_overview;
+pub(super) use overlays::draw_compose;
 use ratatui::buffer::Buffer;
 use ratatui::widgets::Widget;
 
@@ -212,13 +214,16 @@ fn pr_line(pr: &PrSummary, width: usize, spin: &'static str) -> Line<'static> {
 
 /// The footer's hints for an open PR.
 pub(super) fn open_pr_hints(view: &PrView) -> Vec<String> {
+    if view.compose.is_some() {
+        return owned(&["Ctrl+S send", "Esc cancel"]);
+    }
     match (view.tab, &view.files.diff) {
         (PrTab::Files, Some(diff)) if diff.searching => owned(&["type to search", "⏎ keep", "Esc drop"]),
         (PrTab::Files, Some(_)) => owned(&["j/k move", "g/G ends", "/ search", "n/N next match", "h back to files"]),
         (PrTab::Files, None) => owned(&["Tab next tab", "j/k move", "⏎ open diff", "o open on GitHub", "r refresh"]),
         (PrTab::Conversation, _) => {
-            owned(&["Tab next tab", "j/k scroll", "PgUp/PgDn page", "g/G ends", "o open on GitHub", "r refresh"])
+            owned(&["Tab next tab", "j/k scroll", "c comment", "PgUp/PgDn page", "g/G ends", "o open on GitHub", "r refresh"])
         }
-        _ => owned(&["Tab next tab", "j/k scroll", "J/K checks", "o open on GitHub", "r refresh"]),
+        _ => owned(&["Tab next tab", "j/k scroll", "J/K checks", "c comment", "D draft", "o open on GitHub", "r refresh"]),
     }
 }

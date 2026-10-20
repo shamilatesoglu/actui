@@ -262,6 +262,8 @@ mod tests {
             conversation: Default::default(),
             checks: ListState::default(),
             files: Default::default(),
+            compose: None,
+            inflight: None,
         };
         let draw = |view: &mut PrView| {
             let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(23, 12)).unwrap();

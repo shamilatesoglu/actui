@@ -4,10 +4,11 @@
 //! the `App` reducer / input handlers call are `pub(crate)`.
 
 use crate::github::{Annotation, Artifact, PendingDeployment, Runner, WfInput, WfInputKind, Workflow};
+use crate::pulls::model::PrRef;
 use ratatui::widgets::ListState;
 use std::collections::HashSet;
 
-use super::fuzzy;
+use super::{fuzzy, PrAction};
 
 pub enum PendingAction {
     Cancel { repo: String, run_id: u64, label: String },
@@ -15,6 +16,10 @@ pub enum PendingAction {
     RerunFailed { repo: String, run_id: u64, label: String },
     RerunJob { repo: String, job_id: u64, label: String },
     Approve { repo: String, run_id: u64, label: String },
+    /// A change to a PR; `label` is the question.
+    Pr { pr: PrRef, action: PrAction, label: String },
+    /// Throw away what was typed in the comment box.
+    DiscardCompose,
 }
 
 impl PendingAction {
@@ -25,9 +30,12 @@ impl PendingAction {
             PendingAction::RerunFailed { label, .. } => format!("Re-run failed jobs?  {label}"),
             PendingAction::RerunJob { label, .. } => format!("Re-run job?  {label}"),
             PendingAction::Approve { label, .. } => format!("Approve run?  {label}"),
+            PendingAction::Pr { label, .. } => label.clone(),
+            PendingAction::DiscardCompose => "Discard what you typed?".to_string(),
         }
     }
 }
+
 
 /// Browser over a run's artifacts (open with `A`).
 pub struct ArtifactsView {

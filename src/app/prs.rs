@@ -1,12 +1,14 @@
 //! The pull request screens' state. Key handling is in `input`, the worker
 //! protocol in `protocol`.
 
+mod compose;
 mod diff;
 mod input;
 mod protocol;
 
+pub use compose::{Compose, ComposeTarget};
 pub use diff::{DiffLine, DiffView, FilesState};
-pub use protocol::{PrCommand, PrMsg};
+pub use protocol::{PrAction, PrActionKind, PrCommand, PrMsg};
 
 use super::{App, Command, CursorHold, Focus, Mode};
 use crate::github::Run;
@@ -246,6 +248,11 @@ pub struct PrView {
     pub conversation: Scroll,
     pub checks: ListState,
     pub files: FilesState,
+    /// The box being written in, if one is open.
+    pub compose: Option<Compose>,
+    /// What was sent from a box and has no answer yet, kept so a failure can
+    /// put it back.
+    pub inflight: Option<(ComposeTarget, String)>,
 }
 
 impl PrView {
@@ -258,6 +265,8 @@ impl PrView {
             conversation: Scroll::default(),
             checks: ListState::default(),
             files: FilesState::default(),
+            compose: None,
+            inflight: None,
         }
     }
 
@@ -346,6 +355,12 @@ impl PrsState {
 }
 
 impl App {
+    /// Whether the PRs screens are what shows, which includes a question
+    /// asked over them.
+    pub fn shows_prs(&self) -> bool {
+        self.mode == Mode::Prs || (self.mode == Mode::Confirm && self.confirm_from == Mode::Prs)
+    }
+
     /// Reads the open PR again; the refresh timer calls this.
     pub fn queue_pr_refresh(&mut self) {
         if let Some(view) = &self.prs.open {
@@ -464,6 +479,26 @@ impl App {
                     view.set_detail(result);
                 }
             }
+            PrMsg::ActDone { pr, kind, result } => self.apply_act_done(pr, kind, result),
+        }
+    }
+
+    /// Reports a finished change, gives a failed message back to the box it
+    /// was written in, and reads the PR again either way.
+    fn apply_act_done(&mut self, pr: PrRef, kind: PrActionKind, result: Result<(), String>) {
+        match &result {
+            Ok(()) => self.set_status(kind.done_text(), false),
+            Err(e) => self.set_status(format!("{}: {e}", pr.label()), true),
+        }
+        let Some(view) = self.prs.open.as_mut().filter(|v| v.pr == pr) else { return };
+        if let Some((target, text)) = view.inflight.take_if(|(target, _)| target.sends() == kind) {
+            if result.is_err() {
+                view.compose = Some(Compose::new(target, &text));
+            }
+        }
+        self.pending.push(Command::Pr(PrCommand::FetchDetail(pr.clone())));
+        if matches!(view.files.files, Loadable::Ready(_)) {
+            self.pending.push(Command::Pr(PrCommand::FetchFiles(pr)));
         }
     }
 }
@@ -471,8 +506,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{DataMsg, Filter, Mode};
-    use crate::pulls::model::{ChecksState, ReviewDecision};
+    use crate::app::{DataMsg, Filter, Mode, PendingAction};
+    use crate::pulls::model::{Check, CheckState, CheckTarget, ChecksState, MergeStatus, ReviewDecision};
     use crossterm::event::{KeyCode, KeyEvent};
     use chrono::Utc;
 
@@ -644,6 +679,189 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert!(app.mode == Mode::Prs);
         assert!(app.status_msg.as_ref().is_some_and(|(m, _, _)| m == "That check has no page to open"));
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    fn ctrl_s(app: &mut App) {
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), crossterm::event::KeyModifiers::CONTROL));
+    }
+
+    fn edit_detail(app: &mut App, edit: impl FnOnce(&mut PrDetail)) {
+        if let Some(Loadable::Ready(d)) = app.prs.open.as_mut().map(|v| &mut v.detail) {
+            edit(d);
+        }
+    }
+
+    #[test]
+    fn a_failed_comment_reopens_the_box_with_its_text() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "hello");
+        ctrl_s(&mut app);
+        let pr = app.prs.open.as_ref().unwrap().pr.clone();
+        assert!(app.prs.open.as_ref().unwrap().compose.is_none());
+        assert!(matches!(
+            &app.pending[..],
+            [Command::Pr(PrCommand::Act { action: PrAction::Comment { body }, .. })] if body == "hello"
+        ));
+        app.pending.clear();
+
+        app.apply(DataMsg::Pr(PrMsg::ActDone { pr, kind: PrActionKind::Comment, result: Err("boom".into()) }));
+        let view = app.prs.open.as_ref().unwrap();
+        assert_eq!(view.compose.as_ref().map(|c| c.text()).as_deref(), Some("hello"));
+        assert!(view.inflight.is_none());
+        assert!(app.status_msg.as_ref().is_some_and(|(m, err, _)| m.contains("boom") && *err));
+    }
+
+    #[test]
+    fn a_posted_comment_clears_what_was_kept_and_reads_the_pr_again() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "hello");
+        ctrl_s(&mut app);
+        let pr = app.prs.open.as_ref().unwrap().pr.clone();
+        app.pending.clear();
+
+        app.apply(DataMsg::Pr(PrMsg::ActDone { pr, kind: PrActionKind::Comment, result: Ok(()) }));
+        let view = app.prs.open.as_ref().unwrap();
+        assert!(view.compose.is_none() && view.inflight.is_none());
+        assert!(app.status_msg.as_ref().is_some_and(|(m, err, _)| m == "Comment posted" && !*err));
+        assert!(matches!(&app.pending[..], [Command::Pr(PrCommand::FetchDetail(_))]));
+    }
+
+    #[test]
+    fn an_action_result_also_reads_loaded_files_again() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        let pr = app.prs.open.as_ref().unwrap().pr.clone();
+        app.prs.open.as_mut().unwrap().files.set(Ok(vec![]));
+        app.apply(DataMsg::Pr(PrMsg::ActDone { pr, kind: PrActionKind::UpdateBranch, result: Ok(()) }));
+        assert!(matches!(
+            &app.pending[..],
+            [Command::Pr(PrCommand::FetchDetail(_)), Command::Pr(PrCommand::FetchFiles(_))]
+        ));
+    }
+
+    #[test]
+    fn escape_with_text_asks_before_discarding() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        press(&mut app, KeyCode::Char('c'));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.mode == Mode::Prs, "an empty box closes without asking");
+        assert!(app.prs.open.as_ref().unwrap().compose.is_none());
+
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "x");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.mode == Mode::Confirm);
+        assert!(matches!(app.pending_action, Some(PendingAction::DiscardCompose)));
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.mode == Mode::Prs);
+        let compose = app.prs.open.as_ref().unwrap().compose.as_ref().expect("the box stays");
+        assert_eq!(compose.text(), "x");
+
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.mode == Mode::Prs);
+        assert!(app.prs.open.as_ref().unwrap().compose.is_none());
+    }
+
+    #[test]
+    fn the_box_takes_keys_that_mean_more_elsewhere() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "qD1é");
+        press(&mut app, KeyCode::Enter);
+        type_text(&mut app, "two");
+        assert!(app.mode == Mode::Prs && app.prs.open.is_some());
+        assert_eq!(app.prs.open.as_ref().unwrap().compose.as_ref().unwrap().text(), "qD1é\ntwo");
+        assert!(app.pending_action.is_none());
+    }
+
+    #[test]
+    fn confirm_returns_to_the_screen_it_came_from() {
+        let mut app = App::new(&crate::config::Config::default());
+        let mut run = run_in("org/api", 1, "failure");
+        run.status = "in_progress".into();
+        run.conclusion = None;
+        app.apply(DataMsg::Runs { repo: "org/api".into(), runs: vec![run] });
+        press(&mut app, KeyCode::Char('c'));
+        assert!(app.mode == Mode::Confirm, "cancel asks first");
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.mode == Mode::Normal);
+
+        let mut app = app_on_a_pr_with_a_run_check();
+        press(&mut app, KeyCode::Char('D'));
+        assert!(app.mode == Mode::Confirm);
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.mode == Mode::Prs);
+    }
+
+    #[test]
+    fn toggling_draft_asks_then_sends() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        press(&mut app, KeyCode::Char('D'));
+        assert_eq!(app.pending_action.as_ref().map(|a| a.prompt()).as_deref(), Some("Convert to draft?"));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(matches!(
+            &app.pending[..],
+            [Command::Pr(PrCommand::Act { action: PrAction::SetDraft { node_id, draft: true }, .. })] if node_id == "PR_7"
+        ));
+
+        edit_detail(&mut app, |d| d.draft = true);
+        app.pending.clear();
+        press(&mut app, KeyCode::Char('D'));
+        assert_eq!(app.pending_action.as_ref().map(|a| a.prompt()).as_deref(), Some("Mark ready for review?"));
+    }
+
+    #[test]
+    fn update_branch_is_only_offered_when_behind() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        edit_detail(&mut app, |d| d.merge_status = MergeStatus::Clean);
+        press(&mut app, KeyCode::Char('u'));
+        assert!(app.mode == Mode::Prs && app.pending.is_empty());
+        assert!(app.status_msg.is_some());
+
+        edit_detail(&mut app, |d| d.merge_status = MergeStatus::Behind);
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.pending_action.as_ref().map(|a| a.prompt()).as_deref(), Some("Update branch from release?"));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(matches!(
+            &app.pending[..],
+            [Command::Pr(PrCommand::Act { action: PrAction::UpdateBranch { head_oid }, .. })] if head_oid == "abc"
+        ));
+    }
+
+    #[test]
+    fn rerun_failed_collects_the_distinct_failed_runs() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.mode == Mode::Prs && app.status_msg.is_some(), "nothing failed");
+
+        edit_detail(&mut app, |d| {
+            let check = |name: &str, state, run_id| Check {
+                name: name.into(),
+                state,
+                target: CheckTarget::ActionsRun { run_id },
+            };
+            d.checks = vec![
+                check("a", CheckState::Failed, 10),
+                check("b", CheckState::Failed, 10),
+                check("c", CheckState::Failed, 11),
+                check("d", CheckState::Passed, 12),
+            ];
+        });
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.pending_action.as_ref().map(|a| a.prompt()).as_deref(), Some("Re-run failed checks?"));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(matches!(
+            &app.pending[..],
+            [Command::Pr(PrCommand::Act { action: PrAction::RerunFailed { run_ids }, .. })] if run_ids == &[10, 11]
+        ));
     }
 
     #[test]

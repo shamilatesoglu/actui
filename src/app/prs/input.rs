@@ -1,7 +1,8 @@
 //! Keys and clicks on the PRs screens.
 
-use super::{DiffView, Loadable, PrCommand, PrTab, PrView};
-use crate::pulls::model::CheckTarget;
+use super::{ComposeTarget, DiffView, Loadable, PrAction, PrCommand, PrTab, PrView};
+use crate::app::PendingAction;
+use crate::pulls::model::{CheckState, CheckTarget, MergeStatus, PrDetail};
 use crate::app::{App, Command, Filter, Mode};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Position;
@@ -39,7 +40,12 @@ impl App {
     }
 
     pub(in crate::app) fn key_prs(&mut self, key: KeyEvent) {
-        // A search box takes every key, including the ones that mean more elsewhere.
+        // A comment box takes every key, including the ones that mean more elsewhere.
+        if self.prs.open.as_ref().is_some_and(|v| v.compose.is_some()) {
+            self.key_compose(key);
+            return;
+        }
+        // So does a search box.
         if let Some(diff) = self.prs.open.as_mut().and_then(|v| v.files.diff.as_mut()).filter(|d| d.searching) {
             key_search_box(diff, key);
             return;
@@ -92,10 +98,68 @@ impl App {
             KeyCode::PageUp if view.tab == PrTab::Conversation => view.page_conversation(-1),
             KeyCode::Char('g') | KeyCode::Home if view.tab == PrTab::Conversation => view.scroll_text(i32::MIN),
             KeyCode::Char('G') | KeyCode::End if view.tab == PrTab::Conversation => view.scroll_text(i32::MAX),
+            KeyCode::Char('c') if view.tab != PrTab::Files => self.open_compose(ComposeTarget::PrComment),
+            KeyCode::Char('D') => self.ask_toggle_draft(),
+            KeyCode::Char('u') => self.ask_update_branch(),
+            KeyCode::Char('x') => self.ask_rerun_failed(),
             KeyCode::Char('J') if view.tab == PrTab::Overview => view.move_check(1),
             KeyCode::Char('K') if view.tab == PrTab::Overview => view.move_check(-1),
             KeyCode::Enter if view.tab == PrTab::Overview => self.open_selected_check(),
             _ => {}
+        }
+    }
+
+    /// Asks before changing a PR, with `label` as the question.
+    fn ask_pr(&mut self, action: PrAction, label: String) {
+        let Some(view) = &self.prs.open else { return };
+        let pr = view.pr.clone();
+        self.ask(PendingAction::Pr { pr, action, label });
+    }
+
+    fn ask_toggle_draft(&mut self) {
+        let Some(detail) = self.ready_detail() else { return };
+        let (node_id, draft) = (detail.node_id.clone(), !detail.draft);
+        let label = if draft { "Convert to draft?" } else { "Mark ready for review?" };
+        self.ask_pr(PrAction::SetDraft { node_id, draft }, label.to_string());
+    }
+
+    fn ask_update_branch(&mut self) {
+        let Some(detail) = self.ready_detail() else { return };
+        let (head_oid, base) = (detail.head.oid.clone(), detail.base_branch.clone());
+        if detail.merge_status != MergeStatus::Behind {
+            self.set_status(format!("The branch is not behind {base}"), true);
+            return;
+        }
+        self.ask_pr(PrAction::UpdateBranch { head_oid }, format!("Update branch from {base}?"));
+    }
+
+    fn ask_rerun_failed(&mut self) {
+        let Some(detail) = self.ready_detail() else { return };
+        let mut run_ids = Vec::new();
+        for check in detail.checks.iter().filter(|c| c.state == CheckState::Failed) {
+            if let CheckTarget::ActionsRun { run_id } = check.target {
+                if !run_ids.contains(&run_id) {
+                    run_ids.push(run_id);
+                }
+            }
+        }
+        if run_ids.is_empty() {
+            self.set_status("No failed Actions checks to re-run", true);
+            return;
+        }
+        self.ask_pr(PrAction::RerunFailed { run_ids }, "Re-run failed checks?".to_string());
+    }
+
+    /// The open PR's detail, or a status line saying it is not there yet.
+    fn ready_detail(&mut self) -> Option<&PrDetail> {
+        let ready = matches!(self.prs.open.as_ref().map(|v| &v.detail), Some(Loadable::Ready(_)));
+        if !ready {
+            self.set_status("The pull request is still loading", true);
+            return None;
+        }
+        match self.prs.open.as_ref().map(|v| &v.detail) {
+            Some(Loadable::Ready(detail)) => Some(detail),
+            _ => None,
         }
     }
 

@@ -267,6 +267,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_tabs(f, app, chunks[1]);
     draw_body(f, app, chunks[2]);
     draw_footer(f, app, chunks[3]);
+    prs::draw_compose(f, app);
 
     match app.mode {
         Mode::Help => draw_help(f),
@@ -398,7 +399,7 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
 /// The tabs row: which runs you're filtering to on the left, and which screen
 /// you're on over on the right.
 fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
-    let elsewhere = matches!(app.mode, Mode::Runners | Mode::Timing | Mode::Prs);
+    let elsewhere = matches!(app.mode, Mode::Runners | Mode::Timing) || app.shows_prs();
     let titles: Vec<Line> = Filter::ALL
         .iter()
         .map(|filt| Line::from(filt.tab_title()))
@@ -432,7 +433,7 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
         0 => " ⇄ PRs  P ".to_string(),
         n => format!(" ⇄ PRs {n}  P "),
     };
-    app.hit.prs_tab = screen_tab(f, &mut right, floor, area, &prs_label, app.mode == Mode::Prs);
+    app.hit.prs_tab = screen_tab(f, &mut right, floor, area, &prs_label, app.shows_prs());
 }
 
 /// Draw one screen switcher ending at `right`, moving `right` left past it.
@@ -469,11 +470,11 @@ fn draw_body(f: &mut Frame, app: &mut App, area: Rect) {
         app.panes.record_dividers(&dividers);
         return;
     }
-    if app.mode == Mode::Prs && app.prs.open.is_some() {
+    if app.shows_prs() && app.prs.open.is_some() {
         draw_open_pr(f, app, area);
         return;
     }
-    if app.mode == Mode::Prs {
+    if app.shows_prs() {
         app.hit.body = area;
         let (rest, dividers) = draw_sidebar(f, app, area);
         draw_prs_pane(f, app, rest);
@@ -1196,7 +1197,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             owned(&["org self-hosted runners", "j/k move", "⏎ details", "o open on GitHub", "r refresh"]),
             vec!["Esc back"],
         )
-    } else if app.mode == Mode::Prs {
+    } else if app.shows_prs() {
         (
             if let Some(view) = &app.prs.open {
                 prs::open_pr_hints(view)
@@ -2501,6 +2502,30 @@ mod tests {
         assert!(matches!(app.mode, Mode::Prs));
         let out = screen(&mut app, 140, 24);
         assert!(out.contains("Review requested"), "back on the list");
+    }
+
+    #[test]
+    fn the_comment_box_and_a_discard_question_draw_over_the_pr() {
+        use crate::app::{DataMsg, PrMsg};
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut app = prs_app();
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        let pr = app.prs.open.as_ref().unwrap().pr.clone();
+        app.apply(DataMsg::Pr(PrMsg::Detail { pr, result: Ok(Box::new(pr_detail())) }));
+        app.handle_key(KeyEvent::from(KeyCode::Char('c')));
+        for c in "looks good".chars() {
+            app.handle_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        let out = screen(&mut app, 140, 30);
+        assert!(out.contains("Comment on org/api#7"));
+        assert!(out.contains("looks good"));
+        assert!(out.contains("Ctrl+S send · Esc cancel"));
+        assert!(out.contains("Unit tests"), "the PR stays visible behind the box");
+
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        let out = screen(&mut app, 140, 30);
+        assert!(out.contains("Discard what you typed?"));
+        assert!(out.contains("Unit tests"), "the PR, not the runs, stays behind the question");
     }
 
     #[test]

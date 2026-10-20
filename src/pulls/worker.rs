@@ -1,8 +1,8 @@
 //! Runs the PR commands against GitHub on the async runtime.
 
-use crate::app::{DataMsg, PrCommand, PrMsg};
+use crate::app::{DataMsg, PrAction, PrCommand, PrMsg};
 use crate::github::Github;
-use crate::pulls::model::PrGroup;
+use crate::pulls::model::{PrGroup, PrRef};
 use tokio::sync::mpsc::UnboundedSender;
 
 pub fn run_command(cmd: PrCommand, gh: &Github, tx: &UnboundedSender<DataMsg>) {
@@ -30,12 +30,38 @@ pub fn run_command(cmd: PrCommand, gh: &Github, tx: &UnboundedSender<DataMsg>) {
                 let _ = tx.send(DataMsg::Pr(PrMsg::Files { pr, result }));
             });
         }
+        PrCommand::Act { pr, action } => {
+            let (gh, tx) = (gh.clone(), tx.clone());
+            tokio::spawn(async move {
+                let kind = action.kind();
+                let result = act(&gh, &pr, action).await.map_err(|e| e.to_string());
+                let _ = tx.send(DataMsg::Pr(PrMsg::ActDone { pr, kind, result }));
+            });
+        }
         PrCommand::FetchDetail(pr) => {
             let (gh, tx) = (gh.clone(), tx.clone());
             tokio::spawn(async move {
                 let result = gh.pr_detail(&pr).await.map(Box::new).map_err(|e| e.to_string());
                 let _ = tx.send(DataMsg::Pr(PrMsg::Detail { pr, result }));
             });
+        }
+    }
+}
+
+async fn act(gh: &Github, pr: &PrRef, action: PrAction) -> anyhow::Result<()> {
+    match action {
+        PrAction::Comment { body } => gh.comment_on_pr(pr, &body).await,
+        PrAction::SetDraft { node_id, draft } => gh.set_draft(&node_id, draft).await,
+        PrAction::UpdateBranch { head_oid } => gh.update_branch(pr, &head_oid).await,
+        PrAction::RerunFailed { run_ids } => {
+            // Every run gets its turn; the first failure is the one reported.
+            let mut first_error = None;
+            for run_id in run_ids {
+                if let Err(e) = gh.rerun_failed(&pr.repo, run_id).await {
+                    first_error.get_or_insert(e);
+                }
+            }
+            first_error.map_or(Ok(()), Err)
         }
     }
 }

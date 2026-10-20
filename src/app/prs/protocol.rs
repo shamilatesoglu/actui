@@ -4,7 +4,6 @@ use crate::github::Run;
 use crate::pulls::model::{PrDetail, PrFile, PrGroup, PrRef, PrSummary};
 
 /// Work the PRs screens request from the GitHub worker.
-#[allow(clippy::enum_variant_names)] // every request is a read so far; writes come next
 pub enum PrCommand {
     /// Read both lists again.
     FetchList,
@@ -14,6 +13,52 @@ pub enum PrCommand {
     FetchRun { repo: String, run_id: u64 },
     /// Read the files one PR changes, with their diffs.
     FetchFiles(PrRef),
+    /// Change something on one PR.
+    Act { pr: PrRef, action: PrAction },
+}
+
+/// A change to a PR.
+#[derive(Clone, Debug)]
+pub enum PrAction {
+    Comment { body: String },
+    SetDraft { node_id: String, draft: bool },
+    UpdateBranch { head_oid: String },
+    RerunFailed { run_ids: Vec<u64> },
+}
+
+/// Which change an answer is about.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PrActionKind {
+    Comment,
+    MarkReady,
+    ConvertToDraft,
+    UpdateBranch,
+    RerunFailed,
+}
+
+impl PrAction {
+    pub fn kind(&self) -> PrActionKind {
+        match self {
+            PrAction::Comment { .. } => PrActionKind::Comment,
+            PrAction::SetDraft { draft: false, .. } => PrActionKind::MarkReady,
+            PrAction::SetDraft { draft: true, .. } => PrActionKind::ConvertToDraft,
+            PrAction::UpdateBranch { .. } => PrActionKind::UpdateBranch,
+            PrAction::RerunFailed { .. } => PrActionKind::RerunFailed,
+        }
+    }
+}
+
+impl PrActionKind {
+    /// What the status line says once the change went through.
+    pub fn done_text(self) -> &'static str {
+        match self {
+            PrActionKind::Comment => "Comment posted",
+            PrActionKind::MarkReady => "Marked ready for review",
+            PrActionKind::ConvertToDraft => "Converted to draft",
+            PrActionKind::UpdateBranch => "Branch updated",
+            PrActionKind::RerunFailed => "Re-running failed checks",
+        }
+    }
 }
 
 /// What the PR workers send back.
@@ -26,4 +71,6 @@ pub enum PrMsg {
     Run(Result<Box<Run>, String>),
     /// A PR's changed files finished reading.
     Files { pr: PrRef, result: Result<Vec<PrFile>, String> },
+    /// A change to a PR finished.
+    ActDone { pr: PrRef, kind: PrActionKind, result: Result<(), String> },
 }

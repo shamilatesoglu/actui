@@ -574,6 +574,31 @@ impl Github {
     }
 }
 
+impl Github {
+    pub async fn comment_on_pr(&self, pr: &PrRef, body: &str) -> Result<()> {
+        let url = format!("{REST_URL}/repos/{}/issues/{}/comments", pr.repo, pr.number);
+        let req = self.client.post(url).json(&serde_json::json!({ "body": body }));
+        ensure_ok(self.send(req).await?).await.map(|_| ())
+    }
+
+    /// Marks a draft ready for review, or turns a ready PR back into a draft.
+    pub async fn set_draft(&self, node_id: &str, draft: bool) -> Result<()> {
+        let mutation = if draft { CONVERT_TO_DRAFT } else { MARK_READY };
+        self.graphql::<serde_json::Value>(mutation, serde_json::json!({ "id": node_id })).await.map(|_| ())
+    }
+
+    /// Merges the base branch into the PR's branch. GitHub refuses if the
+    /// branch moved since the given head commit was read.
+    pub async fn update_branch(&self, pr: &PrRef, head_oid: &str) -> Result<()> {
+        let url = format!("{REST_URL}/repos/{}/pulls/{}/update-branch", pr.repo, pr.number);
+        let req = self.client.put(url).json(&serde_json::json!({ "expected_head_sha": head_oid }));
+        ensure_ok(self.send(req).await?).await.map(|_| ())
+    }
+}
+
+const MARK_READY: &str = "mutation(: ID!) { markPullRequestReadyForReview(input: { pullRequestId:  }) { clientMutationId } }";
+const CONVERT_TO_DRAFT: &str = "mutation(: ID!) { convertPullRequestToDraft(input: { pullRequestId:  }) { clientMutationId } }";
+
 #[cfg(test)]
 mod tests {
     use super::*;

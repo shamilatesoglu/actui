@@ -31,6 +31,7 @@ serde_yaml = "0.9"
 base64 = "0.22"
 notify-rust = "4"
 terminal-colorsaurus = "1"
+tui-textarea = "0.7"
 
 [profile.release]
 lto = "thin"

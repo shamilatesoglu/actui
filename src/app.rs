@@ -241,6 +241,8 @@ pub struct App {
     pub timing: Option<TimingView>,
     timing_cache: HashMap<u64, TimingHistory>,
     pub pending_action: Option<PendingAction>,
+    /// The mode a confirm prompt returns to.
+    confirm_from: Mode,
     pub pending_open_log_id: Option<u64>,
     /// Debounced log fetch for the selected job (for preview): (selected at, job_id)
     pub logs_fetch_due: Option<(Instant, u64)>,
@@ -324,6 +326,7 @@ impl App {
             timing: None,
             timing_cache: HashMap::new(),
             pending_action: None,
+            confirm_from: Mode::Normal,
             pending_open_log_id: None,
             logs_fetch_due: None,
             last_selected_job_id: None,
@@ -569,8 +572,9 @@ impl App {
                         .find(|r| r.id == run_id)
                         .map(|r| format!("{} #{}", r.workflow_name(), r.run_number))
                         .unwrap_or_default();
-                    self.pending_action = Some(PendingAction::Approve { repo, run_id, label });
-                    self.mode = Mode::Confirm;
+                    // The picker is gone, so the answer goes back to the screen under it.
+                    self.mode = self.overlay_return_mode();
+                    self.ask(PendingAction::Approve { repo, run_id, label });
                     return;
                 }
                 // Pre-select every environment the user is allowed to approve.
