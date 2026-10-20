@@ -5,8 +5,7 @@ use crate::app::PrView;
 use crate::pulls::model::{
     blocked_reason, Check, CheckState, PrDetail, PrRef, QueueState, Verdict,
 };
-use ratatui::buffer::Buffer;
-use ratatui::widgets::{ListState, Widget};
+use ratatui::widgets::ListState;
 
 /// Draws the overview in `area`: the text scrolls above, the checks list sits
 /// below it with its own cursor.
@@ -22,12 +21,7 @@ pub(super) fn draw_overview(
     let [text_area, checks_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(check_rows)]).areas(area);
 
-    let lines = overview_lines(&view.pr, detail);
-    let rows = wrapped_rows(&lines, text_area.width);
-    view.overview_max_scroll = rows.saturating_sub(text_area.height as usize).min(u16::MAX as usize) as u16;
-    view.overview_scroll = view.overview_scroll.min(view.overview_max_scroll);
-    let text = Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((view.overview_scroll, 0));
-    f.render_widget(text, text_area);
+    draw_scrolling_text(f, &mut view.overview, overview_lines(&view.pr, detail), text_area);
 
     draw_checks(f, &detail.checks, &mut view.checks, checks_area, spin);
 }
@@ -58,25 +52,7 @@ fn check_line(check: &Check, spin: &'static str) -> Line<'static> {
     Line::from(vec![Span::styled(glyph, Style::default().fg(color)), Span::raw(format!(" {}", check.name))])
 }
 
-/// How many rows `lines` take once wrapped to `width` the way the paragraph
-/// wraps them. Counted by drawing into a scratch buffer, since the word
-/// breaking is the paragraph's own.
-fn wrapped_rows(lines: &[Line], width: u16) -> usize {
-    if width == 0 {
-        return 0;
-    }
-    // Even breaking every word mid-way takes under two rows per width's worth.
-    let most: usize = lines.iter().map(|l| 2 * l.width().div_ceil(width as usize) + 1).sum();
-    let area = Rect::new(0, 0, width, most.min(u16::MAX as usize) as u16);
-    let mut buf = Buffer::empty(area);
-    Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false }).render(area, &mut buf);
-    (0..area.height)
-        .rev()
-        .find(|&y| (0..width).any(|x| buf[(x, y)].symbol() != " "))
-        .map_or(0, |y| y as usize + 1)
-}
-
-fn verdict_glyph(verdict: Verdict) -> (&'static str, &'static str, Color) {
+pub(super) fn verdict_glyph(verdict: Verdict) -> (&'static str, &'static str, Color) {
     match verdict {
         Verdict::Approved => ("✓", "approved", Color::Green),
         Verdict::ChangesRequested => ("✗", "changes requested", Color::Red),
@@ -281,8 +257,8 @@ mod tests {
             pr: PrRef { repo: "org/api".into(), number: 7 },
             detail: crate::app::Loadable::Loading,
             tab: crate::app::PrTab::Overview,
-            overview_scroll: 0,
-            overview_max_scroll: 0,
+            overview: Default::default(),
+            conversation: Default::default(),
             checks: ListState::default(),
             files: Default::default(),
         };
@@ -292,8 +268,8 @@ mod tests {
             format!("{:?}", term.backend().buffer())
         };
         draw(&mut view);
-        assert!(view.overview_max_scroll > 0);
-        view.overview_scroll = view.overview_max_scroll;
+        assert!(view.overview.max > 0);
+        view.overview.offset = view.overview.max;
         assert!(draw(&mut view).contains("THEEND"));
     }
 

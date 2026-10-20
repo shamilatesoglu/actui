@@ -33,7 +33,7 @@ impl App {
                 Some(diff) => diff.move_cursor(delta),
                 None => view.files.move_sel(delta),
             },
-            Some(view) => view.scroll_overview(delta),
+            Some(view) => view.scroll_text(delta),
             None => self.prs.list.move_sel(delta),
         }
     }
@@ -86,8 +86,12 @@ impl App {
                     self.pending.push(Command::Pr(PrCommand::FetchFiles(pr)));
                 }
             }
-            KeyCode::Char('j') | KeyCode::Down if view.tab == PrTab::Overview => view.scroll_overview(1),
-            KeyCode::Char('k') | KeyCode::Up if view.tab == PrTab::Overview => view.scroll_overview(-1),
+            KeyCode::Char('j') | KeyCode::Down if view.tab != PrTab::Files => view.scroll_text(1),
+            KeyCode::Char('k') | KeyCode::Up if view.tab != PrTab::Files => view.scroll_text(-1),
+            KeyCode::PageDown if view.tab == PrTab::Conversation => view.page_conversation(1),
+            KeyCode::PageUp if view.tab == PrTab::Conversation => view.page_conversation(-1),
+            KeyCode::Char('g') | KeyCode::Home if view.tab == PrTab::Conversation => view.scroll_text(i32::MIN),
+            KeyCode::Char('G') | KeyCode::End if view.tab == PrTab::Conversation => view.scroll_text(i32::MAX),
             KeyCode::Char('J') if view.tab == PrTab::Overview => view.move_check(1),
             KeyCode::Char('K') if view.tab == PrTab::Overview => view.move_check(-1),
             KeyCode::Enter if view.tab == PrTab::Overview => self.open_selected_check(),

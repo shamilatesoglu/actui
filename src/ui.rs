@@ -2489,7 +2489,7 @@ mod tests {
 
         app.handle_key(KeyEvent::from(KeyCode::Tab));
         app.handle_key(KeyEvent::from(KeyCode::Tab));
-        assert!(screen(&mut app, 140, 24).contains("Not built yet"));
+        assert!(screen(&mut app, 140, 24).contains("ana  description"));
         app.pending.clear();
         app.handle_key(KeyEvent::from(KeyCode::Char('o')));
         assert!(matches!(&app.pending[..], [Command::OpenUrl(u)] if u == "https://github.com/org/api/pull/7"));
@@ -2687,6 +2687,63 @@ mod tests {
         let pr = app.prs.open.as_ref().unwrap().pr.clone();
         app.apply(DataMsg::Pr(PrMsg::Detail { pr, result: Ok(Box::new(detail)) }));
         assert!(screen(&mut app, 140, 24).contains('\u{1F4AC}'));
+    }
+
+    fn thread_at(path: &str, line: Option<u32>, outdated: bool) -> crate::pulls::model::ReviewThread {
+        use crate::pulls::model::{Comment, ReviewThread, Side};
+        ReviewThread {
+            id: "T".into(),
+            resolved: false,
+            outdated,
+            path: path.into(),
+            line,
+            start_line: None,
+            side: Side::Right,
+            comments: vec![Comment {
+                id: 1,
+                author: "bob".into(),
+                body: "Why this?".into(),
+                created_at: chrono::Utc::now(),
+            }],
+        }
+    }
+
+    #[test]
+    fn an_outdated_thread_still_shows_in_the_conversation() {
+        let mut detail = pr_detail();
+        detail.threads = vec![thread_at("src/old.rs", None, true), thread_at("src/new.rs", Some(12), false)];
+        let mut app = files_app_with(vec![], detail);
+        press(&mut app, crossterm::event::KeyCode::Tab);
+        let out = screen(&mut app, 140, 24);
+        assert!(out.contains("src/old.rs"), "{out}");
+        assert!(out.contains("outdated"), "{out}");
+        assert!(out.contains("src/new.rs:12"), "{out}");
+        assert!(out.contains("Why this?"), "{out}");
+        assert!(out.contains("Conversation 2"), "the description is not counted: {out}");
+    }
+
+    #[test]
+    fn a_long_conversation_scrolls_to_its_last_line() {
+        use crossterm::event::KeyCode;
+        let mut detail = pr_detail();
+        detail.comments = (1..=30)
+            .map(|n| crate::pulls::model::Comment {
+                id: n,
+                author: "bob".into(),
+                body: format!("note {n}"),
+                created_at: chrono::Utc::now(),
+            })
+            .collect();
+        let mut app = files_app_with(vec![], detail);
+        press(&mut app, KeyCode::Tab);
+        let first = screen(&mut app, 100, 20);
+        assert!(!first.contains("note 30"), "{first}");
+        press(&mut app, KeyCode::Char('G'));
+        assert!(screen(&mut app, 100, 20).contains("note 30"));
+        press(&mut app, KeyCode::Char('g'));
+        assert!(!screen(&mut app, 100, 20).contains("note 30"));
+        press(&mut app, KeyCode::PageDown);
+        assert!(screen(&mut app, 100, 20).contains("note 4"));
     }
 
     #[test]

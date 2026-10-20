@@ -162,14 +162,30 @@ impl PrTab {
     }
 }
 
+/// How far a text is scrolled. The bounds come from the last frame.
+#[derive(Default)]
+pub struct Scroll {
+    pub offset: u16,
+    /// The most `offset` can be.
+    pub max: u16,
+    /// Rows the text area showed.
+    pub page: u16,
+}
+
+impl Scroll {
+    pub fn by(&mut self, delta: i32) {
+        let next = (self.offset as i64 + delta as i64).clamp(0, self.max as i64);
+        self.offset = next as u16;
+    }
+}
+
 /// A PR opened from the list.
 pub struct PrView {
     pub pr: PrRef,
     pub detail: Loadable<Box<PrDetail>>,
     pub tab: PrTab,
-    pub overview_scroll: u16,
-    /// The most the overview text scrolls, as of the last frame.
-    pub overview_max_scroll: u16,
+    pub overview: Scroll,
+    pub conversation: Scroll,
     pub checks: ListState,
     pub files: FilesState,
 }
@@ -180,8 +196,8 @@ impl PrView {
             pr,
             detail: Loadable::Loading,
             tab: PrTab::Overview,
-            overview_scroll: 0,
-            overview_max_scroll: 0,
+            overview: Scroll::default(),
+            conversation: Scroll::default(),
             checks: ListState::default(),
             files: FilesState::default(),
         }
@@ -199,9 +215,19 @@ impl PrView {
         }
     }
 
-    pub fn scroll_overview(&mut self, delta: i32) {
-        let next = (self.overview_scroll as i32 + delta).clamp(0, self.overview_max_scroll as i32);
-        self.overview_scroll = next as u16;
+    /// Scrolls the text of the shown tab, if that tab is a scrolling text.
+    pub fn scroll_text(&mut self, delta: i32) {
+        match self.tab {
+            PrTab::Overview => self.overview.by(delta),
+            PrTab::Conversation => self.conversation.by(delta),
+            PrTab::Files => {}
+        }
+    }
+
+    /// Scrolls the conversation by whole pages (`pages` may be negative).
+    pub fn page_conversation(&mut self, pages: i32) {
+        let page = self.conversation.page.saturating_sub(1).max(1) as i32;
+        self.conversation.by(pages.saturating_mul(page));
     }
 
     pub fn move_check(&mut self, delta: i32) {

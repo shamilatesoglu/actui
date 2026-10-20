@@ -1,14 +1,18 @@
 //! The PRs list: your review requests and your own open PRs, one row each.
 //! Borrows the palette accessors and `pane` from the parent `ui` module.
 
+mod conversation;
 mod diff;
 mod overview;
 
 use super::*;
-use crate::app::{App, Loadable, PrRow, PrTab, PrView};
+use crate::app::{App, Loadable, PrRow, PrTab, PrView, Scroll};
 use crate::pulls::model::{ChecksState, PrSummary, ReviewDecision};
+use conversation::{conversation, draw_conversation};
 use diff::draw_files;
 use overview::draw_overview;
+use ratatui::buffer::Buffer;
+use ratatui::widgets::Widget;
 
 /// Narrowest the title column shrinks to before it stops making room.
 const MIN_TITLE: usize = 12;
@@ -84,12 +88,40 @@ pub(super) fn draw_open_pr(f: &mut Frame, app: &mut App, area: Rect) {
         }
         Loadable::Ready(d) => match view.tab {
             PrTab::Overview => draw_overview(f, view, d, body, spin),
-            PrTab::Files | PrTab::Conversation => {
-                f.render_widget(Paragraph::new(Line::styled("Not built yet", Style::default().fg(dim()))), body);
-            }
+            PrTab::Conversation => draw_conversation(f, &mut view.conversation, d, body),
+            // Drawn above, before the detail matters.
+            PrTab::Files => {}
         },
     }
     view.detail = detail;
+}
+
+/// Draws `lines` wrapped in `area`, scrolled by `scroll`, and records in
+/// `scroll` how far the text can go so the last line can be reached.
+fn draw_scrolling_text(f: &mut Frame, scroll: &mut Scroll, lines: Vec<Line<'static>>, area: Rect) {
+    let rows = wrapped_rows(&lines, area.width);
+    scroll.max = rows.saturating_sub(area.height as usize).min(u16::MAX as usize) as u16;
+    scroll.page = area.height;
+    scroll.offset = scroll.offset.min(scroll.max);
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll.offset, 0)), area);
+}
+
+/// How many rows `lines` take once wrapped to `width` the way the paragraph
+/// wraps them. Counted by drawing into a scratch buffer, since the word
+/// breaking is the paragraph's own.
+fn wrapped_rows(lines: &[Line], width: u16) -> usize {
+    if width == 0 {
+        return 0;
+    }
+    // Even breaking every word mid-way takes under two rows per width's worth.
+    let most: usize = lines.iter().map(|l| 2 * l.width().div_ceil(width as usize) + 1).sum();
+    let area = Rect::new(0, 0, width, most.min(u16::MAX as usize) as u16);
+    let mut buf = Buffer::empty(area);
+    Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false }).render(area, &mut buf);
+    (0..area.height)
+        .rev()
+        .find(|&y| (0..width).any(|x| buf[(x, y)].symbol() != " "))
+        .map_or(0, |y| y as usize + 1)
 }
 
 /// `Overview  Files  Conversation {n}`, the open tab highlighted.
@@ -107,7 +139,8 @@ fn tab_strip(
                 _ => None,
             },
             (PrTab::Conversation, Loadable::Ready(d)) => {
-                Some(d.comments.len() + d.reviews.len() + d.threads.len())
+                // The description is the first entry and is not counted.
+                Some(conversation(d).len() - 1)
             }
             _ => None,
         };
@@ -179,6 +212,9 @@ pub(super) fn open_pr_hints(view: &PrView) -> Vec<String> {
         (PrTab::Files, Some(diff)) if diff.searching => owned(&["type to search", "⏎ keep", "Esc drop"]),
         (PrTab::Files, Some(_)) => owned(&["j/k move", "g/G ends", "/ search", "n/N next match", "h back to files"]),
         (PrTab::Files, None) => owned(&["Tab next tab", "j/k move", "⏎ open diff", "o open on GitHub", "r refresh"]),
+        (PrTab::Conversation, _) => {
+            owned(&["Tab next tab", "j/k scroll", "PgUp/PgDn page", "g/G ends", "o open on GitHub", "r refresh"])
+        }
         _ => owned(&["Tab next tab", "j/k scroll", "J/K checks", "o open on GitHub", "r refresh"]),
     }
 }
