@@ -31,15 +31,17 @@ fn says_rate_limited(body: &str) -> bool {
         .is_ok_and(|resp| resp.errors.iter().any(|e| e.kind.as_deref() == Some("RATE_LIMITED")))
 }
 
-/// Returns the `data` of a GraphQL response. Errors next to data are partial
-/// failures (a SAML-protected org in a search, say) and the data is still
-/// worth showing. Without data, the first error's message is returned.
-fn parse_graphql<T: DeserializeOwned>(body: &str) -> Result<T> {
+/// Returns the `data` of a GraphQL response and the messages of the errors
+/// next to it. Errors next to data are partial failures (a SAML-protected
+/// org in a search, say) and the data is still worth showing; the caller
+/// decides when an error explains what is missing. Without data, the first
+/// error's message is returned.
+fn parse_graphql<T: DeserializeOwned>(body: &str) -> Result<(T, Vec<String>)> {
     let resp: GraphqlResponse<T> = serde_json::from_str(body).context("bad GraphQL response")?;
-    match (resp.data, resp.errors.into_iter().next()) {
-        (Some(data), _) => Ok(data),
-        (None, Some(first)) => Err(anyhow!(first.message)),
-        (None, None) => Err(anyhow!("GraphQL response has no data")),
+    let mut errors = resp.errors.into_iter().map(|e| e.message);
+    match resp.data {
+        Some(data) => Ok((data, errors.collect())),
+        None => Err(anyhow!(errors.next().unwrap_or_else(|| "GraphQL response has no data".into()))),
     }
 }
 
@@ -70,11 +72,12 @@ impl Github {
         Ok(body)
     }
 
+    /// A GraphQL read: its data and the messages of any errors next to it.
     pub(crate) async fn graphql<T: DeserializeOwned>(
         &self,
         query: &str,
         variables: serde_json::Value,
-    ) -> Result<T> {
+    ) -> Result<(T, Vec<String>)> {
         parse_graphql(&self.graphql_body(query, variables).await?)
     }
 
@@ -84,22 +87,22 @@ impl Github {
 
     /// Lists the open pull requests of one group, most recently updated first.
     pub async fn search_prs(&self, group: PrGroup) -> Result<Vec<PrSummary>> {
-        let data = self
+        let (data, errors) = self
             .graphql(SEARCH_QUERY, serde_json::json!({ "q": group.query() }))
             .await?;
-        parse_search(data)
+        parse_search(data, errors)
     }
 
     /// Reads everything the PR view shows about one pull request.
     pub async fn pr_detail(&self, pr: &PrRef) -> Result<PrDetail> {
         let (owner, name) = pr.repo.split_once('/').context("repo is not owner/name")?;
-        let data = self
+        let (data, errors) = self
             .graphql(
                 DETAIL_QUERY,
                 serde_json::json!({ "owner": owner, "name": name, "number": pr.number }),
             )
             .await?;
-        parse_detail(data)
+        detail_answer(data, errors)
     }
 }
 
@@ -203,18 +206,23 @@ impl From<PrNode> for PrSummary {
 /// Turns search results into summaries. Nodes that aren't pull requests
 /// come back as `{}` and are skipped. Any other node that doesn't parse is
 /// an error, so a pull request never drops out of the list silently.
-fn parse_search(data: serde_json::Value) -> Result<Vec<PrSummary>> {
-    let data: SearchData = serde_json::from_value(data).context("bad search response")?;
+fn parse_search(data: serde_json::Value, errors: Vec<String>) -> Result<Vec<PrSummary>> {
+    let data: SearchData = serde_json::from_value(data).map_err(|e| anyhow!("bad search response: {e}"))?;
     let mut prs = Vec::new();
     for node in data.search.nodes {
-        if node.as_object().is_some_and(|o| o.is_empty()) {
+        // `null` is a result the token may not see.
+        if node.is_null() || node.as_object().is_some_and(|o| o.is_empty()) {
             continue;
         }
         let node: PrNode = serde_json::from_value(node)
             .map_err(|e| anyhow!("bad pull request in search: {e}"))?;
         prs.push(PrSummary::from(node));
     }
-    Ok(prs)
+    // Nothing found next to an error is that error, not an empty list.
+    match errors.into_iter().next() {
+        Some(first) if prs.is_empty() => Err(anyhow!(first)),
+        _ => Ok(prs),
+    }
 }
 
 const DETAIL_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { nameWithOwner mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed viewerDefaultMergeMethod pullRequest(number: $number) { id title body url isDraft baseRefName headRefName headRefOid mergeStateStatus isMergeQueueEnabled mergeQueueEntry { position } author { login } headRepository { nameWithOwner } labels(first: 30) { nodes { name } } reviewRequests(first: 30) { nodes { requestedReviewer { __typename ... on User { login } ... on Team { slug } } } } latestOpinionatedReviews(first: 50) { nodes { author { login } state } } reviews(last: 100) { nodes { author { login } state body submittedAt } } comments(last: 100) { nodes { databaseId author { login } body createdAt } } reviewThreads(first: 100) { nodes { id isResolved isOutdated path line startLine diffSide comments(first: 50) { nodes { databaseId author { login } body createdAt } } } } commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes { __typename ... on CheckRun { name status conclusion detailsUrl checkSuite { workflowRun { databaseId } } } ... on StatusContext { context state targetUrl } } } } } } } } } }";
@@ -234,7 +242,8 @@ impl<T> Nodes<T> {
 
 #[derive(Deserialize)]
 struct DetailData {
-    repository: RepoNode,
+    /// `null` when the repo is gone or the token can't see it.
+    repository: Option<RepoNode>,
 }
 
 #[derive(Deserialize)]
@@ -245,7 +254,8 @@ struct RepoNode {
     squash_merge_allowed: bool,
     rebase_merge_allowed: bool,
     viewer_default_merge_method: String,
-    pull_request: DetailNode,
+    /// `null` when the PR is not there.
+    pull_request: Option<DetailNode>,
 }
 
 #[derive(Deserialize)]
@@ -451,12 +461,17 @@ fn merge_methods(repo: &RepoNode) -> Vec<MergeMethod> {
     methods
 }
 
-/// Turns the detail query's `data` into a `PrDetail`.
-pub(crate) fn parse_detail(data: serde_json::Value) -> Result<PrDetail> {
-    let data: DetailData = serde_json::from_value(data).context("bad pull request response")?;
-    let repo = data.repository;
+/// Turns the detail query's answer into a `PrDetail`. When it can't, GitHub's
+/// own reason, sent as an error next to the data, beats what is missing.
+fn detail_answer(data: serde_json::Value, errors: Vec<String>) -> Result<PrDetail> {
+    parse_detail(data).map_err(|e| errors.into_iter().next().map_or(e, |first| anyhow!(first)))
+}
+
+fn parse_detail(data: serde_json::Value) -> Result<PrDetail> {
+    let data: DetailData = serde_json::from_value(data).map_err(|e| anyhow!("bad pull request response: {e}"))?;
+    let mut repo = data.repository.ok_or_else(|| anyhow!("PR not found or no access"))?;
+    let pr = repo.pull_request.take().ok_or_else(|| anyhow!("PR not found or no access"))?;
     let merge_methods = merge_methods(&repo);
-    let pr = repo.pull_request;
 
     // A reviewer asked again is waiting on their review, not on their old
     // verdict, so the request wins.
@@ -939,14 +954,15 @@ mod tests {
     #[test]
     fn data_next_to_errors_is_returned() {
         let body = r#"{"data":{"n":1},"errors":[{"message":"SAML enforcement"}]}"#;
-        let data = parse_graphql::<serde_json::Value>(body).unwrap();
+        let (data, errors) = parse_graphql::<serde_json::Value>(body).unwrap();
         assert_eq!(data["n"], 1);
+        assert_eq!(errors, ["SAML enforcement"]);
     }
 
     #[test]
     fn a_node_that_fails_to_parse_is_an_error() {
         let data = serde_json::json!({"search":{"nodes":[{"id":"PR_1","number":"twelve"}]}});
-        let err = parse_search(data).unwrap_err();
+        let err = parse_search(data, vec![]).unwrap_err();
         let msg = err.to_string();
         assert!(msg.starts_with("bad pull request in search: "), "{msg}");
         assert!(msg.contains("twelve"), "says what was wrong: {msg}");
@@ -965,7 +981,7 @@ mod tests {
              "commits":{"nodes":[{"commit":{"statusCheckRollup":null}}]}},
             {}
         ]}});
-        let prs = parse_search(data).unwrap();
+        let prs = parse_search(data, vec![]).unwrap();
         assert_eq!(prs.len(), 2, "non-PR nodes are skipped");
         assert_eq!(prs[0].pr, PrRef { repo: "org/api".into(), number: 12 });
         assert!(prs[0].draft);
@@ -1026,7 +1042,7 @@ mod tests {
 
     #[test]
     fn detail_parses_reviewers_checks_threads_and_queue() {
-        let d = parse_detail(detail_fixture()).unwrap();
+        let d = detail_answer(detail_fixture(), vec![]).unwrap();
         assert_eq!(d.merge_status, MergeStatus::Blocked);
         assert_eq!(blocked_reason(&d).as_deref(), Some("changes requested"));
         assert_eq!(d.head.repo, "ana/api");
@@ -1061,13 +1077,58 @@ mod tests {
     }
 
     #[test]
+    fn null_and_empty_search_nodes_are_skipped() {
+        let mut data = serde_json::json!({"search":{"nodes":[null, {}]}});
+        let pr = serde_json::json!({"id":"PR_1","number":12,"title":"Fix login","url":"u",
+            "isDraft":false,"updatedAt":"2026-10-20T09:00:00Z","reviewDecision":null,
+            "author":{"login":"ana"},"repository":{"nameWithOwner":"org/api"},
+            "commits":{"nodes":[]}});
+        data["search"]["nodes"].as_array_mut().unwrap().push(pr);
+        let prs = parse_search(data, vec![]).unwrap();
+        assert_eq!(prs.len(), 1);
+    }
+
+    #[test]
+    fn an_empty_search_next_to_an_error_is_that_error() {
+        let empty = || serde_json::json!({"search":{"nodes":[null]}});
+        let saml = || vec!["Resource protected by organization SAML enforcement.".to_string()];
+        let err = parse_search(empty(), saml()).unwrap_err();
+        assert_eq!(err.to_string(), "Resource protected by organization SAML enforcement.");
+        assert!(parse_search(empty(), vec![]).unwrap().is_empty(), "no error: really none");
+    }
+
+    #[test]
+    fn a_pr_github_cannot_find_says_why() {
+        let mut data = detail_fixture();
+        data["repository"]["pullRequest"] = serde_json::Value::Null;
+        let why = "Could not resolve to a PullRequest with the number of 999999.";
+        let err = detail_answer(data.clone(), vec![why.to_string()]).unwrap_err();
+        assert_eq!(err.to_string(), why);
+        let err = detail_answer(data, vec![]).unwrap_err();
+        assert_eq!(err.to_string(), "PR not found or no access");
+
+        let gone = "Could not resolve to a Repository with the name 'org/gone'.";
+        let err = detail_answer(serde_json::json!({"repository": null}), vec![gone.to_string()]).unwrap_err();
+        assert_eq!(err.to_string(), gone);
+    }
+
+    #[test]
+    fn a_detail_that_fails_to_parse_says_what_was_wrong() {
+        let mut data = detail_fixture();
+        data["repository"]["pullRequest"]["title"] = 5.into();
+        let msg = detail_answer(data, vec![]).unwrap_err().to_string();
+        assert!(msg.starts_with("bad pull request response: "), "{msg}");
+        assert!(msg.contains("invalid type"), "names the cause: {msg}");
+    }
+
+    #[test]
     fn a_ghost_author_and_a_deleted_fork_still_parse() {
         let mut data = detail_fixture();
         let pr = &mut data["repository"]["pullRequest"];
         pr["author"] = serde_json::Value::Null;
         pr["headRepository"] = serde_json::Value::Null;
         pr["mergeQueueEntry"] = serde_json::Value::Null;
-        let d = parse_detail(data).unwrap();
+        let d = detail_answer(data, vec![]).unwrap();
         assert_eq!(d.author, "ghost");
         assert_eq!(d.head.repo, "org/api", "falls back to the PR's own repo");
         assert_eq!(d.queue, QueueState::NotQueued);
