@@ -253,18 +253,7 @@ mod tests {
     fn a_long_description_scrolls_to_its_last_word() {
         let mut detail = detail();
         detail.body = (1..=60).map(|n| format!("word{n}")).collect::<Vec<_>>().join(" ") + " THEEND";
-        let mut view = PrView {
-            pr: PrRef { repo: "org/api".into(), number: 7 },
-            detail: crate::app::Loadable::Loading,
-            tab: crate::app::PrTab::Overview,
-            overview: Default::default(),
-            conversation: Default::default(),
-            checks: ListState::default(),
-            files: Default::default(),
-            compose: None,
-            merge_dialog: None,
-            review_popup: None,
-        };
+        let mut view = PrView::new(PrRef { repo: "org/api".into(), number: 7 });
         let draw = |view: &mut PrView| {
             let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(23, 12)).unwrap();
             term.draw(|f| draw_overview(f, view, &detail, f.area(), "*")).unwrap();

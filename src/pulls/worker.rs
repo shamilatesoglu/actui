@@ -51,11 +51,11 @@ pub fn run_command(cmd: PrCommand, gh: &Github, tx: &UnboundedSender<DataMsg>) {
                 }
             });
         }
-        PrCommand::FetchDetail(pr) => {
+        PrCommand::FetchDetail { pr, request } => {
             let (gh, tx) = (gh.clone(), tx.clone());
             tokio::spawn(async move {
                 let result = gh.pr_detail(&pr).await.map(Box::new).map_err(|e| e.to_string());
-                let _ = tx.send(DataMsg::Pr(PrMsg::Detail { pr, result }));
+                let _ = tx.send(DataMsg::Pr(PrMsg::Detail { pr, request, result }));
             });
         }
     }

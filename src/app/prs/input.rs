@@ -22,8 +22,9 @@ impl App {
 
     fn open_pr(&mut self) {
         if let Some(pr) = self.prs.list.selected().map(|p| p.pr.clone()) {
-            self.pending.push(Command::Pr(PrCommand::FetchDetail(pr.clone())));
-            self.prs.open = Some(PrView::new(pr));
+            let mut view = PrView::new(pr);
+            self.pending.push(view.ask_detail());
+            self.prs.open = Some(view);
             self.give_back_refused();
         }
     }

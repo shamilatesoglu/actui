@@ -132,14 +132,15 @@ fn enter_opens_the_pr_overview() {
     app.pending.clear();
     app.handle_key(KeyEvent::from(KeyCode::Enter));
     let pr = match &app.pending[..] {
-        [Command::Pr(PrCommand::FetchDetail(pr))] => pr.clone(),
+        [Command::Pr(PrCommand::FetchDetail { pr, .. })] => pr.clone(),
         _ => panic!("expected a detail fetch"),
     };
     assert_eq!(pr.label(), "org/api#7");
     let out = screen(&mut app, 140, 24);
     assert!(out.contains("loading"), "{out}");
 
-    app.apply(DataMsg::Pr(PrMsg::Detail { pr, result: Ok(Box::new(pr_detail())) }));
+    let request = app.fresh_detail_request();
+    app.apply(DataMsg::Pr(PrMsg::Detail { request, pr, result: Ok(Box::new(pr_detail())) }));
     let out = screen(&mut app, 140, 24);
     println!("{out}");
     assert!(out.contains("org/api#7  Fix login"));
@@ -153,7 +154,8 @@ fn enter_opens_the_pr_overview() {
 
     // Another PR's answer, arriving late, changes nothing.
     let other = crate::pulls::model::PrRef { repo: "org/api".into(), number: 9 };
-    app.apply(DataMsg::Pr(PrMsg::Detail { pr: other, result: Err("late".into()) }));
+    let request = app.fresh_detail_request();
+    app.apply(DataMsg::Pr(PrMsg::Detail { request, pr: other, result: Err("late".into()) }));
     assert!(screen(&mut app, 140, 24).contains("Unit tests"));
 
     app.handle_key(KeyEvent::from(KeyCode::Tab));
@@ -164,7 +166,7 @@ fn enter_opens_the_pr_overview() {
     assert!(matches!(&app.pending[..], [Command::OpenUrl(u)] if u == "https://github.com/org/api/pull/7"));
     app.pending.clear();
     app.handle_key(KeyEvent::from(KeyCode::Char('r')));
-    assert!(matches!(&app.pending[..], [Command::Pr(PrCommand::FetchDetail(_))]));
+    assert!(matches!(&app.pending[..], [Command::Pr(PrCommand::FetchDetail { .. })]));
 
     app.handle_key(KeyEvent::from(KeyCode::Esc));
     assert!(matches!(app.mode, Mode::Prs));
@@ -190,7 +192,8 @@ fn tab_clicks_leave_an_open_box_alone() {
     let pr = app.prs.open.as_ref().unwrap().pr.clone();
     let mut detail = pr_detail();
     detail.queue = QueueState::NoQueue;
-    app.apply(DataMsg::Pr(PrMsg::Detail { pr, result: Ok(Box::new(detail)) }));
+    let request = app.fresh_detail_request();
+    app.apply(DataMsg::Pr(PrMsg::Detail { request, pr, result: Ok(Box::new(detail)) }));
     app.handle_key(KeyEvent::from(KeyCode::Char('c')));
     for c in "half a thought".chars() {
         app.handle_key(KeyEvent::from(KeyCode::Char(c)));
@@ -234,7 +237,8 @@ fn the_comment_box_and_a_discard_question_draw_over_the_pr() {
     let mut app = prs_app();
     app.handle_key(KeyEvent::from(KeyCode::Enter));
     let pr = app.prs.open.as_ref().unwrap().pr.clone();
-    app.apply(DataMsg::Pr(PrMsg::Detail { pr, result: Ok(Box::new(pr_detail())) }));
+    let request = app.fresh_detail_request();
+    app.apply(DataMsg::Pr(PrMsg::Detail { request, pr, result: Ok(Box::new(pr_detail())) }));
     app.handle_key(KeyEvent::from(KeyCode::Char('c')));
     for c in "looks good".chars() {
         app.handle_key(KeyEvent::from(KeyCode::Char(c)));
@@ -260,14 +264,16 @@ fn the_footer_lists_update_and_rerun_keys_when_they_apply() {
     app.handle_key(KeyEvent::from(KeyCode::Enter));
     let pr = app.prs.open.as_ref().unwrap().pr.clone();
     let mut detail = pr_detail();
-    app.apply(DataMsg::Pr(PrMsg::Detail { pr: pr.clone(), result: Ok(Box::new(detail.clone())) }));
+    let request = app.fresh_detail_request();
+    app.apply(DataMsg::Pr(PrMsg::Detail { request, pr: pr.clone(), result: Ok(Box::new(detail.clone())) }));
     let out = screen(&mut app, 200, 24);
     assert!(!out.contains("u update branch") && !out.contains("x re-run failed"));
 
     detail.merge_status = MergeStatus::Behind;
     detail.checks[0].state = CheckState::Failed;
     detail.checks[0].target = crate::pulls::model::CheckTarget::ActionsRun { run_id: 5 };
-    app.apply(DataMsg::Pr(PrMsg::Detail { pr, result: Ok(Box::new(detail)) }));
+    let request = app.fresh_detail_request();
+    app.apply(DataMsg::Pr(PrMsg::Detail { request, pr, result: Ok(Box::new(detail)) }));
     let out = screen(&mut app, 200, 24);
     assert!(out.contains("u update branch") && out.contains("x re-run failed"));
 }
@@ -283,7 +289,8 @@ fn the_merge_box_lists_methods_warns_when_blocked_and_hides_branch_deletion_for_
     let mut detail = pr_detail();
     detail.queue = QueueState::NoQueue;
     detail.merge_methods = vec![MergeMethod::Squash, MergeMethod::Rebase];
-    app.apply(DataMsg::Pr(PrMsg::Detail { pr: pr.clone(), result: Ok(Box::new(detail.clone())) }));
+    let request = app.fresh_detail_request();
+    app.apply(DataMsg::Pr(PrMsg::Detail { request, pr: pr.clone(), result: Ok(Box::new(detail.clone())) }));
     assert!(screen(&mut app, 200, 24).contains("m merge"), "the footer offers it");
 
     app.handle_key(KeyEvent::from(KeyCode::Char('m')));
@@ -300,7 +307,8 @@ fn the_merge_box_lists_methods_warns_when_blocked_and_hides_branch_deletion_for_
     app.handle_key(KeyEvent::from(KeyCode::Esc));
 
     detail.head.repo = "fork/api".into();
-    app.apply(DataMsg::Pr(PrMsg::Detail { pr, result: Ok(Box::new(detail)) }));
+    let request = app.fresh_detail_request();
+    app.apply(DataMsg::Pr(PrMsg::Detail { request, pr, result: Ok(Box::new(detail)) }));
     app.handle_key(KeyEvent::from(KeyCode::Char('m')));
     let out = screen(&mut app, 140, 30);
     assert!(out.contains("Squash and merge"));
@@ -318,17 +326,20 @@ fn the_footer_names_the_queue_key_by_what_it_does() {
     let mut detail = pr_detail();
     for (queue, hint) in [(QueueState::NotQueued, "m queue"), (QueueState::Queued { position: 1 }, "m unqueue")] {
         detail.queue = queue;
-        app.apply(DataMsg::Pr(PrMsg::Detail { pr: pr.clone(), result: Ok(Box::new(detail.clone())) }));
+        let request = app.fresh_detail_request();
+        app.apply(DataMsg::Pr(PrMsg::Detail { request, pr: pr.clone(), result: Ok(Box::new(detail.clone())) }));
         assert!(screen(&mut app, 200, 24).contains(hint), "{hint}");
     }
     detail.queue = QueueState::NoQueue;
     detail.merge_methods.clear();
-    app.apply(DataMsg::Pr(PrMsg::Detail { pr: pr.clone(), result: Ok(Box::new(detail.clone())) }));
+    let request = app.fresh_detail_request();
+    app.apply(DataMsg::Pr(PrMsg::Detail { request, pr: pr.clone(), result: Ok(Box::new(detail.clone())) }));
     assert!(!screen(&mut app, 200, 24).contains("m merge"), "not offered when no method is allowed");
 
     detail.queue = QueueState::Queued { position: 1 };
     detail.draft = true;
-    app.apply(DataMsg::Pr(PrMsg::Detail { pr, result: Ok(Box::new(detail)) }));
+    let request = app.fresh_detail_request();
+    app.apply(DataMsg::Pr(PrMsg::Detail { request, pr, result: Ok(Box::new(detail)) }));
     assert!(!screen(&mut app, 200, 24).contains("m unqueue"), "not offered on a draft");
 }
 
@@ -339,7 +350,8 @@ fn the_footer_offers_the_way_back_to_the_pr_after_a_jump() {
     let mut app = prs_app();
     app.handle_key(KeyEvent::from(KeyCode::Enter));
     let pr = app.prs.open.as_ref().unwrap().pr.clone();
-    app.apply(DataMsg::Pr(PrMsg::Detail { pr, result: Ok(Box::new(pr_detail())) }));
+    let request = app.fresh_detail_request();
+    app.apply(DataMsg::Pr(PrMsg::Detail { request, pr, result: Ok(Box::new(pr_detail())) }));
     app.handle_key(KeyEvent::from(KeyCode::Enter));
     assert!(matches!(app.mode, crate::app::Mode::Normal));
     assert!(screen(&mut app, 140, 24).contains("Esc back to PR"));
@@ -352,7 +364,8 @@ fn a_failed_first_read_of_a_pr_shows_the_error() {
     let mut app = prs_app();
     app.handle_key(KeyEvent::from(KeyCode::Enter));
     let pr = app.prs.open.as_ref().unwrap().pr.clone();
-    app.apply(DataMsg::Pr(PrMsg::Detail { pr, result: Err("Could not resolve".into()) }));
+    let request = app.fresh_detail_request();
+    app.apply(DataMsg::Pr(PrMsg::Detail { request, pr, result: Err("Could not resolve".into()) }));
     let out = screen(&mut app, 140, 24);
     assert!(out.contains("Could not resolve"));
 }
@@ -391,7 +404,8 @@ fn files_app_with(files: Vec<crate::pulls::model::PrFile>, detail: crate::pulls:
     let mut app = prs_app();
     app.handle_key(KeyEvent::from(KeyCode::Enter));
     let pr = app.prs.open.as_ref().unwrap().pr.clone();
-    app.apply(DataMsg::Pr(PrMsg::Detail { pr: pr.clone(), result: Ok(Box::new(detail)) }));
+    let request = app.fresh_detail_request();
+    app.apply(DataMsg::Pr(PrMsg::Detail { request, pr: pr.clone(), result: Ok(Box::new(detail)) }));
     app.handle_key(KeyEvent::from(KeyCode::Tab));
     app.apply(DataMsg::Pr(PrMsg::Files { pr, result: Ok(files) }));
     app
@@ -513,7 +527,8 @@ fn a_detail_refresh_that_adds_a_thread_marks_the_open_diff() {
         comments: vec![],
     }];
     let pr = app.prs.open.as_ref().unwrap().pr.clone();
-    app.apply(DataMsg::Pr(PrMsg::Detail { pr, result: Ok(Box::new(detail)) }));
+    let request = app.fresh_detail_request();
+    app.apply(DataMsg::Pr(PrMsg::Detail { request, pr, result: Ok(Box::new(detail)) }));
     assert!(screen(&mut app, 140, 24).contains('\u{1F4AC}'));
 }
 
@@ -609,7 +624,8 @@ fn the_conversation_is_built_once_until_the_detail_or_width_changes() {
     screen(&mut app, 90, 20);
     assert_eq!(builds(&app), 2, "a new width rebuilds");
     let pr = app.prs.open.as_ref().unwrap().pr.clone();
-    app.apply(DataMsg::Pr(PrMsg::Detail { pr, result: Ok(Box::new(pr_detail())) }));
+    let request = app.fresh_detail_request();
+    app.apply(DataMsg::Pr(PrMsg::Detail { request, pr, result: Ok(Box::new(pr_detail())) }));
     screen(&mut app, 90, 20);
     assert_eq!(builds(&app), 3, "a refreshed detail rebuilds");
 }
@@ -796,7 +812,8 @@ fn the_verdict_picker_warns_when_the_branch_moved_under_the_review() {
     let mut detail = pr_detail();
     detail.head.oid = "newer".into();
     let pr = app.prs.open.as_ref().unwrap().pr.clone();
-    app.apply(DataMsg::Pr(PrMsg::Detail { pr, result: Ok(Box::new(detail)) }));
+    let request = app.fresh_detail_request();
+    app.apply(DataMsg::Pr(PrMsg::Detail { request, pr, result: Ok(Box::new(detail)) }));
     press(&mut app, KeyCode::Char('R'));
     let out = screen(&mut app, 140, 30);
     assert!(out.contains(WARNING), "{out}");

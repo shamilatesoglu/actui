@@ -10,13 +10,24 @@ pub enum PrCommand {
     /// Read both lists again.
     FetchList,
     /// Read one PR's detail again.
-    FetchDetail(PrRef),
+    FetchDetail { pr: PrRef, request: DetailRequest },
     /// Read one Actions run that a check points at.
     FetchRun { repo: String, run_id: u64 },
     /// Read the files one PR changes, with their diffs.
     FetchFiles(PrRef),
     /// Change something on one PR.
     Act { pr: PrRef, action: PrAction },
+}
+
+/// Which of an open PR's detail reads an answer belongs to. Later reads
+/// count higher, so an answer that arrives late can be told from a newer one.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+pub struct DetailRequest(u64);
+
+impl DetailRequest {
+    pub fn next(self) -> Self {
+        DetailRequest(self.0 + 1)
+    }
 }
 
 /// A change to a PR.
@@ -106,7 +117,7 @@ pub enum PrMsg {
     /// One list's search finished.
     List { group: PrGroup, result: Result<Vec<PrSummary>, String> },
     /// A PR's detail finished reading.
-    Detail { pr: PrRef, result: Result<Box<PrDetail>, String> },
+    Detail { pr: PrRef, request: DetailRequest, result: Result<Box<PrDetail>, String> },
     /// The run a check pointed at finished reading.
     Run { run_id: u64, result: Result<Box<Run>, String> },
     /// A PR's changed files finished reading.

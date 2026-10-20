@@ -701,7 +701,7 @@ mod tests {
         app.apply(DataMsg::Pr(PrMsg::ActDone { pr, kind: PrActionKind::SubmitReview, result }));
         assert_eq!((drafts(&app).comments.clone(), drafts(&app).replies.clone()), before);
         assert!(status(&app).is_some_and(|(m, err)| m.contains("Pull request head changed") && err));
-        assert!(app.pending.iter().any(|c| matches!(c, Command::Pr(PrCommand::FetchDetail(_)))));
+        assert!(app.pending.iter().any(|c| matches!(c, Command::Pr(PrCommand::FetchDetail { .. }))));
         assert_eq!(compose(&app).map(|c| c.text()).as_deref(), Some("fix"), "the message comes back");
     }
 
@@ -778,7 +778,8 @@ mod tests {
         press(app, KeyCode::Esc);
         assert!(app.prs.open.is_none());
         press(app, KeyCode::Enter);
-        app.apply(DataMsg::Pr(PrMsg::Detail { pr: pr.clone(), result: Ok(detail) }));
+        let request = app.fresh_detail_request();
+        app.apply(DataMsg::Pr(PrMsg::Detail { request, pr: pr.clone(), result: Ok(detail) }));
         press(app, KeyCode::Tab);
         app.apply(DataMsg::Pr(PrMsg::Files { pr, result: Ok(files()) }));
         press(app, KeyCode::Enter);
