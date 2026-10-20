@@ -1,9 +1,9 @@
 //! Keys and clicks on the PRs screens.
 
-use super::{Loadable, PrCommand, PrTab, PrView};
+use super::{DiffView, Loadable, PrCommand, PrTab, PrView};
 use crate::pulls::model::CheckTarget;
 use crate::app::{App, Command, Filter, Mode};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Position;
 
 impl App {
@@ -29,12 +29,21 @@ impl App {
     /// Moves the list cursor, or scrolls the open PR's text (the mouse wheel).
     pub(in crate::app) fn move_prs(&mut self, delta: i32) {
         match &mut self.prs.open {
+            Some(view) if view.tab == PrTab::Files => match &mut view.files.diff {
+                Some(diff) => diff.move_cursor(delta),
+                None => view.files.move_sel(delta),
+            },
             Some(view) => view.scroll_overview(delta),
             None => self.prs.list.move_sel(delta),
         }
     }
 
     pub(in crate::app) fn key_prs(&mut self, key: KeyEvent) {
+        // A search box takes every key, including the ones that mean more elsewhere.
+        if let Some(diff) = self.prs.open.as_mut().and_then(|v| v.files.diff.as_mut()).filter(|d| d.searching) {
+            key_search_box(diff, key);
+            return;
+        }
         match key.code {
             KeyCode::Char('q' | 'P') => self.close_prs(),
             // A filter tab takes you back to the runs it filters.
@@ -48,13 +57,24 @@ impl App {
     }
 
     fn key_open_pr(&mut self, key: KeyEvent) {
+        if self.key_files(key) {
+            return;
+        }
         let Some(view) = &mut self.prs.open else { return };
         match key.code {
             KeyCode::Esc | KeyCode::Backspace => self.prs.open = None,
-            KeyCode::Tab => view.cycle_tab(1),
-            KeyCode::BackTab => view.cycle_tab(-1),
+            KeyCode::Tab => {
+                view.cycle_tab(1);
+                self.fetch_files_if_shown();
+            }
+            KeyCode::BackTab => {
+                view.cycle_tab(-1);
+                self.fetch_files_if_shown();
+            }
             KeyCode::Char('o') => {
-                let url = view.pr.url();
+                // A file GitHub sends no diff for is read on its Files page.
+                let no_diff = view.tab == PrTab::Files && view.files.shown_file().is_some_and(|f| f.patch.is_none());
+                let url = if no_diff { format!("{}/files", view.pr.url()) } else { view.pr.url() };
                 self.pending.push(Command::OpenUrl(url));
             }
             KeyCode::Char('r') => self.queue_pr_refresh(),
@@ -65,6 +85,57 @@ impl App {
             KeyCode::Enter if view.tab == PrTab::Overview => self.open_selected_check(),
             _ => {}
         }
+    }
+
+    /// Reads the files when the Files tab has just come up without them.
+    fn fetch_files_if_shown(&mut self) {
+        let Some(view) = &self.prs.open else { return };
+        if view.tab == PrTab::Files && !matches!(view.files.files, Loadable::Ready(_)) {
+            self.pending.push(Command::Pr(PrCommand::FetchFiles(view.pr.clone())));
+        }
+    }
+
+    /// Keys on the Files tab: the file list, or the diff once one is open.
+    /// Returns whether the key was used.
+    fn key_files(&mut self, key: KeyEvent) -> bool {
+        // Rows moved by the paging keys in the file list.
+        const PAGE: i32 = 10;
+        let Some(view) = &mut self.prs.open else { return false };
+        if view.tab != PrTab::Files {
+            return false;
+        }
+        let files = &mut view.files;
+        if let Some(diff) = &mut files.diff {
+            let page = diff.height.saturating_sub(1).max(1) as i32;
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => diff.move_cursor(1),
+                KeyCode::Char('k') | KeyCode::Up => diff.move_cursor(-1),
+                KeyCode::PageDown => diff.move_cursor(page),
+                KeyCode::PageUp => diff.move_cursor(-page),
+                KeyCode::Char('g') | KeyCode::Home => diff.move_cursor(i32::MIN),
+                KeyCode::Char('G') | KeyCode::End => diff.move_cursor(i32::MAX),
+                KeyCode::Char('/') => {
+                    diff.set_search("");
+                    diff.searching = true;
+                }
+                KeyCode::Char('n') => diff.next_match(true),
+                KeyCode::Char('N') => diff.next_match(false),
+                KeyCode::Esc | KeyCode::Char('h') | KeyCode::Backspace => files.diff = None,
+                _ => return false,
+            }
+            return true;
+        }
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => files.move_sel(1),
+            KeyCode::Char('k') | KeyCode::Up => files.move_sel(-1),
+            KeyCode::PageDown => files.move_sel(PAGE),
+            KeyCode::PageUp => files.move_sel(-PAGE),
+            KeyCode::Char('g') | KeyCode::Home => files.move_sel(i32::MIN),
+            KeyCode::Char('G') | KeyCode::End => files.move_sel(i32::MAX),
+            KeyCode::Enter | KeyCode::Char('l') => files.open_selected(),
+            _ => return false,
+        }
+        true
     }
 
     /// Acts on the check picked with J/K: its Actions run opens on the runs
@@ -125,5 +196,29 @@ impl App {
         } else if self.hit.prs_pane.contains(pos) {
             self.prs.list.click_row((y - self.hit.prs_pane.y) as usize);
         }
+    }
+}
+
+/// Types into the diff's search box. Enter keeps the search and leaves the
+/// box, Esc drops the search.
+fn key_search_box(diff: &mut DiffView, key: KeyEvent) {
+    match key.code {
+        KeyCode::Enter => diff.searching = false,
+        KeyCode::Esc => {
+            diff.set_search("");
+            diff.searching = false;
+        }
+        KeyCode::Backspace => {
+            let mut q = diff.search.clone();
+            if q.pop().is_none() {
+                diff.searching = false;
+            }
+            diff.set_search(&q);
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let q = format!("{}{c}", diff.search);
+            diff.set_search(&q);
+        }
+        _ => {}
     }
 }

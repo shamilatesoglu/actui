@@ -1,6 +1,6 @@
 //! Pull request reads over GitHub's GraphQL API.
 
-use crate::github::{ensure_ok, Github};
+use crate::github::{ensure_ok, Cond, Github};
 use crate::pulls::model::*;
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
@@ -509,9 +509,83 @@ pub(crate) fn parse_detail(data: serde_json::Value) -> Result<PrDetail> {
     })
 }
 
+const REST_URL: &str = "https://api.github.com";
+
+/// Files per page of the changed-files list, which is the most GitHub gives.
+const FILES_PER_PAGE: usize = 100;
+/// GitHub lists at most 3000 files, so 30 pages is all there is.
+const FILES_MAX_PAGES: u32 = 30;
+
+#[derive(Deserialize)]
+struct RawFile {
+    filename: String,
+    previous_filename: Option<String>,
+    status: String,
+    additions: u32,
+    deletions: u32,
+    patch: Option<String>,
+}
+
+impl From<RawFile> for PrFile {
+    fn from(f: RawFile) -> Self {
+        PrFile {
+            path: f.filename,
+            previous_path: f.previous_filename,
+            status: FileStatus::parse(&f.status),
+            additions: f.additions,
+            deletions: f.deletions,
+            patch: f.patch,
+        }
+    }
+}
+
+impl Github {
+    /// The files a PR changes, with their diffs. The first page is conditional,
+    /// so reading an unchanged PR again costs no rate limit.
+    pub async fn pr_files(&self, pr: &PrRef) -> Result<Vec<PrFile>> {
+        let url = format!("{REST_URL}/repos/{}/pulls/{}/files", pr.repo, pr.number);
+        let query = |page: u32| vec![("per_page", FILES_PER_PAGE.to_string()), ("page", page.to_string())];
+        let key = format!("prfiles:{}", pr.label());
+        let first = match self.cond_get::<serde_json::Value>(&key, url.clone(), &query(1)).await? {
+            Cond::Modified(page) => {
+                self.pr_files_cache.lock().unwrap().insert(key.clone(), page.clone());
+                page
+            }
+            Cond::NotModified => self.pr_files_cache.lock().unwrap().get(&key).cloned().unwrap_or_default(),
+        };
+        let first: Vec<RawFile> = serde_json::from_value(first).context("bad files response")?;
+        let mut files: Vec<PrFile> = first.into_iter().map(PrFile::from).collect();
+        let mut page = 1;
+        let mut last_len = files.len();
+        while last_len == FILES_PER_PAGE && page < FILES_MAX_PAGES {
+            page += 1;
+            let req = self.client.get(&url).query(&query(page));
+            let raw: Vec<RawFile> = ensure_ok(self.send(req).await?).await?.json().await?;
+            last_len = raw.len();
+            files.extend(raw.into_iter().map(PrFile::from));
+        }
+        Ok(files)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_without_a_patch_parses_with_none() {
+        let raw: Vec<RawFile> = serde_json::from_str(
+            r#"[{"filename":"a.png","status":"added","additions":0,"deletions":0},
+                {"filename":"b.rs","previous_filename":"c.rs","status":"renamed","additions":1,"deletions":2,
+                 "patch":"@@ -1 +1 @@\n-x\n+y"}]"#,
+        )
+        .unwrap();
+        let files: Vec<PrFile> = raw.into_iter().map(PrFile::from).collect();
+        assert!(files[0].patch.is_none());
+        assert_eq!(files[0].status, FileStatus::Added);
+        assert_eq!(files[1].previous_path.as_deref(), Some("c.rs"));
+        assert_eq!(files[1].status, FileStatus::Renamed);
+    }
 
     #[test]
     fn graphql_errors_become_the_error_message() {

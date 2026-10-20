@@ -1,0 +1,377 @@
+//! A file's unified diff as rows, with the cursor, search and review-thread
+//! lookups the diff viewer needs.
+
+use super::Loadable;
+use crate::pulls::model::{PrFile, ReviewThread, Side};
+use ratatui::widgets::ListState;
+use std::collections::HashMap;
+
+/// One row of a diff.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiffLine {
+    /// An `@@ -a,b +c,d @@` header, whole.
+    Hunk(String),
+    Context { old: u32, new: u32, text: String },
+    Added { new: u32, text: String },
+    Removed { old: u32, text: String },
+    /// `\ No newline at end of file`.
+    NoNewline,
+}
+
+impl DiffLine {
+    /// The side and line number a review comment on this row attaches to.
+    #[allow(dead_code)] // posting comments uses it
+    pub fn anchor(&self) -> Option<(Side, u32)> {
+        match self {
+            DiffLine::Removed { old, .. } => Some((Side::Left, *old)),
+            DiffLine::Added { new, .. } | DiffLine::Context { new, .. } => Some((Side::Right, *new)),
+            DiffLine::Hunk(_) | DiffLine::NoNewline => None,
+        }
+    }
+
+    /// The row's text without its `+`, `-` or space marker.
+    pub fn text(&self) -> &str {
+        match self {
+            DiffLine::Hunk(text)
+            | DiffLine::Context { text, .. }
+            | DiffLine::Added { text, .. }
+            | DiffLine::Removed { text, .. } => text,
+            DiffLine::NoNewline => NO_NEWLINE,
+        }
+    }
+}
+
+const NO_NEWLINE: &str = "\\ No newline at end of file";
+
+/// The starting old and new line numbers of an `@@ -a,b +c,d @@` header.
+fn hunk_start(header: &str) -> Option<(u32, u32)> {
+    let mut parts = header.strip_prefix("@@ ")?.split_whitespace();
+    let first = |part: &str, sign: char| -> Option<u32> {
+        part.strip_prefix(sign)?.split(',').next()?.parse().ok()
+    };
+    Some((first(parts.next()?, '-')?, first(parts.next()?, '+')?))
+}
+
+/// Reads a unified diff, numbering each row from its hunk header.
+pub fn parse_patch(patch: &str) -> Vec<DiffLine> {
+    let mut rows = Vec::new();
+    let (mut old, mut new) = (0, 0);
+    for line in patch.lines() {
+        if line.starts_with("@@") {
+            if let Some(start) = hunk_start(line) {
+                (old, new) = start;
+            }
+            rows.push(DiffLine::Hunk(line.to_string()));
+        } else if line.starts_with('\\') {
+            rows.push(DiffLine::NoNewline);
+        } else if let Some(text) = line.strip_prefix('+') {
+            rows.push(DiffLine::Added { new, text: text.to_string() });
+            new += 1;
+        } else if let Some(text) = line.strip_prefix('-') {
+            rows.push(DiffLine::Removed { old, text: text.to_string() });
+            old += 1;
+        } else {
+            // A blank context line can arrive without its leading space.
+            let text = line.strip_prefix(' ').unwrap_or(line);
+            rows.push(DiffLine::Context { old, new, text: text.to_string() });
+            old += 1;
+            new += 1;
+        }
+    }
+    rows
+}
+
+/// Which diff rows carry review threads: row index to thread indices. A
+/// thread whose lines are gone has no row.
+pub fn thread_rows(lines: &[DiffLine], threads: &[ReviewThread], path: &str) -> HashMap<usize, Vec<usize>> {
+    let mut rows: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, thread) in threads.iter().enumerate() {
+        let Some(line) = thread.line.filter(|_| thread.path == path) else { continue };
+        let at = lines.iter().position(|row| match (thread.side, row) {
+            (Side::Left, DiffLine::Removed { old, .. } | DiffLine::Context { old, .. }) => *old == line,
+            (Side::Right, DiffLine::Added { new, .. } | DiffLine::Context { new, .. }) => *new == line,
+            _ => false,
+        });
+        if let Some(at) = at {
+            rows.entry(at).or_default().push(i);
+        }
+    }
+    rows
+}
+
+/// An open diff.
+pub struct DiffView {
+    /// Index into the file list.
+    pub file: usize,
+    pub lines: Vec<DiffLine>,
+    pub cursor: usize,
+    pub scroll: usize,
+    /// The other end of a marked range, set when comments arrive.
+    #[allow(dead_code)] // range marking comes with commenting
+    pub mark: Option<usize>,
+    pub search: String,
+    /// The search box is taking keys.
+    pub searching: bool,
+    /// Rows that contain the search text, in order.
+    pub matches: Vec<usize>,
+    /// Digits in the widest line number, for the gutters.
+    pub number_width: usize,
+    /// Rows the diff showed in the last frame, which a page key moves by.
+    pub height: usize,
+}
+
+impl DiffView {
+    pub fn new(file: usize, patch: &str) -> Self {
+        let lines = parse_patch(patch);
+        let widest = lines
+            .iter()
+            .filter_map(|row| match row {
+                DiffLine::Context { old, new, .. } => Some(*old.max(new)),
+                DiffLine::Added { new, .. } => Some(*new),
+                DiffLine::Removed { old, .. } => Some(*old),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        DiffView {
+            file,
+            lines,
+            cursor: 0,
+            scroll: 0,
+            mark: None,
+            search: String::new(),
+            searching: false,
+            matches: Vec::new(),
+            number_width: widest.to_string().len(),
+            height: 0,
+        }
+    }
+
+    /// Moves the cursor by `delta` rows, stopping at the first and last.
+    pub fn move_cursor(&mut self, delta: i32) {
+        let last = self.lines.len().saturating_sub(1) as i64;
+        self.cursor = (self.cursor as i64 + delta as i64).clamp(0, last) as usize;
+    }
+
+    /// Searches rows for `q` ignoring case, and moves to the first match at or
+    /// below the cursor.
+    pub fn set_search(&mut self, q: &str) {
+        self.search = q.to_string();
+        self.matches.clear();
+        if q.is_empty() {
+            return;
+        }
+        let q = q.to_lowercase();
+        self.matches = (0..self.lines.len())
+            .filter(|&i| self.lines[i].text().to_lowercase().contains(&q))
+            .collect();
+        if let Some(&first) = self.matches.iter().find(|&&i| i >= self.cursor).or(self.matches.first()) {
+            self.cursor = first;
+        }
+    }
+
+    /// Moves to the next match, or the previous one, wrapping around.
+    pub fn next_match(&mut self, forward: bool) {
+        let found = if forward {
+            self.matches.iter().find(|&&i| i > self.cursor).or(self.matches.first())
+        } else {
+            self.matches.iter().rev().find(|&&i| i < self.cursor).or(self.matches.last())
+        };
+        if let Some(&at) = found {
+            self.cursor = at;
+        }
+    }
+}
+
+/// The Files tab: the changed files and the diff opened from them.
+#[derive(Default)]
+pub struct FilesState {
+    pub files: Loadable<Vec<PrFile>>,
+    /// Selected index into the file list.
+    pub sel: ListState,
+    pub diff: Option<DiffView>,
+}
+
+impl FilesState {
+    fn list(&self) -> &[PrFile] {
+        match &self.files {
+            Loadable::Ready(files) => files,
+            _ => &[],
+        }
+    }
+
+    /// The file the diff pane is about: the open diff's, else the selected one.
+    pub fn shown_file(&self) -> Option<&PrFile> {
+        let at = self.diff.as_ref().map(|d| d.file).or(self.sel.selected())?;
+        self.list().get(at)
+    }
+
+    pub fn move_sel(&mut self, delta: i32) {
+        let count = self.list().len();
+        if count > 0 {
+            let at = self.sel.selected().unwrap_or(0) as i64;
+            self.sel.select(Some((at + delta as i64).clamp(0, count as i64 - 1) as usize));
+        }
+    }
+
+    /// Opens the selected file's diff. A file GitHub sent no diff for has
+    /// nothing to open.
+    pub fn open_selected(&mut self) {
+        let Some(at) = self.sel.selected() else { return };
+        if let Some(patch) = self.list().get(at).and_then(|f| f.patch.as_deref()) {
+            self.diff = Some(DiffView::new(at, patch));
+        }
+    }
+
+    /// Takes in a finished read. The selection and the open diff stay on
+    /// their files when those are still in the list, and a failed refresh
+    /// leaves what was shown.
+    pub fn set(&mut self, result: Result<Vec<PrFile>, String>) {
+        let files = match result {
+            Ok(files) => files,
+            Err(e) => {
+                if !matches!(self.files, Loadable::Ready(_)) {
+                    self.files = Loadable::Failed(e);
+                }
+                return;
+            }
+        };
+        let old: &[PrFile] = match &self.files {
+            Loadable::Ready(files) => files,
+            _ => &[],
+        };
+        let path_at = |at: usize| old.get(at).map(|f| f.path.clone());
+        let sel_path = self.sel.selected().and_then(path_at);
+        let sel_index = self.sel.selected().unwrap_or(0);
+        let open = self.diff.take().map(|d| (path_at(d.file), old.get(d.file).and_then(|f| f.patch.clone()), d));
+
+        let find = |path: &Option<String>| path.as_ref().and_then(|p| files.iter().position(|f| &f.path == p));
+        let sel = find(&sel_path).or(if files.is_empty() { None } else { Some(sel_index.min(files.len() - 1)) });
+        self.diff = open.and_then(|(path, old_patch, mut diff)| {
+            let at = find(&path)?;
+            let patch = files[at].patch.as_deref()?;
+            if old_patch.as_deref() == Some(patch) {
+                diff.file = at;
+                return Some(diff);
+            }
+            let mut fresh = DiffView::new(at, patch);
+            fresh.searching = diff.searching;
+            fresh.set_search(&diff.search);
+            fresh.cursor = diff.cursor.min(fresh.lines.len().saturating_sub(1));
+            fresh.scroll = diff.scroll.min(fresh.cursor);
+            Some(fresh)
+        });
+        self.sel.select(sel);
+        self.files = Loadable::Ready(files);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pulls::model::{Comment, ReviewThread};
+
+    fn thread(path: &str, line: Option<u32>, side: Side) -> ReviewThread {
+        ReviewThread {
+            id: "T".into(),
+            resolved: false,
+            outdated: line.is_none(),
+            path: path.into(),
+            line,
+            start_line: None,
+            side,
+            comments: Vec::<Comment>::new(),
+        }
+    }
+
+    fn ctx(old: u32, new: u32, text: &str) -> DiffLine {
+        DiffLine::Context { old, new, text: text.into() }
+    }
+
+    #[test]
+    fn parse_patch_numbers_both_sides() {
+        let patch = "@@ -10,3 +10,4 @@ fn a()\n ctx\n-old\n+new\n+added\n ctx2\n\\ No newline at end of file";
+        assert_eq!(
+            parse_patch(patch),
+            [
+                DiffLine::Hunk("@@ -10,3 +10,4 @@ fn a()".into()),
+                ctx(10, 10, "ctx"),
+                DiffLine::Removed { old: 11, text: "old".into() },
+                DiffLine::Added { new: 11, text: "new".into() },
+                DiffLine::Added { new: 12, text: "added".into() },
+                ctx(12, 13, "ctx2"),
+                DiffLine::NoNewline,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_second_hunk_restarts_the_numbers_and_a_bare_blank_line_is_context() {
+        let rows = parse_patch("@@ -1 +1 @@\n-a\n+b\n@@ -20,2 +20,2 @@\n\n x");
+        assert_eq!(rows[3], DiffLine::Hunk("@@ -20,2 +20,2 @@".into()));
+        assert_eq!(rows[4], ctx(20, 20, ""));
+        assert_eq!(rows[5], ctx(21, 21, "x"));
+    }
+
+    #[test]
+    fn anchors_follow_the_side_a_comment_would_use() {
+        assert_eq!(DiffLine::Removed { old: 4, text: String::new() }.anchor(), Some((Side::Left, 4)));
+        assert_eq!(DiffLine::Added { new: 5, text: String::new() }.anchor(), Some((Side::Right, 5)));
+        assert_eq!(ctx(3, 4, "").anchor(), Some((Side::Right, 4)));
+        assert_eq!(DiffLine::Hunk(String::new()).anchor(), None);
+        assert_eq!(DiffLine::NoNewline.anchor(), None);
+    }
+
+    #[test]
+    fn outdated_threads_have_no_row() {
+        let lines = parse_patch("@@ -10,3 +10,4 @@\n ctx\n-old\n+new\n+added\n ctx2");
+        let threads = [
+            thread("a.rs", None, Side::Right),
+            thread("a.rs", Some(12), Side::Right),
+            thread("b.rs", Some(12), Side::Right),
+            thread("a.rs", Some(11), Side::Left),
+        ];
+        let rows = thread_rows(&lines, &threads, "a.rs");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[&4], [1]);
+        assert_eq!(lines[4], DiffLine::Added { new: 12, text: "added".into() });
+        assert_eq!(rows[&2], [3]);
+    }
+
+    fn huge_patch() -> String {
+        let mut patch = String::from("@@ -1,15000 +1,15000 @@\n");
+        for i in 0..15_000 {
+            patch.push_str(&format!("-old {i}\n+new {i}\n"));
+        }
+        patch
+    }
+
+    #[test]
+    fn a_huge_diff_parses_and_jumps_quickly() {
+        let patch = huge_patch();
+        let mut view = DiffView::new(0, &patch);
+        assert_eq!(view.lines.len(), 30_001);
+        view.move_cursor(i32::MAX);
+        assert_eq!(view.cursor, 30_000);
+        assert_eq!(view.lines[view.cursor].text(), "new 14999");
+        view.move_cursor(i32::MIN);
+        assert_eq!(view.cursor, 0);
+    }
+
+    #[test]
+    fn search_finds_rows_ignoring_case_and_steps_with_wraparound() {
+        let mut view = DiffView::new(0, "@@ -1,3 +1,3 @@\n a Foo\n-b\n+foo bar\n c FOO");
+        view.cursor = 2;
+        view.set_search("foo");
+        assert_eq!(view.matches, [1, 3, 4]);
+        assert_eq!(view.cursor, 3, "the first match below the cursor");
+        view.next_match(true);
+        assert_eq!(view.cursor, 4);
+        view.next_match(true);
+        assert_eq!(view.cursor, 1);
+        view.next_match(false);
+        assert_eq!(view.cursor, 4);
+        view.set_search("");
+        assert!(view.matches.is_empty());
+    }
+}

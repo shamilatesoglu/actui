@@ -1,11 +1,13 @@
 //! The PRs list: your review requests and your own open PRs, one row each.
 //! Borrows the palette accessors and `pane` from the parent `ui` module.
 
+mod diff;
 mod overview;
 
 use super::*;
-use crate::app::{App, Loadable, PrRow, PrTab};
+use crate::app::{App, Loadable, PrRow, PrTab, PrView};
 use crate::pulls::model::{ChecksState, PrSummary, ReviewDecision};
+use diff::draw_files;
 use overview::draw_overview;
 
 /// Narrowest the title column shrinks to before it stops making room.
@@ -63,8 +65,19 @@ pub(super) fn draw_open_pr(f: &mut Frame, app: &mut App, area: Rect) {
         title.push(Span::raw(d.title.clone()));
     }
     f.render_widget(Paragraph::new(Line::from(title)), title_row);
-    f.render_widget(Paragraph::new(tab_strip(view.tab, &detail)), tabs_row);
+    f.render_widget(Paragraph::new(tab_strip(view.tab, &detail, &view.files.files)), tabs_row);
 
+    // The files come from their own read, so the tab shows without the detail
+    // and only borrows its review threads.
+    if view.tab == PrTab::Files {
+        let threads = match &detail {
+            Loadable::Ready(d) => d.threads.as_slice(),
+            _ => &[],
+        };
+        draw_files(f, view, threads, body, spin);
+        view.detail = detail;
+        return;
+    }
     match &detail {
         Loadable::Loading => {
             let line = Line::styled(format!("{spin} loading…"), Style::default().fg(dim()));
@@ -85,11 +98,19 @@ pub(super) fn draw_open_pr(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// `Overview  Files  Conversation {n}`, the open tab highlighted.
-fn tab_strip(open: PrTab, detail: &Loadable<Box<crate::pulls::model::PrDetail>>) -> Line<'static> {
+fn tab_strip(
+    open: PrTab,
+    detail: &Loadable<Box<crate::pulls::model::PrDetail>>,
+    files: &Loadable<Vec<crate::pulls::model::PrFile>>,
+) -> Line<'static> {
     let mut spans = Vec::new();
     for tab in PrTab::ALL {
         // Files has no count until its tab loads the file list.
         let count = match (tab, detail) {
+            (PrTab::Files, _) => match files {
+                Loadable::Ready(files) => Some(files.len()),
+                _ => None,
+            },
             (PrTab::Conversation, Loadable::Ready(d)) => {
                 Some(d.comments.len() + d.reviews.len() + d.threads.len())
             }
@@ -155,4 +176,14 @@ fn pr_line(pr: &PrSummary, width: usize, spin: &'static str) -> Line<'static> {
         spans.push(Span::styled(format!("  {text}"), Style::default().fg(color)));
     }
     Line::from(spans)
+}
+
+/// The footer's hints for an open PR.
+pub(super) fn open_pr_hints(view: &PrView) -> Vec<String> {
+    match (view.tab, &view.files.diff) {
+        (PrTab::Files, Some(diff)) if diff.searching => owned(&["type to search", "⏎ keep", "Esc drop"]),
+        (PrTab::Files, Some(_)) => owned(&["j/k move", "g/G ends", "/ search", "n/N next match", "h back to files"]),
+        (PrTab::Files, None) => owned(&["Tab next tab", "j/k move", "⏎ open diff", "o open on GitHub", "r refresh"]),
+        _ => owned(&["Tab next tab", "j/k scroll", "J/K checks", "o open on GitHub", "r refresh"]),
+    }
 }

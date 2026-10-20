@@ -281,3 +281,57 @@ pub fn blocked_reason(d: &PrDetail) -> Option<String> {
     };
     Some(reason.to_string())
 }
+
+/// How a pull request changes one file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FileStatus {
+    Added,
+    Removed,
+    Modified,
+    Renamed,
+    Copied,
+    Changed,
+    Unchanged,
+}
+
+impl FileStatus {
+    /// Reads the `status` of a file from the REST API. Anything unknown counts
+    /// as a plain change.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "added" => FileStatus::Added,
+            "removed" => FileStatus::Removed,
+            "modified" => FileStatus::Modified,
+            "renamed" => FileStatus::Renamed,
+            "copied" => FileStatus::Copied,
+            "unchanged" => FileStatus::Unchanged,
+            _ => FileStatus::Changed,
+        }
+    }
+
+    pub fn letter(self) -> char {
+        match self {
+            FileStatus::Added => 'A',
+            FileStatus::Removed => 'D',
+            FileStatus::Modified => 'M',
+            FileStatus::Renamed => 'R',
+            FileStatus::Copied => 'C',
+            FileStatus::Changed => 'M',
+            FileStatus::Unchanged => '=',
+        }
+    }
+}
+
+/// One file a pull request changes.
+#[derive(Clone, Debug)]
+pub struct PrFile {
+    pub path: String,
+    /// Where a renamed file was before.
+    #[allow(dead_code)] // not shown yet
+    pub previous_path: Option<String>,
+    pub status: FileStatus,
+    pub additions: u32,
+    pub deletions: u32,
+    /// The unified diff. GitHub leaves it out for binary and very large files.
+    pub patch: Option<String>,
+}

@@ -1198,8 +1198,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         )
     } else if app.mode == Mode::Prs {
         (
-            if app.prs.open.is_some() {
-                owned(&["Tab next tab", "j/k scroll", "J/K checks", "o open on GitHub", "r refresh"])
+            if let Some(view) = &app.prs.open {
+                prs::open_pr_hints(view)
             } else {
                 owned(&["pull requests", "j/k move", "⏎ open", "o open on GitHub", "r refresh"])
             },
@@ -2537,6 +2537,202 @@ mod tests {
         let out = screen(&mut app, 140, 24);
         assert!(out.contains("Opened by you  none"), "the shown list stays");
         assert!(out.contains("Opened by you: 502"), "and the error is reported");
+    }
+
+    fn pr_file(path: &str, patch: Option<&str>) -> crate::pulls::model::PrFile {
+        use crate::pulls::model::{FileStatus, PrFile};
+        PrFile {
+            path: path.into(),
+            previous_path: None,
+            status: FileStatus::Modified,
+            additions: 3,
+            deletions: 1,
+            patch: patch.map(String::from),
+        }
+    }
+
+    /// An app on the Files tab of PR 7 with these files loaded.
+    fn files_app(files: Vec<crate::pulls::model::PrFile>) -> App {
+        files_app_with(files, pr_detail())
+    }
+
+    fn files_app_with(files: Vec<crate::pulls::model::PrFile>, detail: crate::pulls::model::PrDetail) -> App {
+        use crate::app::{DataMsg, PrMsg};
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut app = prs_app();
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        let pr = app.prs.open.as_ref().unwrap().pr.clone();
+        app.apply(DataMsg::Pr(PrMsg::Detail { pr: pr.clone(), result: Ok(Box::new(detail)) }));
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        app.apply(DataMsg::Pr(PrMsg::Files { pr, result: Ok(files) }));
+        app
+    }
+
+    fn press(app: &mut App, code: crossterm::event::KeyCode) {
+        app.handle_key(crossterm::event::KeyEvent::from(code));
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, crossterm::event::KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn the_files_tab_fetches_once_and_lists_the_files_with_a_count() {
+        use crate::app::{Command, PrCommand};
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut app = prs_app();
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        app.pending.clear();
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert!(matches!(&app.pending[..], [Command::Pr(PrCommand::FetchFiles(pr))] if pr.number == 7));
+        assert!(screen(&mut app, 140, 24).contains("loading"));
+        let pr = app.prs.open.as_ref().unwrap().pr.clone();
+        let files = vec![pr_file("src/a.rs", Some("@@ -1 +1 @@\n-a\n+b")), pr_file("README.md", None)];
+        app.apply(crate::app::DataMsg::Pr(crate::app::PrMsg::Files { pr, result: Ok(files) }));
+        let out = screen(&mut app, 140, 24);
+        println!("{out}");
+        assert!(out.contains("Files 2"));
+        assert!(out.contains("M src/a.rs"));
+        assert!(out.contains("+3 \u{2212}1"));
+        assert!(out.contains("M README.md"));
+
+        // Coming back to the tab with the files loaded asks for nothing.
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        app.pending.clear();
+        app.handle_key(KeyEvent::from(KeyCode::BackTab));
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        app.handle_key(KeyEvent::from(KeyCode::BackTab));
+        assert!(app.pending.is_empty());
+    }
+
+    #[test]
+    fn the_diff_draws_tabs_as_spaces_and_clips_long_lines() {
+        use crossterm::event::KeyCode;
+        let patch = format!("@@ -1,2 +1,3 @@\n ctx\n+\tlet x = 1;\n+{}END", "x".repeat(500));
+        let mut app = files_app(vec![pr_file("src/a.rs", Some(&patch))]);
+        press(&mut app, KeyCode::Enter);
+        let out = screen(&mut app, 100, 24);
+        println!("{out}");
+        assert!(out.contains("    let x = 1;"));
+        assert!(!out.contains("END"), "the long line is cut at the pane");
+        let long = out.lines().find(|l| l.contains("xxxxxxxx")).unwrap();
+        assert!(long.trim_end().ends_with('\u{2502}'), "the border stays put: {long}");
+        assert!(out.lines().all(|l| l.chars().count() == 100));
+    }
+
+    #[test]
+    fn a_file_without_a_patch_says_so() {
+        use crate::app::Command;
+        use crossterm::event::KeyCode;
+        let mut app = files_app(vec![pr_file("logo.png", None)]);
+        let out = screen(&mut app, 160, 24);
+        assert!(out.contains("GitHub doesn't send this diff (binary or too large). o opens it on github.com."), "{out}");
+        press(&mut app, KeyCode::Enter);
+        assert!(screen(&mut app, 160, 24).contains("GitHub doesn't send this diff"));
+        app.pending.clear();
+        press(&mut app, KeyCode::Char('o'));
+        assert!(matches!(&app.pending[..], [Command::OpenUrl(u)] if u == "https://github.com/org/api/pull/7/files"));
+    }
+
+    #[test]
+    fn g_shows_the_last_line_of_a_huge_diff() {
+        use crossterm::event::KeyCode;
+        let mut patch = String::from("@@ -1,15000 +1,15000 @@");
+        for i in 0..15_000 {
+            patch.push_str(&format!("\n-old {i}\n+new {i}"));
+        }
+        let mut app = files_app(vec![pr_file("big.txt", Some(&patch))]);
+        press(&mut app, KeyCode::Enter);
+        assert!(screen(&mut app, 140, 24).contains("old 0"));
+        press(&mut app, KeyCode::Char('G'));
+        let out = screen(&mut app, 140, 24);
+        assert!(out.contains("new 14999"), "{out}");
+        assert!(!out.contains("old 0"));
+        press(&mut app, KeyCode::Char('g'));
+        assert!(screen(&mut app, 140, 24).contains("old 0"));
+    }
+
+    #[test]
+    fn typing_a_search_does_not_trigger_other_keys_and_n_steps_matches() {
+        use crossterm::event::KeyCode;
+        let patch = "@@ -1,4 +1,4 @@\n alpha\n-quit\n+beta\n gamma quit";
+        let mut app = files_app(vec![pr_file("a.rs", Some(patch))]);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "quit");
+        let out = screen(&mut app, 140, 24);
+        assert!(out.contains("/quit"), "{out}");
+        assert!(out.contains("2 matches"), "{out}");
+        assert!(app.prs.open.is_some(), "q went into the box");
+        press(&mut app, KeyCode::Enter);
+        let at = |app: &App| app.prs.open.as_ref().unwrap().files.diff.as_ref().unwrap().cursor;
+        assert_eq!(at(&app), 2);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(at(&app), 4);
+        press(&mut app, KeyCode::Char('N'));
+        assert_eq!(at(&app), 2);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.prs.open.as_ref().unwrap().files.diff.is_none(), "Esc returns to the list");
+        assert!(screen(&mut app, 140, 24).contains("a.rs"));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.prs.open.is_none());
+    }
+
+    #[test]
+    fn rows_with_review_threads_show_a_marker() {
+        use crate::pulls::model::{ReviewThread, Side};
+        use crossterm::event::KeyCode;
+        let mut detail = pr_detail();
+        detail.threads = vec![ReviewThread {
+            id: "T".into(),
+            resolved: false,
+            outdated: false,
+            path: "a.rs".into(),
+            line: Some(1),
+            start_line: None,
+            side: Side::Right,
+            comments: vec![],
+        }];
+        let mut app = files_app_with(vec![pr_file("a.rs", Some("@@ -1 +1 @@\n-a\n+b"))], detail);
+        press(&mut app, KeyCode::Enter);
+        let out = screen(&mut app, 140, 24);
+        let row = out.lines().find(|l| l.contains("+b")).unwrap();
+        assert!(row.contains('\u{1F4AC}'), "{row}");
+        let other = out.lines().find(|l| l.contains("-a")).unwrap();
+        assert!(!other.contains('\u{1F4AC}'));
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_open_diff_on_its_file_and_the_count_right() {
+        use crossterm::event::KeyCode;
+        let patch = "@@ -1,4 +1,4 @@\n a\n b\n c\n-d\n+e";
+        let mut app = files_app(vec![pr_file("one.rs", Some("@@ -1 +1 @@\n-x\n+y")), pr_file("two.rs", Some(patch))]);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        let pr = app.prs.open.as_ref().unwrap().pr.clone();
+        let files = vec![
+            pr_file("new.rs", None),
+            pr_file("one.rs", Some("@@ -1 +1 @@\n-x\n+y")),
+            pr_file("two.rs", Some(patch)),
+        ];
+        app.apply(crate::app::DataMsg::Pr(crate::app::PrMsg::Files { pr: pr.clone(), result: Ok(files) }));
+        let out = screen(&mut app, 140, 24);
+        assert!(out.contains("Files 3"), "{out}");
+        let files_state = &app.prs.open.as_ref().unwrap().files;
+        let diff = files_state.diff.as_ref().unwrap();
+        assert_eq!((diff.file, diff.cursor), (2, 2));
+        assert_eq!(files_state.sel.selected(), Some(2));
+
+        // The file leaves the PR, so its diff closes; a failed refresh changes nothing.
+        let files = vec![pr_file("new.rs", None)];
+        app.apply(crate::app::DataMsg::Pr(crate::app::PrMsg::Files { pr: pr.clone(), result: Ok(files) }));
+        assert!(app.prs.open.as_ref().unwrap().files.diff.is_none());
+        app.apply(crate::app::DataMsg::Pr(crate::app::PrMsg::Files { pr, result: Err("502".into()) }));
+        assert!(screen(&mut app, 140, 24).contains("Files 1"));
     }
 
     #[test]

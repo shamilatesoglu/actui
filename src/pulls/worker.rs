@@ -23,6 +23,13 @@ pub fn run_command(cmd: PrCommand, gh: &Github, tx: &UnboundedSender<DataMsg>) {
                 let _ = tx.send(DataMsg::Pr(PrMsg::Run(result)));
             });
         }
+        PrCommand::FetchFiles(pr) => {
+            let (gh, tx) = (gh.clone(), tx.clone());
+            tokio::spawn(async move {
+                let result = gh.pr_files(&pr).await.map_err(|e| e.to_string());
+                let _ = tx.send(DataMsg::Pr(PrMsg::Files { pr, result }));
+            });
+        }
         PrCommand::FetchDetail(pr) => {
             let (gh, tx) = (gh.clone(), tx.clone());
             tokio::spawn(async move {

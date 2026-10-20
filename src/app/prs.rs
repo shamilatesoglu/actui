@@ -1,9 +1,11 @@
 //! The pull request screens' state. Key handling is in `input`, the worker
 //! protocol in `protocol`.
 
+mod diff;
 mod input;
 mod protocol;
 
+pub use diff::{thread_rows, DiffLine, DiffView, FilesState};
 pub use protocol::{PrCommand, PrMsg};
 
 use super::{App, Command, CursorHold, Focus, Mode};
@@ -169,6 +171,7 @@ pub struct PrView {
     /// The most the overview text scrolls, as of the last frame.
     pub overview_max_scroll: u16,
     pub checks: ListState,
+    pub files: FilesState,
 }
 
 impl PrView {
@@ -180,6 +183,7 @@ impl PrView {
             overview_scroll: 0,
             overview_max_scroll: 0,
             checks: ListState::default(),
+            files: FilesState::default(),
         }
     }
 
@@ -252,6 +256,10 @@ impl App {
     pub fn queue_pr_refresh(&mut self) {
         if let Some(view) = &self.prs.open {
             self.pending.push(Command::Pr(PrCommand::FetchDetail(view.pr.clone())));
+            // The files are read again once they have been asked for.
+            if view.tab == PrTab::Files || matches!(view.files.files, Loadable::Ready(_)) {
+                self.pending.push(Command::Pr(PrCommand::FetchFiles(view.pr.clone())));
+            }
         }
     }
 
@@ -338,6 +346,17 @@ impl App {
                 self.prs.list.set(group, result);
             }
             PrMsg::Run(result) => self.apply_jump_run(result),
+            PrMsg::Files { pr, result } => {
+                if !self.prs.open.as_ref().is_some_and(|v| v.pr == pr) {
+                    return;
+                }
+                if let Err(e) = &result {
+                    self.set_status(format!("{}: {e}", pr.label()), true);
+                }
+                if let Some(view) = &mut self.prs.open {
+                    view.files.set(result);
+                }
+            }
             PrMsg::Detail { pr, result } => {
                 // An answer for a PR that has since been closed or swapped is dropped.
                 if !self.prs.open.as_ref().is_some_and(|v| v.pr == pr) {

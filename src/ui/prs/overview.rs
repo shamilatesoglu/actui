@@ -284,6 +284,7 @@ mod tests {
             overview_scroll: 0,
             overview_max_scroll: 0,
             checks: ListState::default(),
+            files: Default::default(),
         };
         let draw = |view: &mut PrView| {
             let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(23, 12)).unwrap();

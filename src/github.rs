@@ -68,6 +68,9 @@ pub struct Github {
     tags_cache: Arc<Mutex<HashMap<String, Vec<Tag>>>>,
     /// Last runner list per repo, returned when that repo's runners are unchanged.
     repo_runners_cache: Arc<Mutex<HashMap<String, Vec<Runner>>>>,
+    /// First page of a PR's changed files by `repo#number`, as the API sent it,
+    /// returned when it is unchanged.
+    pub(crate) pr_files_cache: Arc<Mutex<HashMap<String, serde_json::Value>>>,
     /// Largest `X-Poll-Interval` (seconds) GitHub has asked us to honor; 0 = unset.
     poll_interval: Arc<AtomicU64>,
     rate_state: Arc<Mutex<RateState>>,
@@ -95,6 +98,7 @@ impl Github {
             repos_cache: Arc::new(Mutex::new(Vec::new())),
             tags_cache: Arc::new(Mutex::new(HashMap::new())),
             repo_runners_cache: Arc::new(Mutex::new(HashMap::new())),
+            pr_files_cache: Arc::new(Mutex::new(HashMap::new())),
             poll_interval: Arc::new(AtomicU64::new(0)),
             rate_state: Arc::new(Mutex::new(RateState::default())),
         })
@@ -221,7 +225,7 @@ impl Github {
     /// A conditional GET: sends `If-None-Match` from the cache under `key`,
     /// stores the new ETag, records rate-limit headers, honors `X-Poll-Interval`,
     /// backs off on `403`/`429`, and returns `NotModified` on `304`.
-    async fn cond_get<T: DeserializeOwned>(
+    pub(crate) async fn cond_get<T: DeserializeOwned>(
         &self,
         key: &str,
         url: String,
