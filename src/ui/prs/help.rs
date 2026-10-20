@@ -29,6 +29,9 @@ pub(in crate::ui) fn pr_help() -> (Text<'static>, Text<'static>) {
         hl("Overview"),
         help_row("J / K", "pick a check"),
         help_row("⏎", "an Actions check: its run · else its page"),
+        Line::raw(""),
+        hl("Conversation"),
+        help_row("⏎", "every review thread, outdated ones too"),
     ]);
 
     let right = Text::from(vec![

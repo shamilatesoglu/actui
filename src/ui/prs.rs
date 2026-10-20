@@ -284,6 +284,9 @@ pub(super) fn open_pr_hints(view: &PrView, review: Option<&PendingReview>) -> Ve
         if detail.checks.iter().any(|c| failed(&c)) {
             hints.insert(at, "x re-run failed".to_string());
         }
+        if view.tab == PrTab::Conversation && !detail.threads.is_empty() {
+            hints.insert(at, "⏎ threads".to_string());
+        }
     }
     if review.is_some() {
         hints.push("p pending".to_string());

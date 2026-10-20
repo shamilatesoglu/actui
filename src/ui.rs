@@ -2021,7 +2021,7 @@ mod tests {
         println!("{out}");
         assert!(app.mode == crate::app::Mode::Help);
         // The last row of each column, and the longest row of each.
-        assert!(out.contains("an Actions check: its run"), "left column is clipped");
+        assert!(out.contains("every review thread, outdated ones too"), "left column is clipped");
         assert!(out.contains("asks first when comments are unsent"), "right column is clipped");
         assert!(out.contains("j/k method · d delete branch · ⏎ merge"), "left rows are cut");
         assert!(out.contains("j/k move · e edit · d drop · R submit"), "right rows are cut");

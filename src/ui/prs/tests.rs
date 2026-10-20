@@ -542,6 +542,11 @@ fn an_outdated_thread_still_shows_in_the_conversation() {
     assert!(out.contains("src/new.rs:12"), "{out}");
     assert!(out.contains("Why this?"), "{out}");
     assert!(out.contains("Conversation 2"), "the description is not counted: {out}");
+    assert!(out.contains("⏎ threads"), "the footer says how to reach them: {out}");
+
+    let mut app = files_app_with(vec![], pr_detail());
+    press(&mut app, crossterm::event::KeyCode::Tab);
+    assert!(!screen(&mut app, 140, 24).contains("⏎ threads"), "no threads, no hint");
 }
 
 #[test]

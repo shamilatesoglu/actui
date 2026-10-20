@@ -100,13 +100,15 @@ fn step(sel: usize, delta: i32, len: usize) -> usize {
 }
 
 impl App {
-    /// Review keys on an open PR: `p` and `R` on any tab, and `v`, `c` and
-    /// Enter in a diff. Returns whether the key was used.
+    /// Review keys on an open PR: `p` and `R` on any tab, Enter in the
+    /// conversation, and `v`, `c` and Enter in a diff. Returns whether the
+    /// key was used.
     pub(super) fn key_review(&mut self, key: KeyEvent) -> bool {
         let Some(view) = &mut self.prs.open else { return false };
         match key.code {
             KeyCode::Char('p') => view.review_popup = Some(ReviewPopup::Pending { sel: 0 }),
             KeyCode::Char('R') => view.review_popup = Some(ReviewPopup::Verdict { sel: 0 }),
+            KeyCode::Enter if view.tab == PrTab::Conversation => return self.open_conversation_threads(),
             _ if view.tab != PrTab::Files || view.files.diff.is_none() => return false,
             KeyCode::Char('v') => self.toggle_mark(),
             KeyCode::Char('c') => self.compose_line_comment(),
@@ -161,6 +163,22 @@ impl App {
         let (Some(diff), Loadable::Ready(detail)) = (&view.files.diff, &view.detail) else { return false };
         let Some(found) = diff.thread_rows.get(&diff.cursor) else { return false };
         let thread_ids: Vec<String> = found.iter().filter_map(|&i| detail.threads.get(i)).map(|t| t.id.clone()).collect();
+        if thread_ids.is_empty() {
+            return false;
+        }
+        view.review_popup = Some(ReviewPopup::Thread(ThreadPopup { thread_ids, sel: 0, scroll: Scroll::default() }));
+        true
+    }
+
+    /// Enter in the conversation: shows every review thread, in the order the
+    /// conversation lists them. Outdated threads have no row in any diff, so
+    /// this is where they are answered and resolved.
+    fn open_conversation_threads(&mut self) -> bool {
+        let Some(view) = &mut self.prs.open else { return false };
+        let Loadable::Ready(detail) = &view.detail else { return false };
+        let mut threads: Vec<_> = detail.threads.iter().filter_map(|t| Some((t.comments.first()?.created_at, &t.id))).collect();
+        threads.sort_by_key(|(at, _)| *at);
+        let thread_ids: Vec<String> = threads.into_iter().map(|(_, id)| id.clone()).collect();
         if thread_ids.is_empty() {
             return false;
         }
@@ -875,6 +893,53 @@ mod tests {
         ));
         press(&mut app, KeyCode::Esc);
         assert!(app.prs.open.as_ref().unwrap().review_popup.is_none());
+    }
+
+    #[test]
+    fn enter_in_the_conversation_opens_every_thread_including_outdated_ones() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        add_thread(&mut app);
+        edit_detail(&mut app, |d| {
+            let mut outdated = d.threads[0].clone();
+            outdated.id = "PRRT_old".into();
+            outdated.outdated = true;
+            outdated.line = None;
+            outdated.comments[0].id = 41;
+            outdated.comments[0].created_at = Utc::now() - chrono::Duration::hours(1);
+            d.threads.push(outdated);
+        });
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.prs.open.as_ref().unwrap().tab, PrTab::Conversation);
+        press(&mut app, KeyCode::Enter);
+        let Some(ReviewPopup::Thread(popup)) = &app.prs.open.as_ref().unwrap().review_popup else {
+            panic!("the thread box is open");
+        };
+        assert_eq!(popup.thread_ids, ["PRRT_old", "PRRT_1"], "in the order the conversation shows them");
+
+        // The outdated thread, which has no row in any diff, can be answered and resolved.
+        app.pending.clear();
+        press(&mut app, KeyCode::Char('x'));
+        assert!(matches!(
+            &app.pending[..],
+            [Command::Pr(PrCommand::Act { action: PrAction::ResolveThread { thread_id, resolved: true }, .. })]
+                if thread_id == "PRRT_old"
+        ));
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(
+            compose(&app).map(|c| c.target.clone()),
+            Some(ComposeTarget::Reply { thread_id: "PRRT_old".into(), comment_id: 41 })
+        );
+    }
+
+    #[test]
+    fn enter_in_a_conversation_without_threads_does_nothing() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.prs.open.as_ref().unwrap().review_popup.is_none());
+        assert!(app.mode == Mode::Prs);
     }
 
     #[test]
