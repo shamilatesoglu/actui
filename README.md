@@ -22,6 +22,7 @@ A terminal UI for GitHub Actions across all the repos and orgs your account can 
   or jobs, approve held runs, and download artifacts.
 - Self-hosted runners (`s`) of your orgs and watched repos, personal repos
   included.
+- Your open PRs and review requests (P): description, checks, diffs, conversation; comment, review with line comments, merge or queue, toggle draft.
 - The runner each job runs on, with its labels.
 - A desktop notification and terminal bell when a run finishes.
 - Colors that match your terminal's scheme, light or dark.
@@ -91,6 +92,7 @@ next to the config.
 | `d` | dispatch a workflow |
 | `c`, `x` / `X` | cancel, re-run failed jobs / all jobs |
 | `o` | open on github.com |
+| `P` | your open PRs and review requests |
 | `?` | all keys |
 | `q` | quit |
 

@@ -5,7 +5,7 @@
 //! `ui` module.
 
 use super::*;
-use crate::app::{AnnLevel, App, DispatchStage, RefKind};
+use crate::app::{AnnLevel, App, DispatchStage, HelpPage, RefKind};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -302,17 +302,28 @@ pub(super) fn draw_errors(f: &mut Frame, app: &App) {
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
-pub(super) fn draw_help(f: &mut Frame) {
+pub(super) fn draw_help(f: &mut Frame, page: HelpPage) {
     // Two columns so the whole reference fits without clipping on short
     // terminals (a single column runs ~70 rows). Each row is kept short
     // enough to fit its column at 120 columns wide.
     let area = centered(96, 94, f.area());
-    let title = format!("Help · actui {}", env!("CARGO_PKG_VERSION"));
+    let version = env!("CARGO_PKG_VERSION");
+    let title = match page {
+        HelpPage::Keys => format!("Help · actui {version} · Tab: pull request keys"),
+        HelpPage::PullRequests => format!("Help · actui {version} · pull requests · Tab: all other keys"),
+    };
     let inner = popup(f, area, &title, accent());
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(inner);
+
+    if page == HelpPage::PullRequests {
+        let (left, right) = super::prs::pr_help();
+        f.render_widget(Paragraph::new(left), cols[0]);
+        f.render_widget(Paragraph::new(right), cols[1]);
+        return;
+    }
 
     let left = Text::from(vec![
         hl("Panes  (Repos ⟷ Runs ⟷ Jobs)"),
@@ -549,14 +560,14 @@ pub(super) fn draw_confirm(f: &mut Frame, app: &App) {
     f.render_widget(Paragraph::new(body), inner);
 }
 
-fn hl(s: &str) -> Line<'static> {
+pub(super) fn hl(s: &str) -> Line<'static> {
     Line::from(Span::styled(
         s.to_string(),
         Style::default().fg(accent()).add_modifier(Modifier::BOLD),
     ))
 }
 
-fn help_row(keys: &str, desc: &str) -> Line<'static> {
+pub(super) fn help_row(keys: &str, desc: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("  {keys:<16}"), Style::default().fg(Color::Yellow)),
         Span::raw(desc.to_string()),

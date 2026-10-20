@@ -3,6 +3,7 @@
 
 mod conversation;
 mod diff;
+mod help;
 mod overlays;
 mod overview;
 
@@ -14,6 +15,7 @@ use crate::pulls::model::{
 use conversation::{conversation, draw_conversation};
 use diff::draw_files;
 use overview::draw_overview;
+pub(super) use help::pr_help;
 pub(super) use overlays::{draw_compose, draw_merge_dialog, draw_review_popup};
 use ratatui::buffer::Buffer;
 use ratatui::widgets::Widget;
@@ -27,6 +29,7 @@ pub(super) fn draw_prs_pane(f: &mut Frame, app: &mut App, area: Rect) {
     // The highlight marker takes the first column.
     let width = inner.width.saturating_sub(1) as usize;
     let spin = SPINNER[app.spinner];
+    let drafts = &app.prs.drafts;
     let items: Vec<ListItem> = app
         .prs
         .list
@@ -38,7 +41,10 @@ pub(super) fn draw_prs_pane(f: &mut Frame, app: &mut App, area: Rect) {
                 Span::raw("  "),
                 Span::styled(detail.clone(), Style::default().fg(dim())),
             ])),
-            PrRow::Pr(pr) => ListItem::new(pr_line(pr, width, spin)),
+            PrRow::Pr(pr) => {
+                let has_draft = drafts.get(&pr.pr).is_some_and(|d| !d.is_empty());
+                ListItem::new(pr_line(pr, width, spin, has_draft))
+            }
         })
         .collect();
     let list = List::new(items).highlight_style(select_style(true)).highlight_symbol("▌");
@@ -192,12 +198,13 @@ fn review_text(review: ReviewDecision) -> Option<(&'static str, Color)> {
     }
 }
 
-/// `{checks} {repo}#{number}  {title}  {author}  {age}  {review}`, with the
-/// title taking whatever width the rest leaves.
-fn pr_line(pr: &PrSummary, width: usize, spin: &'static str) -> Line<'static> {
+/// `{checks} {repo}#{number}{✎}  {title}  {author}  {age}  {review}`, with the
+/// title taking whatever width the rest leaves. `✎` shows when the PR has
+/// review comments not sent yet.
+fn pr_line(pr: &PrSummary, width: usize, spin: &'static str, has_draft: bool) -> Line<'static> {
     let (glyph, glyph_color) = checks_glyph(pr.checks, spin);
     let repo = pr.pr.repo.rsplit('/').next().unwrap_or(&pr.pr.repo);
-    let id = format!("{repo}#{}", pr.pr.number);
+    let id = format!("{repo}#{}{}", pr.pr.number, if has_draft { "✎" } else { "" });
     let age = fmt_age(pr.updated_at);
     let review = review_text(pr.review);
     let draft = if pr.draft { "draft " } else { "" };

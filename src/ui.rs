@@ -272,7 +272,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     prs::draw_merge_dialog(f, app);
 
     match app.mode {
-        Mode::Help => draw_help(f),
+        Mode::Help => draw_help(f, app.help_page),
         Mode::Dispatch => draw_dispatch(f, app),
         Mode::Confirm => draw_confirm(f, app),
         Mode::Errors => draw_errors(f, app),
@@ -2011,6 +2011,27 @@ mod tests {
     }
 
     #[test]
+    fn the_help_has_a_page_for_the_pr_keys() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut app = demo_app();
+        app.handle_key(KeyEvent::from(KeyCode::Char('?')));
+        assert!(screen(&mut app, 120, 40).contains("Tab: pull request keys"), "the first page says how to get there");
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        let out = screen(&mut app, 120, 40);
+        println!("{out}");
+        assert!(app.mode == crate::app::Mode::Help);
+        // The last row of each column, and the longest row of each.
+        assert!(out.contains("an Actions check: its run"), "left column is clipped");
+        assert!(out.contains("asks first when comments are unsent"), "right column is clipped");
+        assert!(out.contains("j/k method · d delete branch · ⏎ merge"), "left rows are cut");
+        assert!(out.contains("j/k move · e edit · d drop · R submit"), "right rows are cut");
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert!(screen(&mut app, 120, 40).contains("Tab: pull request keys"), "Tab turns back");
+        app.handle_key(KeyEvent::from(KeyCode::Char('x')));
+        assert!(app.mode == crate::app::Mode::Normal, "any other key closes");
+    }
+
+    #[test]
     fn a_repo_with_no_runs_points_at_dispatch() {
         let mut app = demo_app();
         app.sync_layout(120);
@@ -2389,6 +2410,19 @@ mod tests {
         assert!(out.contains("changes requested"));
         assert!(out.contains("Opened by you  none"));
         assert!(out.contains("⇄ PRs 1  P"), "the tab counts what waits on you");
+    }
+
+    #[test]
+    fn a_pr_with_a_draft_is_marked_in_the_list() {
+        use crate::app::PendingReview;
+        use crate::pulls::model::{DraftComment, LineSpan, PrRef, Side};
+        let mut app = prs_app();
+        assert!(!screen(&mut app, 140, 24).contains('✎'));
+        let comment = DraftComment { path: "a.rs".into(), side: Side::Right, span: LineSpan::One(1), body: "why?".into() };
+        let review = PendingReview { head_oid: "abc".into(), comments: vec![comment], replies: vec![] };
+        app.prs.drafts.insert(PrRef { repo: "org/api".into(), number: 7 }, review);
+        let out = screen(&mut app, 140, 24);
+        assert!(out.contains("api#7✎"), "{out}");
     }
 
     #[test]

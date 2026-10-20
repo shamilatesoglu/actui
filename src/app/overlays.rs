@@ -10,6 +10,23 @@ use std::collections::HashSet;
 
 use super::{fuzzy, PrAction};
 
+/// Which page of the help is up.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum HelpPage {
+    #[default]
+    Keys,
+    PullRequests,
+}
+
+impl HelpPage {
+    pub fn other(self) -> Self {
+        match self {
+            HelpPage::Keys => HelpPage::PullRequests,
+            HelpPage::PullRequests => HelpPage::Keys,
+        }
+    }
+}
+
 pub enum PendingAction {
     Cancel { repo: String, run_id: u64, label: String },
     Rerun { repo: String, run_id: u64, label: String },
@@ -22,6 +39,8 @@ pub enum PendingAction {
     DiscardCompose,
     /// Drop the draft selected in the pending-review panel.
     DropDraft,
+    /// Quit although `unsent` pieces of review text would be lost.
+    Quit { unsent: usize },
 }
 
 impl PendingAction {
@@ -35,6 +54,10 @@ impl PendingAction {
             PendingAction::Pr { label, .. } => label.clone(),
             PendingAction::DiscardCompose => "Discard what you typed?".to_string(),
             PendingAction::DropDraft => "Drop this comment?".to_string(),
+            PendingAction::Quit { unsent } => {
+                let noun = if *unsent == 1 { "comment" } else { "comments" };
+                format!("Quit and lose {unsent} unsent review {noun}?")
+            }
         }
     }
 }

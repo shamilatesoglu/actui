@@ -14,14 +14,16 @@ const WHEEL_STEP: i32 = 3;
 
 impl App {
     pub fn handle_key(&mut self, key: KeyEvent) {
-        // Ctrl-C always quits.
+        // Ctrl-C always quits, after one question when review text would be lost.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.should_quit = true;
+            self.quit();
             return;
         }
         match self.mode {
             Mode::Normal => self.key_normal(key),
             Mode::Search => self.key_search(key),
+            // Tab turns the page; any other key closes the help.
+            Mode::Help if key.code == KeyCode::Tab => self.help_page = self.help_page.other(),
             Mode::Help => {
                 self.mode = Mode::Normal;
             }
@@ -369,7 +371,7 @@ impl App {
     fn key_normal(&mut self, key: KeyEvent) {
         self.status_msg = None;
         match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => self.quit(),
             // Movement applies to whichever pane is focused.
             KeyCode::Char('j') | KeyCode::Down => self.move_focused(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_focused(-1),
@@ -411,7 +413,10 @@ impl App {
                     self.mode = Mode::Errors;
                 }
             }
-            KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char('?') => {
+                self.help_page = HelpPage::default();
+                self.mode = Mode::Help;
+            }
             // Enter / l: drill from runs into jobs, or open the focused job's logs.
             KeyCode::Enter | KeyCode::Char('l') => match self.focus {
                 Focus::Repos => self.focus = Focus::Runs,
@@ -884,6 +889,7 @@ impl App {
                         }
                         PendingAction::DiscardCompose => self.discard_compose(),
                         PendingAction::DropDraft => self.drop_selected_draft(),
+                        PendingAction::Quit { .. } => self.should_quit = true,
                     }
                 }
                 self.mode = self.confirm_from;
@@ -893,6 +899,22 @@ impl App {
                 self.mode = self.confirm_from;
             }
             _ => {}
+        }
+    }
+
+    /// Quits, or asks first when a review is unsent. Asked again while the
+    /// question is up, it quits.
+    fn quit(&mut self) {
+        if !self.prs.has_unsent() || matches!(self.pending_action, Some(PendingAction::Quit { .. })) {
+            self.should_quit = true;
+            return;
+        }
+        let unsent = self.prs.unsent_count();
+        if self.mode == Mode::Confirm {
+            // Swap the question; answering no still returns to where it came from.
+            self.pending_action = Some(PendingAction::Quit { unsent });
+        } else {
+            self.ask(PendingAction::Quit { unsent });
         }
     }
 

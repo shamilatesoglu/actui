@@ -1135,4 +1135,58 @@ mod tests {
         assert_eq!(details, ["boom", "none"]);
         assert_eq!(PrList::default().rows().len(), 2);
     }
+
+    fn with_draft(app: &mut App) {
+        use crate::pulls::model::{DraftComment, LineSpan, Side};
+        let pr = app.prs.open.as_ref().unwrap().pr.clone();
+        let comment = DraftComment { path: "a.rs".into(), side: Side::Right, span: LineSpan::One(1), body: "why?".into() };
+        app.prs.drafts.insert(pr, PendingReview { head_oid: "abc".into(), comments: vec![comment], replies: vec![] });
+    }
+
+    #[test]
+    fn quitting_with_unsent_comments_asks_first() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        with_draft(&mut app);
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.mode == Mode::Normal, "q leaves the PR screen first");
+        assert!(app.mode == Mode::Normal);
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.mode == Mode::Confirm);
+        assert!(!app.should_quit);
+        let prompt = app.pending_action.as_ref().unwrap().prompt();
+        assert_eq!(prompt, "Quit and lose 1 unsent review comment?");
+
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.mode == Mode::Normal && !app.should_quit);
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.should_quit);
+
+        let mut app = app_on_a_pr_with_a_run_check();
+        with_draft(&mut app);
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), crossterm::event::KeyModifiers::CONTROL));
+        assert!(app.mode == Mode::Confirm && !app.should_quit);
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), crossterm::event::KeyModifiers::CONTROL));
+        assert!(app.should_quit, "a second Ctrl+C quits");
+    }
+
+    #[test]
+    fn the_quit_question_counts_drafts_and_open_boxes() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        with_draft(&mut app);
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "hi");
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), crossterm::event::KeyModifiers::CONTROL));
+        assert_eq!(app.pending_action.as_ref().unwrap().prompt(), "Quit and lose 2 unsent review comments?");
+    }
+
+    #[test]
+    fn quitting_without_drafts_is_immediate() {
+        let mut app = App::new(&crate::config::Config::default());
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.should_quit);
+        let mut app = app_on_a_pr_with_a_run_check();
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), crossterm::event::KeyModifiers::CONTROL));
+        assert!(app.should_quit);
+    }
 }

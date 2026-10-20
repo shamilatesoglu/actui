@@ -65,16 +65,20 @@ impl PrsState {
         self.sending.contains(pr)
     }
 
-    /// Whether anything typed would be lost by quitting: a pending review, a
-    /// box with text in it, or a message sent and not yet answered.
-    #[allow(dead_code)] // the quit guard uses it
+    /// How many pieces of text quitting would lose: the drafts of every
+    /// pending review, a box with text in it, and a message sent and not yet
+    /// answered.
+    pub fn unsent_count(&self) -> usize {
+        let typed = |text: &str| usize::from(!text.trim().is_empty());
+        let open = self.open.as_ref().map_or(0, |v| {
+            v.compose.as_ref().map_or(0, |c| typed(&c.text()))
+                + v.inflight.as_ref().map_or(0, |(_, text)| typed(text))
+        });
+        self.drafts.values().map(PendingReview::len).sum::<usize>() + open
+    }
+
     pub fn has_unsent(&self) -> bool {
-        let typed = |text: &str| !text.trim().is_empty();
-        self.drafts.values().any(|d| !d.is_empty())
-            || self.open.as_ref().is_some_and(|v| {
-                v.compose.as_ref().is_some_and(|c| typed(&c.text()))
-                    || v.inflight.as_ref().is_some_and(|(_, text)| typed(text))
-            })
+        self.unsent_count() > 0
     }
 }
 
