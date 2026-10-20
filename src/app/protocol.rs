@@ -110,8 +110,8 @@ pub enum Command {
     },
     FetchRefs { repo: String },
     /// List self-hosted runners for these candidate orgs (merged with the
-    /// user's org memberships by the worker).
-    FetchRunners { orgs: Vec<String> },
+    /// user's org memberships by the worker) and these watched repos.
+    FetchRunners { orgs: Vec<String>, repos: Vec<String> },
     SaveLogs { name: String, content: String },
     OpenUrl(String),
     /// A watched run finished — ring the bell / raise a desktop notification.

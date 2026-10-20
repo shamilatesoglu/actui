@@ -7,7 +7,7 @@ mod state;
 mod ui;
 
 use anyhow::Result;
-use app::{App, Command, DataMsg, Fetch, RunnerGroup};
+use app::{App, Command, DataMsg, Fetch, OrgRunners, RunnerGroup};
 use config::Config;
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::{FutureExt, StreamExt};
@@ -639,8 +639,9 @@ fn dispatch_commands(app: &mut App, gh: &Github, cfg: &Config, tx: &UnboundedSen
                     });
                 });
             }
-            Command::FetchRunners { orgs } => {
+            Command::FetchRunners { orgs, repos } => {
                 let (gh, tx) = (gh.clone(), tx.clone());
+                let concurrency = cfg.concurrency.max(1);
                 tokio::spawn(async move {
                     // Merge the user's org memberships with the owners derived from
                     // loaded runs, de-duped case-insensitively.
@@ -650,23 +651,48 @@ fn dispatch_commands(app: &mut App, gh: &Github, cfg: &Config, tx: &UnboundedSen
                             names.push(o);
                         }
                     }
-                    names.sort_by_key(|s| s.to_lowercase());
-                    if names.is_empty() {
-                        let _ = tx.send(DataMsg::Runners { groups: vec![] });
-                        return;
-                    }
                     // Each org's runners in parallel; a 403 (no admin) becomes a
                     // per-org note rather than failing the whole view.
-                    let groups = futures::future::join_all(names.into_iter().map(|org| {
-                        let gh = gh.clone();
-                        async move {
-                            match gh.list_org_runners(&org).await {
-                                Ok(runners) => RunnerGroup { org, runners, error: None },
-                                Err(e) => RunnerGroup { org, runners: vec![], error: Some(e.to_string()) },
+                    let org_lists = futures::future::join_all(names.iter().map(|org| gh.list_org_runners(org)));
+                    // Each watched repo's own runners, a few at a time. Repos that
+                    // refuse (no admin) or have none are left out.
+                    let repo_lists = futures::stream::iter(repos)
+                        .map(|repo| {
+                            let gh = gh.clone();
+                            async move {
+                                let runners = gh.list_repo_runners(&repo).await;
+                                runners.ok().filter(|r| !r.is_empty()).map(|r| (repo, r))
                             }
+                        })
+                        .buffer_unordered(concurrency)
+                        .filter_map(std::future::ready)
+                        .collect::<Vec<_>>();
+                    let (org_lists, mut repo_lists) = futures::join!(org_lists, repo_lists);
+                    repo_lists.sort_by_key(|(repo, _)| repo.to_lowercase());
+
+                    let mut groups: Vec<RunnerGroup> = names
+                        .into_iter()
+                        .zip(org_lists)
+                        .map(|(owner, listed)| RunnerGroup {
+                            owner,
+                            org: match listed {
+                                Ok(runners) => OrgRunners::Listed(runners),
+                                Err(e) => OrgRunners::Failed(e.to_string()),
+                            },
+                            repos: Vec::new(),
+                        })
+                        .collect();
+                    for (repo, runners) in repo_lists {
+                        let owner = repo.split_once('/').map_or(repo.as_str(), |(o, _)| o).to_string();
+                        match groups.iter_mut().find(|g| g.owner.eq_ignore_ascii_case(&owner)) {
+                            Some(g) => g.repos.push((repo, runners)),
+                            None => groups.push(RunnerGroup {
+                                owner,
+                                org: OrgRunners::NotAsked,
+                                repos: vec![(repo, runners)],
+                            }),
                         }
-                    }))
-                    .await;
+                    }
                     let _ = tx.send(DataMsg::Runners { groups });
                 });
             }

@@ -9,8 +9,8 @@ mod screenshot;
 mod timing;
 
 use crate::app::{
-    is_error_line, log_content, App, Bar, Column, Divider, Fetch, Filter, Focus, Mode, Panes, RunnerRow,
-    RunnerStatus, Scrollable,
+    is_error_line, log_content, App, Bar, Column, Divider, Fetch, Filter, Focus, Mode, Panes, RunnerHome,
+    RunnerRow, RunnerStatus, Scrollable,
 };
 use crate::github::{Job, Run, RunState, RunTag, Step};
 use ansi_to_tui::IntoText;
@@ -910,7 +910,7 @@ fn get_error_preview_lines(log_text: &str, conclusion: Option<&str>) -> (Vec<Lin
 /// The org self-hosted runners view: a dedicated, full-width body pane with a
 /// selectable list of runners grouped by org, and a tally on the last row.
 fn draw_runners_pane(f: &mut Frame, app: &mut App, area: Rect) {
-    let inner = pane(f, area, "Org runners", true);
+    let inner = pane(f, area, "Self-hosted runners", true);
     let Some(rv) = &app.runners else {
         app.hit.runners_pane = inner;
         return;
@@ -922,7 +922,7 @@ fn draw_runners_pane(f: &mut Frame, app: &mut App, area: Rect) {
     if !rv.loaded {
         app.hit.runners_pane = body;
         f.render_widget(
-            Paragraph::new("Discovering organizations & runners…").style(Style::default().fg(dim())),
+            Paragraph::new("Reading runners from your orgs and watched repos…").style(Style::default().fg(dim())),
             body,
         );
         return;
@@ -931,8 +931,8 @@ fn draw_runners_pane(f: &mut Frame, app: &mut App, area: Rect) {
         app.hit.runners_pane = body;
         f.render_widget(
             Paragraph::new(
-                "No organizations found.\n\nYou're not a member of an org, or the token can't \
-                 read your org memberships.",
+                "No self-hosted runners found in your orgs or watched repos.\n\nListing a \
+                 repo's runners needs admin on it; repos that refuse are left out.",
             )
             .style(Style::default().fg(dim()))
             .wrap(Wrap { trim: true }),
@@ -1004,7 +1004,7 @@ fn draw_runner_detail(f: &mut Frame, rv: &crate::app::RunnersView, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let Some(RunnerRow::Runner { name, status, os, labels }) = rv.selected_runner() else {
+    let Some(RunnerRow::Runner { name, status, os, labels, home }) = rv.selected_runner() else {
         return;
     };
     let (glyph, gcolor, state_text, scolor) = match status {
@@ -1018,7 +1018,10 @@ fn draw_runner_detail(f: &mut Frame, rv: &crate::app::RunnersView, area: Rect) {
             Span::styled(name.clone(), Style::default().add_modifier(Modifier::BOLD)),
         ]),
         Line::raw(""),
-        kv("org", rv.selected_org().unwrap_or("-")),
+        match home {
+            RunnerHome::Org(org) => kv("org", org),
+            RunnerHome::Repo(repo) => kv("repo", repo),
+        },
         Line::from(vec![
             Span::styled(format!("{:>LABEL_W$}  ", "status"), Style::default().fg(dim())),
             Span::styled(state_text, Style::default().fg(scolor)),
@@ -1049,23 +1052,36 @@ fn runner_row_item(row: &RunnerRow) -> ListItem<'static> {
         RunnerRow::Note(text) => {
             ListItem::new(Line::from(Span::styled(text.clone(), Style::default().fg(Color::Yellow))))
         }
-        RunnerRow::Header { org, detail, detail_err } => {
+        RunnerRow::Header { owner, detail, detail_err } => {
             let acc = Style::default().fg(accent()).add_modifier(Modifier::BOLD);
             let dc = if *detail_err { Color::Red } else { dim() };
             ListItem::new(Line::from(vec![
                 Span::styled("▸ ", acc),
-                Span::styled(org.clone(), acc),
+                Span::styled(owner.clone(), acc),
                 Span::styled(format!("  {}", truncate(detail, 60)), Style::default().fg(dc)),
             ]))
         }
-        RunnerRow::Runner { name, status, os, labels } => {
+        RunnerRow::RepoHeader(repo) => {
+            // The owner is already on the header above.
+            let name = repo.split_once('/').map_or(repo.as_str(), |(_, name)| name);
+            ListItem::new(Line::from(vec![
+                Span::styled("  ▹ ", Style::default().fg(dim())),
+                Span::styled(name.to_string(), Style::default().fg(accent())),
+            ]))
+        }
+        RunnerRow::Runner { name, status, os, labels, home } => {
             let (icon, color, label, label_c) = match status {
                 RunnerStatus::Busy => ("●", Color::Yellow, "busy", Color::Yellow),
                 RunnerStatus::Online => ("●", Color::Green, "idle", Color::Green),
                 RunnerStatus::Offline => ("○", dim(), "offline", dim()),
             };
+            // Repo runners sit one step further in, under their repo's row.
+            let indent = match home {
+                RunnerHome::Org(_) => "  ",
+                RunnerHome::Repo(_) => "    ",
+            };
             let mut spans = vec![
-                Span::raw("  "),
+                Span::raw(indent),
                 Span::styled(format!("{icon} "), Style::default().fg(color)),
                 Span::raw(truncate(name, 28)),
                 Span::styled(format!("  {label}"), Style::default().fg(label_c)),
@@ -2280,7 +2296,7 @@ mod tests {
 
         let out = screen(&mut app, 120, 14);
         println!("{out}");
-        assert!(out.contains("Org runners"), "the view opens");
+        assert!(out.contains("Self-hosted runners"), "the view opens");
         assert!(out.contains("All repos"), "beside the sidebar, which stays put");
 
         // Clicking it again comes back, with the repo scope untouched.

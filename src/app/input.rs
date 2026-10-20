@@ -1444,12 +1444,18 @@ impl App {
         self.pending.push(Command::FetchWorkflows { repo });
     }
 
-    /// Open the org self-hosted runners view. Fetches runners for the orgs seen
-    /// across loaded runs (merged with the user's org memberships by the worker).
+    /// Open the self-hosted runners view. Fetches runners for the orgs seen
+    /// across loaded runs (merged with the user's org memberships by the
+    /// worker) and for every watched repo.
     fn open_runners(&mut self) {
         self.runners = Some(RunnersView::loading());
         self.mode = Mode::Runners;
-        self.pending.push(Command::FetchRunners { orgs: self.candidate_orgs() });
+        self.fetch_runners();
+    }
+
+    fn fetch_runners(&mut self) {
+        let repos = self.repos.known().to_vec();
+        self.pending.push(Command::FetchRunners { orgs: self.candidate_orgs(), repos });
     }
 
     fn close_runners(&mut self) {
@@ -1491,18 +1497,15 @@ impl App {
                 if let Some(rv) = &mut self.runners {
                     rv.loaded = false;
                 }
-                self.pending.push(Command::FetchRunners { orgs: self.candidate_orgs() });
+                self.fetch_runners();
             }
-            // Open the selected runner's org runner-settings page on github.com.
-            // Org settings live under /organizations/, not /orgs/.
+            // Open the runner settings page of the org or repo the selected
+            // runner is registered to.
             KeyCode::Char('o') => {
-                let url = self
-                    .runners
-                    .as_ref()
-                    .and_then(|rv| rv.selected_org())
-                    .map(|org| {
-                        format!("https://github.com/organizations/{org}/settings/actions/runners")
-                    });
+                let url = match self.runners.as_ref().and_then(|rv| rv.selected_runner()) {
+                    Some(RunnerRow::Runner { home, .. }) => Some(home.settings_url()),
+                    _ => None,
+                };
                 if let Some(url) = url {
                     self.pending.push(Command::OpenUrl(url));
                 }

@@ -161,6 +161,10 @@ impl ReposPane {
         self.known = names;
     }
 
+    pub fn known(&self) -> &[String] {
+        &self.known
+    }
+
     /// Rebuild the rows from the current runs. Pinned repos come first, in the
     /// order they're configured; the rest are alphabetical, or ordered by use
     /// under `sort = "used"`. The cursor stays on the same repo across a

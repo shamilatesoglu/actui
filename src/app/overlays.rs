@@ -176,23 +176,42 @@ impl AnnotationsView {
     }
 }
 
-/// One org's self-hosted runners (or the error encountered fetching them).
+/// One owner's self-hosted runners: the org's own, and those registered to
+/// its watched repos.
 pub struct RunnerGroup {
-    pub org: String,
-    pub runners: Vec<Runner>,
-    /// Set when the listing failed — most often "no admin access".
-    pub error: Option<String>,
+    pub owner: String,
+    pub org: OrgRunners,
+    /// Runners registered to single repos, by repo full name. Repos with none,
+    /// or that refuse the listing, are left out.
+    pub repos: Vec<(String, Vec<Runner>)>,
+}
+
+/// What listing an owner's org-wide runners gave.
+pub enum OrgRunners {
+    /// Not asked: the owner is a user, or an org the token isn't a member of.
+    NotAsked,
+    Listed(Vec<Runner>),
+    /// Most often "no admin access".
+    Failed(String),
 }
 
 impl RunnerGroup {
-    /// Triage rank: orgs with runners first, then accessible-but-empty, errors last.
+    fn count(&self) -> usize {
+        let org = match &self.org {
+            OrgRunners::Listed(runners) => runners.len(),
+            _ => 0,
+        };
+        org + self.repos.iter().map(|(_, runners)| runners.len()).sum::<usize>()
+    }
+
+    /// Triage rank: owners with runners first, then accessible-but-empty, errors last.
     pub(crate) fn rank(&self) -> u8 {
-        if !self.runners.is_empty() {
+        if self.count() > 0 {
             0
-        } else if self.error.is_none() {
-            1
-        } else {
+        } else if matches!(self.org, OrgRunners::Failed(_)) {
             2
+        } else {
+            1
         }
     }
 }
@@ -204,18 +223,54 @@ pub enum RunnerStatus {
     Offline,
 }
 
+impl RunnerStatus {
+    fn of(r: &Runner) -> Self {
+        if r.busy {
+            RunnerStatus::Busy
+        } else if r.status == "online" {
+            RunnerStatus::Online
+        } else {
+            RunnerStatus::Offline
+        }
+    }
+}
+
+/// Where a runner is registered.
+#[derive(Clone, PartialEq, Eq)]
+pub enum RunnerHome {
+    Org(String),
+    /// A repo's full name.
+    Repo(String),
+}
+
+impl RunnerHome {
+    /// Its runner settings page on github.com. Org settings live under
+    /// /organizations/, not /orgs/.
+    pub fn settings_url(&self) -> String {
+        match self {
+            RunnerHome::Org(org) => {
+                format!("https://github.com/organizations/{org}/settings/actions/runners")
+            }
+            RunnerHome::Repo(repo) => format!("https://github.com/{repo}/settings/actions/runners"),
+        }
+    }
+}
+
 /// One rendered row of the runners view. Headers and notes are not selectable;
 /// the cursor only ever lands on `Runner` rows.
 pub enum RunnerRow {
     /// A standalone note (e.g. the missing-scope hint).
     Note(String),
-    /// An org header with a trailing detail (count, "no runners", or an error).
-    Header { org: String, detail: String, detail_err: bool },
+    /// An owner header with a trailing detail (count, "no runners", or an error).
+    Header { owner: String, detail: String, detail_err: bool },
+    /// The repo the runners below it are registered to, under its owner.
+    RepoHeader(String),
     Runner {
         name: String,
         status: RunnerStatus,
         os: String,
         labels: Vec<String>,
+        home: RunnerHome,
     },
 }
 
@@ -223,9 +278,19 @@ impl RunnerRow {
     fn is_runner(&self) -> bool {
         matches!(self, RunnerRow::Runner { .. })
     }
+
+    fn runner(r: &Runner, home: RunnerHome) -> Self {
+        RunnerRow::Runner {
+            name: r.name.clone(),
+            status: RunnerStatus::of(r),
+            os: r.os.clone(),
+            labels: r.labels.iter().map(|l| l.name.clone()).collect(),
+            home,
+        }
+    }
 }
 
-/// Org self-hosted runners view, shown as a dedicated body pane (open with `s`).
+/// Self-hosted runners view, shown as a dedicated body pane (open with `s`).
 /// The groups are flattened into `rows`; selection moves over runner rows only.
 pub struct RunnersView {
     pub rows: Vec<RunnerRow>,
@@ -250,47 +315,41 @@ impl RunnersView {
     /// rows, and leave the cursor on the runner it was on — the detail pane
     /// beside it would otherwise start describing a different machine.
     pub fn set_groups(&mut self, mut groups: Vec<RunnerGroup>) {
-        // Orgs with runners first, accessible-but-empty next, errors last; then
-        // alphabetical so the list is stable across refreshes.
-        groups.sort_by(|a, b| a.rank().cmp(&b.rank()).then_with(|| a.org.cmp(&b.org)));
+        // An owner we only looked at for its repos' runners isn't worth a row
+        // when it has none.
+        groups.retain(|g| !matches!(g.org, OrgRunners::NotAsked) || g.count() > 0);
+        // Owners with runners first, accessible-but-empty next, errors last;
+        // then alphabetical so the list is stable across refreshes.
+        groups.sort_by(|a, b| a.rank().cmp(&b.rank()).then_with(|| a.owner.cmp(&b.owner)));
 
         let mut rows = Vec::new();
-        // All orgs errored → almost always a token-scope problem, not real lack
-        // of access. Point the user at the fix.
-        if !groups.is_empty() && groups.iter().all(|g| g.error.is_some()) {
+        // Every org listing failed → almost always a token-scope problem, not
+        // real lack of access. Point the user at the fix.
+        let mut asked = groups.iter().filter(|g| !matches!(g.org, OrgRunners::NotAsked)).peekable();
+        if asked.peek().is_some() && asked.all(|g| matches!(g.org, OrgRunners::Failed(_))) {
             rows.push(RunnerRow::Note(
-                "Listing runners needs the admin:org scope. Run:  gh auth refresh -s admin:org"
+                "Listing org runners needs the admin:org scope. Run:  gh auth refresh -s admin:org"
                     .into(),
             ));
         }
         for g in &groups {
-            let (detail, detail_err) = if let Some(e) = &g.error {
-                (e.clone(), true)
-            } else if g.runners.is_empty() {
-                ("no self-hosted runners".into(), false)
-            } else {
-                let n = g.runners.len();
-                (format!("{n} runner{}", if n == 1 { "" } else { "s" }), false)
+            let n = g.count();
+            let (detail, detail_err) = match &g.org {
+                OrgRunners::Failed(e) if n == 0 => (e.clone(), true),
+                _ if n == 0 => ("no self-hosted runners".into(), false),
+                _ => (format!("{n} runner{}", if n == 1 { "" } else { "s" }), false),
             };
-            rows.push(RunnerRow::Header { org: g.org.clone(), detail, detail_err });
-            for r in &g.runners {
-                let status = if r.busy {
-                    RunnerStatus::Busy
-                } else if r.status == "online" {
-                    RunnerStatus::Online
-                } else {
-                    RunnerStatus::Offline
-                };
-                rows.push(RunnerRow::Runner {
-                    name: r.name.clone(),
-                    status,
-                    os: r.os.clone(),
-                    labels: r.labels.iter().map(|l| l.name.clone()).collect(),
-                });
+            rows.push(RunnerRow::Header { owner: g.owner.clone(), detail, detail_err });
+            if let OrgRunners::Listed(runners) = &g.org {
+                rows.extend(runners.iter().map(|r| RunnerRow::runner(r, RunnerHome::Org(g.owner.clone()))));
+            }
+            for (repo, runners) in &g.repos {
+                rows.push(RunnerRow::RepoHeader(repo.clone()));
+                rows.extend(runners.iter().map(|r| RunnerRow::runner(r, RunnerHome::Repo(repo.clone()))));
             }
         }
         let keep = match self.selected_runner() {
-            Some(RunnerRow::Runner { name, .. }) => Some(name.clone()),
+            Some(RunnerRow::Runner { name, home, .. }) => Some((name.clone(), home.clone())),
             _ => None,
         };
         self.rows = rows;
@@ -298,9 +357,9 @@ impl RunnersView {
         // Back on the same runner, else the first one — a name that has gone
         // must not leave the cursor pointing at a header or off the end.
         let at = keep
-            .and_then(|name| {
+            .and_then(|(name, home)| {
                 self.rows.iter().position(
-                    |r| matches!(r, RunnerRow::Runner { name: n, .. } if *n == name),
+                    |r| matches!(r, RunnerRow::Runner { name: n, home: h, .. } if *n == name && *h == home),
                 )
             })
             .or_else(|| self.runner_indices().first().copied());
@@ -355,16 +414,7 @@ impl RunnersView {
         }
     }
 
-    /// The org the selected runner belongs to (nearest header above it).
-    pub fn selected_org(&self) -> Option<&str> {
-        let sel = self.state.selected()?;
-        self.rows[..=sel].iter().rev().find_map(|r| match r {
-            RunnerRow::Header { org, .. } => Some(org.as_str()),
-            _ => None,
-        })
-    }
-
-    /// (online, offline, busy) tallied across every org, for the status bar.
+    /// (online, offline, busy) tallied across every owner, for the status bar.
     /// Busy runners are also counted as online.
     pub fn totals(&self) -> (usize, usize, usize) {
         let (mut online, mut offline, mut busy) = (0, 0, 0);
@@ -535,9 +585,9 @@ mod tests {
             labels: Vec::new(),
         };
         let group = |org: &str, names: &[&str]| RunnerGroup {
-            org: org.into(),
-            runners: names.iter().copied().map(runner).collect(),
-            error: None,
+            owner: org.into(),
+            org: OrgRunners::Listed(names.iter().copied().map(runner).collect()),
+            repos: Vec::new(),
         };
         let name_of = |rv: &RunnersView| match rv.selected_runner() {
             Some(RunnerRow::Runner { name, .. }) => name.clone(),
@@ -557,6 +607,60 @@ mod tests {
         // And when it drops off entirely, the cursor lands on a real row.
         rv.set_groups(vec![group("acme", &["alpha", "beta"])]);
         assert_eq!(name_of(&rv), "alpha");
+    }
+
+    /// Runners registered to repos show under their owner, a personal account
+    /// included, and owners with nothing to show stay out of the list.
+    #[test]
+    fn repo_runners_list_under_their_owner() {
+        let runner = |name: &str| crate::github::Runner {
+            name: name.into(),
+            os: "linux".into(),
+            status: "online".into(),
+            busy: false,
+            labels: Vec::new(),
+        };
+        let mut rv = RunnersView::loading();
+        rv.set_groups(vec![
+            RunnerGroup {
+                owner: "acme".into(),
+                org: OrgRunners::Failed("403 Forbidden".into()),
+                repos: vec![("acme/api".into(), vec![runner("rack-1")])],
+            },
+            RunnerGroup {
+                owner: "me".into(),
+                org: OrgRunners::NotAsked,
+                repos: vec![("me/tool".into(), vec![runner("desk")])],
+            },
+            RunnerGroup { owner: "friend".into(), org: OrgRunners::NotAsked, repos: Vec::new() },
+        ]);
+        let shown: Vec<String> = rv
+            .rows
+            .iter()
+            .map(|r| match r {
+                RunnerRow::Note(n) => format!("note {n}"),
+                RunnerRow::Header { owner, detail, .. } => format!("{owner}: {detail}"),
+                RunnerRow::RepoHeader(repo) => format!("  {repo}"),
+                RunnerRow::Runner { name, .. } => format!("    {name}"),
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "note Listing org runners needs the admin:org scope. Run:  gh auth refresh -s admin:org",
+                "acme: 1 runner",
+                "  acme/api",
+                "    rack-1",
+                "me: 1 runner",
+                "  me/tool",
+                "    desk",
+            ]
+        );
+        let url = match rv.selected_runner() {
+            Some(RunnerRow::Runner { home, .. }) => home.settings_url(),
+            _ => panic!("expected a runner"),
+        };
+        assert_eq!(url, "https://github.com/acme/api/settings/actions/runners");
     }
 
     #[test]

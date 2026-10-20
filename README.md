@@ -20,7 +20,8 @@ A terminal UI for GitHub Actions across all the repos and orgs your account can 
 - The tag or release a run made, shown with the run.
 - Dispatch a workflow with a form built from its inputs, cancel and re-run runs
   or jobs, approve held runs, and download artifacts.
-- Your orgs' self-hosted runners (`s`).
+- Self-hosted runners (`s`) of your orgs and watched repos, personal repos
+  included.
 - The runner each job runs on, with its labels.
 - A desktop notification and terminal bell when a run finishes.
 - Light and dark themes, following the terminal's background.

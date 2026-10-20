@@ -66,6 +66,8 @@ pub struct Github {
     repos_cache: Arc<Mutex<Vec<Repo>>>,
     /// Last tag list per repo, returned when that repo's `/tags` is unchanged.
     tags_cache: Arc<Mutex<HashMap<String, Vec<Tag>>>>,
+    /// Last runner list per repo, returned when that repo's runners are unchanged.
+    repo_runners_cache: Arc<Mutex<HashMap<String, Vec<Runner>>>>,
     /// Largest `X-Poll-Interval` (seconds) GitHub has asked us to honor; 0 = unset.
     poll_interval: Arc<AtomicU64>,
     rate_state: Arc<Mutex<RateState>>,
@@ -92,6 +94,7 @@ impl Github {
             etags: Arc::new(Mutex::new(HashMap::new())),
             repos_cache: Arc::new(Mutex::new(Vec::new())),
             tags_cache: Arc::new(Mutex::new(HashMap::new())),
+            repo_runners_cache: Arc::new(Mutex::new(HashMap::new())),
             poll_interval: Arc::new(AtomicU64::new(0)),
             rate_state: Arc::new(Mutex::new(RateState::default())),
         })
@@ -605,6 +608,34 @@ impl Github {
         Ok(resp.runners)
     }
 
+    /// Self-hosted runners registered to one repo, which is the only place a
+    /// personal account can register them. Needs admin on the repo.
+    /// Conditional, so reopening the runners view costs almost no quota.
+    pub async fn list_repo_runners(&self, full_name: &str) -> Result<Vec<Runner>> {
+        #[derive(Deserialize)]
+        struct Resp {
+            runners: Vec<Runner>,
+        }
+        let key = format!("runners:{full_name}");
+        let url = format!("{API}/repos/{full_name}/actions/runners");
+        match self.cond_get::<Resp>(&key, url, &[("per_page", "100".to_string())]).await? {
+            Cond::Modified(resp) => {
+                self.repo_runners_cache
+                    .lock()
+                    .unwrap()
+                    .insert(full_name.to_string(), resp.runners.clone());
+                Ok(resp.runners)
+            }
+            Cond::NotModified => Ok(self
+                .repo_runners_cache
+                .lock()
+                .unwrap()
+                .get(full_name)
+                .cloned()
+                .unwrap_or_default()),
+        }
+    }
+
     /// The repo's most recent tags, each already resolved to the commit it
     /// points at (GitHub dereferences annotated tags for this endpoint).
     /// Conditional: a `304` hands back the tags we already have and costs no
@@ -1058,7 +1089,7 @@ pub struct Annotation {
     pub message: String,
 }
 
-/// A self-hosted runner registered to an org.
+/// A self-hosted runner, registered to an org or a repo.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Runner {
     pub name: String,
