@@ -95,93 +95,82 @@ async fn main() -> Result<()> {
     // The terminal has to be asked before raw mode starts, because its answer
     // arrives as terminal input and the event loop would take it first. Skipped
     // when the config already picked a palette.
-    let terminal_dark = match cfg.theme.as_str() {
+    let colors = match cfg.theme.as_str() {
         "dark" | "light" => None,
-        _ => terminal_is_dark(Duration::from_secs(1)),
+        _ => terminal_colors(Duration::from_secs(1)),
     };
 
     let mut terminal = ratatui::init();
     // Mouse: wheel scrolls, click selects rows / panes / filter tabs.
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
-    let res = run(&mut terminal, gh, cfg, terminal_dark).await;
+    let res = run(&mut terminal, gh, cfg, colors).await;
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
     res
 }
 
-/// Which palette to use, and what to keep asking for a change while the app
-/// runs.
+/// The terminal's foreground and background colors.
 #[derive(Clone, Copy, PartialEq, Debug)]
-struct ThemeChoice {
-    dark: bool,
-    follow: Follow,
+struct TermColors {
+    fg: (u8, u8, u8),
+    bg: (u8, u8, u8),
 }
 
-/// Where a theme change can come from while the app runs.
+/// Where the palette comes from.
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Follow {
-    /// The config picked the palette.
-    Nothing,
-    /// The terminal answers when asked for its background.
-    Terminal,
-    /// The terminal won't answer, or missed an answer, so the desktop setting
-    /// stands in for it.
-    System,
+enum ThemeSource {
+    /// The config picked "dark" or "light".
+    Configured { dark: bool },
+    /// Built from the colors the terminal reported. Asked again while the app
+    /// runs, so changing the terminal's theme changes ours.
+    Terminal(TermColors),
+    /// The terminal won't report its colors: named ANSI colors, which it draws
+    /// in its own scheme, so they follow it without being asked.
+    Ansi,
 }
 
 /// Pick the palette. A configured "dark"/"light" wins outright. Otherwise the
-/// terminal's own background decides, since that is the screen actually being
-/// drawn on and it need not match the desktop — a dark profile on a light
-/// desktop, or a light one reached over ssh. The desktop setting is asked only
-/// when the terminal won't answer. Whichever answered is asked again while the
-/// app runs, so switching the terminal's theme switches ours.
-fn resolve_theme(
-    configured: &str,
-    terminal_dark: Option<bool>,
-    system_dark: impl FnOnce() -> bool,
-) -> ThemeChoice {
+/// terminal's own colors decide, since that is the screen actually being drawn
+/// on.
+fn resolve_theme(configured: &str, terminal: Option<TermColors>) -> ThemeSource {
     match configured {
-        "dark" => ThemeChoice { dark: true, follow: Follow::Nothing },
-        "light" => ThemeChoice { dark: false, follow: Follow::Nothing },
-        _ => match terminal_dark {
-            Some(dark) => ThemeChoice { dark, follow: Follow::Terminal },
-            None => ThemeChoice { dark: system_dark(), follow: Follow::System },
-        },
+        "dark" => ThemeSource::Configured { dark: true },
+        "light" => ThemeSource::Configured { dark: false },
+        _ => terminal.map_or(ThemeSource::Ansi, ThemeSource::Terminal),
     }
 }
 
-/// Ask the terminal whether it is dark, by its own background color. None when
-/// it doesn't answer within `wait`: an older terminal, output that is not a
+/// Ask the terminal for its foreground and background colors. None when it
+/// doesn't answer within `wait`: an older terminal, output that is not a
 /// terminal at all, or a link too slow to wait on.
-fn terminal_is_dark(wait: Duration) -> Option<bool> {
+fn terminal_colors(wait: Duration) -> Option<TermColors> {
     let mut options = terminal_colorsaurus::QueryOptions::default();
     options.timeout = wait;
-    match terminal_colorsaurus::theme_mode(options) {
-        Ok(terminal_colorsaurus::ThemeMode::Dark) => Some(true),
-        Ok(terminal_colorsaurus::ThemeMode::Light) => Some(false),
-        Err(_) => None,
+    let colors = terminal_colorsaurus::color_palette(options).ok()?;
+    Some(TermColors {
+        fg: colors.foreground.scale_to_8bit(),
+        bg: colors.background.scale_to_8bit(),
+    })
+}
+
+fn palette(source: ThemeSource) -> ui::Theme {
+    match source {
+        ThemeSource::Configured { dark: true } => ui::Theme::dark(),
+        ThemeSource::Configured { dark: false } => ui::Theme::light(),
+        ThemeSource::Terminal(c) => ui::Theme::from_terminal(c.fg, c.bg),
+        ThemeSource::Ansi => ui::Theme::ansi(),
     }
-}
-
-/// The desktop's own light/dark setting, which counts as dark when unknown.
-fn system_is_dark() -> bool {
-    !matches!(dark_light::detect(), dark_light::Mode::Light)
-}
-
-/// The palette for a light/dark answer.
-fn palette(dark: bool) -> ui::Theme {
-    if dark { ui::Theme::dark() } else { ui::Theme::light() }
 }
 
 async fn run(
     terminal: &mut ratatui::DefaultTerminal,
     gh: Github,
     cfg: Config,
-    terminal_dark: Option<bool>,
+    colors: Option<TermColors>,
 ) -> Result<()> {
     let mut app = App::new(&cfg);
-    let theme = resolve_theme(&cfg.theme, terminal_dark, system_is_dark);
-    ui::set_theme(palette(theme.dark));
+    let mut theme = resolve_theme(&cfg.theme, colors);
+    ui::set_theme(palette(theme));
     let (tx, mut rx) = mpsc::unbounded_channel::<DataMsg>();
 
     // Initial load.
@@ -224,12 +213,8 @@ async fn run(
     // After a dispatch, how often to look for the run GitHub makes of it.
     let pickup_iv = Duration::from_secs(3);
     let mut last_pickup = std::time::Instant::now();
-    // Re-check the theme periodically so it switches live: the terminal's own
-    // background when it answers, else the desktop setting. A terminal that
-    // answered has told us about the screen we are on, and the desktop must
-    // not override it.
-    let mut follow = theme.follow;
-    let mut dark = theme.dark;
+    // Re-ask the terminal for its colors periodically so the theme switches
+    // live.
     let mut ask_terminal = false;
     let mut last_theme = std::time::Instant::now();
 
@@ -264,15 +249,12 @@ async fn run(
             _ = sched.tick() => {
                 // The once-a-second redraw also keeps ages/durations current.
                 redraw = true;
-                if follow != Follow::Nothing && last_theme.elapsed() >= Duration::from_secs(3) {
+                if matches!(theme, ThemeSource::Terminal(_))
+                    && last_theme.elapsed() >= Duration::from_secs(3)
+                {
                     last_theme = std::time::Instant::now();
-                    if follow == Follow::Terminal {
-                        // Asked below, once the event stream is free of this select.
-                        ask_terminal = true;
-                    } else {
-                        // Detection can block (dbus on Linux), so keep it off the UI loop.
-                        tokio::task::spawn_blocking(|| ui::set_theme(palette(system_is_dark())));
-                    }
+                    // Asked below, once the event stream is free of this select.
+                    ask_terminal = true;
                 }
                 // Surface live rate-limit / back-off state from response headers.
                 app.rate = gh.rate();
@@ -349,18 +331,16 @@ async fn run(
             drop(events);
             // Waits for the dropped stream's reader thread to let go of input.
             let _ = crossterm::event::poll(Duration::from_millis(50));
-            match terminal_is_dark(Duration::from_millis(500)) {
-                Some(now_dark) if now_dark != dark => {
-                    dark = now_dark;
-                    ui::set_theme(palette(dark));
-                    redraw = true;
-                }
-                Some(_) => {}
-                // A late answer would land in the new stream as keypresses, and
-                // each wait stalls the app, so a terminal that missed once is
-                // not asked again. The desktop setting takes over, so the
-                // theme still follows.
-                None => follow = Follow::System,
+            // A late answer would land in the new stream as keypresses, and
+            // each wait stalls the app, so a terminal that missed once is not
+            // asked again. ANSI colors take over, and they still follow its
+            // scheme.
+            let now = terminal_colors(Duration::from_millis(500))
+                .map_or(ThemeSource::Ansi, ThemeSource::Terminal);
+            if now != theme {
+                theme = now;
+                ui::set_theme(palette(theme));
+                redraw = true;
             }
             events = EventStream::new();
         }
@@ -846,27 +826,19 @@ mod tests {
 
     #[test]
     fn a_configured_theme_beats_anything_detected() {
-        let choice = resolve_theme("dark", Some(false), || false);
-        assert_eq!(choice, ThemeChoice { dark: true, follow: Follow::Nothing });
-        let choice = resolve_theme("light", Some(true), || true);
-        assert_eq!(choice, ThemeChoice { dark: false, follow: Follow::Nothing });
+        let colors = Some(TermColors { fg: (0, 0, 0), bg: (255, 255, 255) });
+        assert_eq!(resolve_theme("dark", colors), ThemeSource::Configured { dark: true });
+        assert_eq!(resolve_theme("light", None), ThemeSource::Configured { dark: false });
     }
 
     #[test]
-    fn the_terminal_decides_when_it_answers() {
-        // The system setting says the opposite in both of these: a dark profile
-        // on a light desktop is the case this exists for.
-        let choice = resolve_theme("auto", Some(true), || false);
-        assert_eq!(choice, ThemeChoice { dark: true, follow: Follow::Terminal });
-        let choice = resolve_theme("auto", Some(false), || true);
-        assert_eq!(choice, ThemeChoice { dark: false, follow: Follow::Terminal });
+    fn the_terminal_colors_decide_when_it_answers() {
+        let colors = TermColors { fg: (205, 214, 244), bg: (30, 30, 46) };
+        assert_eq!(resolve_theme("auto", Some(colors)), ThemeSource::Terminal(colors));
     }
 
     #[test]
-    fn the_system_decides_when_the_terminal_stays_silent() {
-        let choice = resolve_theme("auto", None, || true);
-        assert_eq!(choice, ThemeChoice { dark: true, follow: Follow::System });
-        let choice = resolve_theme("auto", None, || false);
-        assert_eq!(choice, ThemeChoice { dark: false, follow: Follow::System });
+    fn ansi_colors_stand_in_when_the_terminal_stays_silent() {
+        assert_eq!(resolve_theme("auto", None), ThemeSource::Ansi);
     }
 }

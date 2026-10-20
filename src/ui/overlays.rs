@@ -449,7 +449,7 @@ fn draw_dispatch_form(f: &mut Frame, d: &crate::app::DispatchState, area: Rect) 
     // Highlight for the focused field's value.
     let val_style = |on: bool| {
         if on {
-            Style::default().fg(Color::Black).bg(accent())
+            Style::default().fg(on_accent()).bg(accent())
         } else {
             Style::default().fg(text()).bg(bg_sel())
         }

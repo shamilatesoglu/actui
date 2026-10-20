@@ -44,6 +44,7 @@ pub struct Theme {
     soft_red: Color,   // a guessed error, quieter than a real failure's red
     text: Color,       // the strongest foreground: what stands out from the accent
     faded: Color,      // a row whose data is being read
+    on_accent: Color,  // text drawn on the accent color
 }
 
 impl Theme {
@@ -58,6 +59,7 @@ impl Theme {
             soft_red: Color::Rgb(235, 160, 172),
             text: Color::Rgb(205, 214, 244),
             faded: Color::Rgb(88, 91, 112),
+            on_accent: Color::Black,
         }
     }
     pub fn light() -> Self {
@@ -71,6 +73,50 @@ impl Theme {
             soft_red: Color::Rgb(179, 80, 92),
             text: Color::Rgb(76, 79, 105),
             faded: Color::Rgb(172, 176, 190),
+            on_accent: Color::Black,
+        }
+    }
+
+    /// Colors that match the terminal's scheme, from the foreground and
+    /// background it reports. Accent and text are named ANSI colors, which the
+    /// terminal draws in its own scheme; the shades ANSI has no color for are
+    /// blends of its background and foreground.
+    pub fn from_terminal(fg: (u8, u8, u8), bg: (u8, u8, u8)) -> Self {
+        let mix = |t: f32| {
+            let channel = |b: u8, f: u8| (b as f32 + (f as f32 - b as f32) * t).round() as u8;
+            Color::Rgb(channel(bg.0, fg.0), channel(bg.1, fg.1), channel(bg.2, fg.2))
+        };
+        let (r, g, b) = (bg.0 as u32, bg.1 as u32, bg.2 as u32);
+        let dark = (r * 299 + g * 587 + b * 114) / 1000 < 128;
+        Self {
+            accent: Color::Blue,
+            dim: mix(0.5),
+            bg_sel: mix(0.14),
+            bg_sel_dim: mix(0.07),
+            pale: mix(0.75),
+            popup_bg: mix(0.05),
+            // The bright red is the softer one on a dark background.
+            soft_red: if dark { Color::LightRed } else { Color::Red },
+            text: Color::Reset,
+            faded: mix(0.3),
+            on_accent: Color::Rgb(bg.0, bg.1, bg.2),
+        }
+    }
+
+    /// Named ANSI colors only, for a terminal that won't report its colors. It
+    /// draws them in its own scheme, so they match it without being asked.
+    pub fn ansi() -> Self {
+        Self {
+            accent: Color::Blue,
+            dim: Color::DarkGray,
+            bg_sel: Color::DarkGray,
+            bg_sel_dim: Color::DarkGray,
+            pale: Color::Reset,
+            popup_bg: Color::Reset,
+            soft_red: Color::Red,
+            text: Color::Reset,
+            faded: Color::DarkGray,
+            on_accent: Color::Black,
         }
     }
 }
@@ -80,8 +126,8 @@ fn theme_store() -> &'static RwLock<Theme> {
     CURRENT.get_or_init(|| RwLock::new(Theme::dark()))
 }
 
-/// Set the active palette (called from the main loop when the system theme,
-/// or the configured override, resolves to light or dark).
+/// Set the active palette (called from the main loop when the configured
+/// palette or the terminal's colors are known, and when the terminal's change).
 pub fn set_theme(t: Theme) {
     *theme_store().write().unwrap() = t;
 }
@@ -116,6 +162,9 @@ fn text() -> Color {
 }
 fn faded() -> Color {
     theme().faded
+}
+fn on_accent() -> Color {
+    theme().on_accent
 }
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -152,7 +201,7 @@ fn pane_title(title: &str, focused: bool) -> Span<'static> {
     if focused {
         Span::styled(
             format!(" {title} "),
-            Style::default().fg(Color::Black).bg(accent()).add_modifier(Modifier::BOLD),
+            Style::default().fg(on_accent()).bg(accent()).add_modifier(Modifier::BOLD),
         )
     } else {
         Span::styled(format!(" {title} "), Style::default().fg(dim()).add_modifier(Modifier::BOLD))
@@ -357,7 +406,7 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
     let selected = if elsewhere {
         Style::default().fg(dim()).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Black).bg(accent()).add_modifier(Modifier::BOLD)
+        Style::default().fg(on_accent()).bg(accent()).add_modifier(Modifier::BOLD)
     };
     let tabs = Tabs::new(titles)
         .select(sel)
@@ -395,7 +444,7 @@ fn screen_tab(
     let at = Rect { x: *right - width, width, ..area };
     *right = at.x;
     let style = if active {
-        Style::default().fg(Color::Black).bg(accent()).add_modifier(Modifier::BOLD)
+        Style::default().fg(on_accent()).bg(accent()).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(dim())
     };

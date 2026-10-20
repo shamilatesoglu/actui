@@ -24,7 +24,7 @@ A terminal UI for GitHub Actions across all the repos and orgs your account can 
   included.
 - The runner each job runs on, with its labels.
 - A desktop notification and terminal bell when a run finishes.
-- Light and dark themes, following the terminal's background.
+- Colors that match your terminal's scheme, light or dark.
 - Pane and column widths you drag stay set between sessions.
 - Light on the API: conditional requests (a `304` doesn't count against the rate
   limit), fast polling only while runs are active, and a pause when GitHub
@@ -66,7 +66,7 @@ max_repos           = 60      # most recently pushed repos to watch (0 = all)
 skip_archived       = true
 notify              = true    # desktop notification when a run finishes
 bell                = true    # terminal bell when a run finishes
-theme               = "auto"  # or "dark" / "light"
+theme               = "auto"  # match the terminal's colors, or "dark" / "light"
 sidebar             = true    # show the repos sidebar
 sort                = "alpha" # sidebar order after pinned repos, or "used"
 pinned              = []      # e.g. ["my-org/api"]
