@@ -3,6 +3,7 @@
 //! lives here; the floating modal overlays are in the `overlays` submodule.
 
 mod overlays;
+mod prs;
 mod repos;
 #[cfg(test)]
 mod screenshot;
@@ -16,6 +17,7 @@ use crate::github::{Job, Run, RunState, RunTag, Step};
 use ansi_to_tui::IntoText;
 use chrono::{DateTime, Utc};
 use overlays::*;
+use prs::draw_prs_pane;
 use repos::draw_repos;
 use timing::draw_timing_pane;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
@@ -253,6 +255,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.hit.tabs = chunks[1];
     app.hit.runners_tab = Rect::default();
     app.hit.timing_tab = Rect::default();
+    app.hit.prs_tab = Rect::default();
     // Cleared here so stale rects can't take clicks in the views that drop the
     // panes; draw_repos and draw_body set them again when they draw.
     app.hit.repos = Rect::default();
@@ -395,7 +398,7 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
 /// The tabs row: which runs you're filtering to on the left, and which screen
 /// you're on over on the right.
 fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
-    let elsewhere = app.mode == Mode::Runners || app.mode == Mode::Timing;
+    let elsewhere = matches!(app.mode, Mode::Runners | Mode::Timing | Mode::Prs);
     let titles: Vec<Line> = Filter::ALL
         .iter()
         .map(|filt| Line::from(filt.tab_title()))
@@ -425,6 +428,11 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
         screen_tab(f, &mut right, floor, area, " ⚙ Runners  s ", app.mode == Mode::Runners);
     app.hit.timing_tab =
         screen_tab(f, &mut right, floor, area, " ◷ Duration  w ", app.mode == Mode::Timing);
+    let prs_label = match app.prs.list.waiting() {
+        0 => " ⇄ PRs  P ".to_string(),
+        n => format!(" ⇄ PRs {n}  P "),
+    };
+    app.hit.prs_tab = screen_tab(f, &mut right, floor, area, &prs_label, app.mode == Mode::Prs);
 }
 
 /// Draw one screen switcher ending at `right`, moving `right` left past it.
@@ -458,6 +466,13 @@ fn draw_body(f: &mut Frame, app: &mut App, area: Rect) {
         app.hit.body = area;
         let (rest, dividers) = draw_sidebar(f, app, area);
         draw_runners_pane(f, app, rest);
+        app.panes.record_dividers(&dividers);
+        return;
+    }
+    if app.mode == Mode::Prs {
+        app.hit.body = area;
+        let (rest, dividers) = draw_sidebar(f, app, area);
+        draw_prs_pane(f, app, rest);
         app.panes.record_dividers(&dividers);
         return;
     }
@@ -1177,6 +1192,11 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             owned(&["org self-hosted runners", "j/k move", "⏎ details", "o open on GitHub", "r refresh"]),
             vec!["Esc back"],
         )
+    } else if app.mode == Mode::Prs {
+        (
+            owned(&["pull requests", "j/k move", "o open on GitHub", "r refresh"]),
+            vec!["Esc back"],
+        )
     } else if app.mode == Mode::Timing {
         (
             owned(&[
@@ -1231,6 +1251,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                     "x/X rerun",
                     "A artifacts",
                     "s runners",
+                    "P PRs",
                     "w durations",
                     "p repos",
                 ]));
@@ -2312,6 +2333,97 @@ mod tests {
                 assert_eq!(app.filter, filt, "column {x} of {title:?}");
             }
         }
+    }
+
+    fn pr(repo: &str, number: u64, title: &str) -> crate::pulls::model::PrSummary {
+        use crate::pulls::model::*;
+        PrSummary {
+            pr: PrRef { repo: repo.into(), number },
+            node_id: format!("PR_{number}"),
+            title: title.into(),
+            author: "ana".into(),
+            updated_at: Utc::now(),
+            draft: false,
+            checks: ChecksState::Failing,
+            review: ReviewDecision::ChangesRequested,
+        }
+    }
+
+    fn prs_app() -> App {
+        use crate::app::{DataMsg, PrMsg};
+        use crate::pulls::model::PrGroup;
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut app = demo_app();
+        app.handle_key(KeyEvent::from(KeyCode::Char('P')));
+        app.apply(DataMsg::Pr(PrMsg::List {
+            group: PrGroup::ReviewRequested,
+            result: Ok(vec![pr("org/api", 7, "Fix login")]),
+        }));
+        app.apply(DataMsg::Pr(PrMsg::List { group: PrGroup::Authored, result: Ok(vec![]) }));
+        app
+    }
+
+    #[test]
+    fn p_opens_the_prs_screen_with_both_groups() {
+        let mut app = prs_app();
+        let out = screen(&mut app, 140, 24);
+        println!("{out}");
+        assert!(out.contains("Review requested"));
+        assert!(out.contains("api#7"));
+        assert!(out.contains("Fix login"));
+        assert!(out.contains("changes requested"));
+        assert!(out.contains("Opened by you  none"));
+        assert!(out.contains("⇄ PRs 1  P"), "the tab counts what waits on you");
+    }
+
+    #[test]
+    fn the_tabs_row_switches_to_the_prs_screen() {
+        let mut app = demo_app();
+        let out = screen(&mut app, 140, 24);
+        assert!(out.contains("⇄ PRs  P"), "no count while nothing waits");
+        let row = row_of(&out, "⇄ PRs");
+        let at = column_of(out.lines().nth(row as usize).unwrap(), "⇄ PRs") as u16;
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), at, row));
+        assert!(matches!(app.mode, crate::app::Mode::Prs));
+        assert!(matches!(app.pending.last(), Some(crate::app::Command::Pr(crate::app::PrCommand::FetchList))));
+
+        // A filter tab goes back to the runs.
+        let out = screen(&mut app, 140, 24);
+        let row = row_of(&out, "Running");
+        let at = column_of(out.lines().nth(row as usize).unwrap(), "Running") as u16;
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), at, row));
+        assert!(matches!(app.mode, crate::app::Mode::Normal));
+    }
+
+    #[test]
+    fn the_prs_keys_open_refresh_and_leave() {
+        use crate::app::{Command, Mode};
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut app = prs_app();
+        screen(&mut app, 140, 24);
+        app.pending.clear();
+        app.handle_key(KeyEvent::from(KeyCode::Char('o')));
+        assert!(matches!(&app.pending[..], [Command::OpenUrl(u)] if u == "https://github.com/org/api/pull/7"));
+        app.pending.clear();
+        app.handle_key(KeyEvent::from(KeyCode::Char('r')));
+        assert!(matches!(&app.pending[..], [Command::Pr(_)]));
+        app.handle_key(KeyEvent::from(KeyCode::Char('4')));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.filter, crate::app::Filter::Failed);
+        app.handle_key(KeyEvent::from(KeyCode::Char('P')));
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn a_failed_search_shows_in_its_header_and_the_status_line() {
+        use crate::app::{DataMsg, PrMsg};
+        use crate::pulls::model::PrGroup;
+        let mut app = prs_app();
+        app.apply(DataMsg::Pr(PrMsg::List { group: PrGroup::Authored, result: Err("502".into()) }));
+        let out = screen(&mut app, 140, 24);
+        assert!(out.contains("Opened by you  none"), "the shown list stays");
+        assert!(out.contains("Opened by you: 502"), "and the error is reported");
     }
 
     #[test]

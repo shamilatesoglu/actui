@@ -8,6 +8,7 @@ mod logs;
 mod overlays;
 mod panes;
 mod protocol;
+mod prs;
 mod repos;
 mod timing;
 
@@ -19,6 +20,7 @@ pub use timing::{Layout as TimingLayout, Stats as TimingStats, TimingView};
 use timing::History as TimingHistory;
 pub(crate) use timing::HISTORY as TIMING_HISTORY;
 pub use protocol::{AnnJob, Command, DataMsg, Fetch};
+pub use prs::*;
 pub(crate) use logs::{is_error_line, log_content};
 
 use crate::config::Config;
@@ -124,6 +126,8 @@ pub struct HitMap {
     pub tabs: Rect,
     /// The runners switcher, right-aligned on that same row.
     pub runners_tab: Rect,
+    /// The PRs switcher, left of the duration one.
+    pub prs_tab: Rect,
     /// Repos sidebar content (empty when the sidebar isn't drawn).
     pub repos: Rect,
     /// The whole body, spanning every pane — what a divider drag measures
@@ -137,6 +141,8 @@ pub struct HitMap {
     pub timing_tab: Rect,
     /// Org-runners pane content (for click-to-select).
     pub runners_pane: Rect,
+    /// PRs list content (for click-to-select).
+    pub prs_pane: Rect,
     /// The chart's plot area (for click-to-select a column).
     pub timing_plot: Rect,
     /// Logs viewport height — the page size for PgUp/PgDn.
@@ -158,6 +164,7 @@ pub enum Mode {
     RefPicker,
     Runners,
     Timing,
+    Prs,
 }
 
 /// The answer to "what did this run put on its commit?".
@@ -227,6 +234,7 @@ pub struct App {
     pub pending_log_search: Option<String>,
     pub ref_picker: Option<RefPicker>,
     pub runners: Option<RunnersView>,
+    pub prs: PrsState,
     /// The duration chart, and one workflow's successful runs cached by
     /// workflow id — the conditional refetch answers `304` for a workflow we
     /// have already read, so without the cache re-opening it would show nothing.
@@ -312,6 +320,7 @@ impl App {
             pending_log_search: None,
             ref_picker: None,
             runners: None,
+            prs: PrsState::default(),
             timing: None,
             timing_cache: HashMap::new(),
             pending_action: None,
@@ -401,7 +410,7 @@ impl App {
         }
     }
 
-    fn set_status(&mut self, msg: impl Into<String>, is_err: bool) {
+    pub(super) fn set_status(&mut self, msg: impl Into<String>, is_err: bool) {
         self.status_msg = Some((msg.into(), is_err, Instant::now()));
     }
 
@@ -635,6 +644,7 @@ impl App {
                     rv.set_groups(groups);
                 }
             }
+            DataMsg::Pr(m) => self.apply_pr(m),
             DataMsg::DispatchFailed { placeholder_id, err } => {
                 let keep = self.run_to_keep();
                 self.pending_dispatches.retain(|p| p.id != placeholder_id);
@@ -1130,6 +1140,7 @@ impl App {
             return;
         }
         self.pending.push(Command::Refresh { deep: self.repos.scope().map(str::to_string) });
+        self.pending.push(Command::Pr(PrCommand::FetchList));
         self.queue_selected_jobs();
     }
 

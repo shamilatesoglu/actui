@@ -21,13 +21,16 @@ struct GraphqlError {
     message: String,
 }
 
-/// Returns the `data` of a GraphQL response, or the first error's message.
+/// Returns the `data` of a GraphQL response. Errors next to data are partial
+/// failures (a SAML-protected org in a search, say) and the data is still
+/// worth showing. Without data, the first error's message is returned.
 fn parse_graphql<T: DeserializeOwned>(body: &str) -> Result<T> {
     let resp: GraphqlResponse<T> = serde_json::from_str(body).context("bad GraphQL response")?;
-    if let Some(first) = resp.errors.into_iter().next() {
-        return Err(anyhow!(first.message));
+    match (resp.data, resp.errors.into_iter().next()) {
+        (Some(data), _) => Ok(data),
+        (None, Some(first)) => Err(anyhow!(first.message)),
+        (None, None) => Err(anyhow!("GraphQL response has no data")),
     }
-    resp.data.ok_or_else(|| anyhow!("GraphQL response has no data"))
 }
 
 impl Github {
@@ -151,16 +154,19 @@ impl From<PrNode> for PrSummary {
 }
 
 /// Turns search results into summaries. Nodes that aren't pull requests
-/// come back as `{}` and are skipped.
+/// come back as `{}` and are skipped. Any other node that doesn't parse is
+/// an error, so a pull request never drops out of the list silently.
 fn parse_search(data: serde_json::Value) -> Result<Vec<PrSummary>> {
     let data: SearchData = serde_json::from_value(data).context("bad search response")?;
-    Ok(data
-        .search
-        .nodes
-        .into_iter()
-        .filter_map(|node| serde_json::from_value::<PrNode>(node).ok())
-        .map(PrSummary::from)
-        .collect())
+    let mut prs = Vec::new();
+    for node in data.search.nodes {
+        if node.as_object().is_some_and(|o| o.is_empty()) {
+            continue;
+        }
+        let node: PrNode = serde_json::from_value(node).context("bad pull request in search")?;
+        prs.push(PrSummary::from(node));
+    }
+    Ok(prs)
 }
 
 #[cfg(test)]
@@ -172,6 +178,20 @@ mod tests {
         let body = r#"{"data":null,"errors":[{"message":"Field 'nope' doesn't exist"}]}"#;
         let err = parse_graphql::<serde_json::Value>(body).unwrap_err();
         assert_eq!(err.to_string(), "Field 'nope' doesn't exist");
+    }
+
+    #[test]
+    fn data_next_to_errors_is_returned() {
+        let body = r#"{"data":{"n":1},"errors":[{"message":"SAML enforcement"}]}"#;
+        let data = parse_graphql::<serde_json::Value>(body).unwrap();
+        assert_eq!(data["n"], 1);
+    }
+
+    #[test]
+    fn a_node_that_fails_to_parse_is_an_error() {
+        let data = serde_json::json!({"search":{"nodes":[{"id":"PR_1","number":"twelve"}]}});
+        let err = parse_search(data).unwrap_err();
+        assert_eq!(err.to_string(), "bad pull request in search");
     }
 
     #[test]

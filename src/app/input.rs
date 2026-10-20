@@ -35,6 +35,7 @@ impl App {
             Mode::RefPicker => self.key_ref_picker(key),
             Mode::Runners => self.key_runners(key),
             Mode::Timing => self.key_timing(key),
+            Mode::Prs => self.key_prs(key),
         }
     }
 
@@ -213,6 +214,10 @@ impl App {
                 }
                 true
             }
+            Mode::Prs => {
+                self.prs.list.move_sel(delta);
+                true
+            }
             Mode::Dispatch => {
                 if let Some(d) = &mut self.dispatch {
                     if matches!(d.stage, DispatchStage::SelectWorkflow) {
@@ -237,6 +242,9 @@ impl App {
                 let pos = Position::new(x, y);
                 if self.hit.runners_tab.contains(pos) {
                     self.close_runners();
+                } else if self.hit.prs_tab.contains(pos) {
+                    self.close_runners();
+                    self.open_prs();
                 } else if let Some(filt) = self.filter_tab_at(pos) {
                     self.close_runners();
                     self.set_filter(filt);
@@ -260,6 +268,9 @@ impl App {
                 } else if self.hit.runners_tab.contains(pos) {
                     self.close_timing();
                     self.open_runners();
+                } else if self.hit.prs_tab.contains(pos) {
+                    self.close_timing();
+                    self.open_prs();
                 } else if let Some(filt) = self.filter_tab_at(pos) {
                     self.close_timing();
                     self.set_filter(filt);
@@ -276,10 +287,17 @@ impl App {
                 }
                 true
             }
+            Mode::Prs => {
+                self.click_prs(x, y);
+                true
+            }
             Mode::Normal | Mode::Search => {
                 let pos = Position::new(x, y);
                 if self.hit.runners_tab.contains(pos) {
                     self.open_runners();
+                    true
+                } else if self.hit.prs_tab.contains(pos) {
+                    self.open_prs();
                     true
                 } else if self.hit.timing_tab.contains(pos) {
                     self.open_timing();
@@ -317,7 +335,7 @@ impl App {
     }
 
     /// The filter tab under the pointer, if any.
-    fn filter_tab_at(&self, pos: Position) -> Option<Filter> {
+    pub(super) fn filter_tab_at(&self, pos: Position) -> Option<Filter> {
         if !self.hit.tabs.contains(pos) {
             return None;
         }
@@ -329,7 +347,7 @@ impl App {
     }
 
     /// Select the sidebar row under the pointer.
-    fn click_repo_row(&mut self, y: u16) {
+    pub(super) fn click_repo_row(&mut self, y: u16) {
         self.focus = Focus::Repos;
         let row = self.repos.state.offset() + (y - self.hit.repos.y) as usize;
         if row < self.repos.len() {
@@ -410,6 +428,7 @@ impl App {
             KeyCode::Char('v') => self.open_annotations(),
             KeyCode::Char('d') => self.open_dispatch(),
             KeyCode::Char('s') => self.open_runners(),
+            KeyCode::Char('P') => self.open_prs(),
             KeyCode::Char('w') => self.open_timing(),
             KeyCode::Char('p') => self.toggle_repos_pane(),
             KeyCode::Char('>') => self.resize_repos_pane(2),
@@ -904,7 +923,7 @@ impl App {
         self.set_filter(Filter::ALL[next as usize]);
     }
 
-    fn set_filter(&mut self, f: Filter) {
+    pub(super) fn set_filter(&mut self, f: Filter) {
         self.filter = f;
         self.recompute_view();
     }
@@ -1447,7 +1466,7 @@ impl App {
     /// Open the self-hosted runners view. Fetches runners for the orgs seen
     /// across loaded runs (merged with the user's org memberships by the
     /// worker) and for every watched repo.
-    fn open_runners(&mut self) {
+    pub(super) fn open_runners(&mut self) {
         self.runners = Some(RunnersView::loading());
         self.mode = Mode::Runners;
         self.fetch_runners();
@@ -1536,7 +1555,7 @@ impl App {
 
     /// Open the duration chart for the selected run's workflow. Durations only
     /// compare within one workflow, so the run under the cursor aims it.
-    fn open_timing(&mut self) {
+    pub(super) fn open_timing(&mut self) {
         let Some(run) = self.selected_run() else {
             self.set_status("Select a run - the chart follows its workflow", true);
             return;

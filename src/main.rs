@@ -719,6 +719,7 @@ fn dispatch_commands(app: &mut App, gh: &Github, cfg: &Config, tx: &UnboundedSen
                     Err(e) => { let _ = tx.send(DataMsg::Error(format!("writing {name}: {e}"))); }
                 }
             }
+            Command::Pr(cmd) => pulls::run_command(cmd, gh, tx),
             Command::OpenUrl(url) => {
                 let _ = open::that_detached(&url);
             }

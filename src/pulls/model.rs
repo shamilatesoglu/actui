@@ -16,6 +16,7 @@ impl PrRef {
     }
 
     /// Short form, `owner/name#12`.
+    #[allow(dead_code)] // the PR view's title uses it
     pub fn label(&self) -> String {
         format!("{}#{}", self.repo, self.number)
     }
@@ -72,6 +73,7 @@ pub enum ReviewDecision {
 pub struct PrSummary {
     pub pr: PrRef,
     /// GraphQL node id, used by mutations.
+    #[allow(dead_code)] // nothing mutates yet
     pub node_id: String,
     pub title: String,
     pub author: String,
