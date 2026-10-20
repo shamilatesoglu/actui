@@ -6,6 +6,8 @@ mod diff;
 mod help;
 mod overlays;
 mod overview;
+#[cfg(test)]
+mod tests;
 
 use super::*;
 use crate::app::{App, Loadable, PendingReview, PrRow, PrTab, PrView, PrsState, ReviewPopup, Scroll};
