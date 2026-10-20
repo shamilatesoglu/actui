@@ -832,3 +832,43 @@ fn a_refresh_keeps_the_open_diff_on_its_file_and_the_count_right() {
     app.apply(crate::app::DataMsg::Pr(crate::app::PrMsg::Files { pr, result: Err("502".into()) }));
     assert!(screen(&mut app, 140, 24).contains("Files 1"));
 }
+
+/// The rows `lines` take, drawn all at once in one buffer as tall as needed.
+fn rows_in_one_buffer(lines: &[Line], width: u16) -> usize {
+    let most: usize = lines.iter().map(|l| 2 * l.width().div_ceil(width as usize) + 1).sum();
+    let area = Rect::new(0, 0, width, most.min(u16::MAX as usize) as u16);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    ratatui::widgets::Widget::render(Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false }), area, &mut buf);
+    (0..area.height)
+        .rev()
+        .find(|&y| (0..width).any(|x| buf[(x, y)].symbol() != " "))
+        .map_or(0, |y| y as usize + 1)
+}
+
+#[test]
+fn measuring_a_long_text_a_few_lines_at_a_time_counts_every_row() {
+    // Long, short, empty and blank lines, enough to take several scratch buffers.
+    let words = "lorem ipsum dolor sit amet consectetur adipiscing elit ".repeat(4);
+    let lines: Vec<Line> = (0..2500)
+        .map(|i| match i % 5 {
+            0 => Line::raw(words.clone()),
+            1 => Line::raw(format!("line {i}")),
+            2 => Line::default(),
+            3 => Line::raw("   "),
+            _ => Line::raw("x".repeat(i % 97)),
+        })
+        .collect();
+    for width in [7, 40, 120] {
+        assert_eq!(super::wrapped_rows(&lines, width), rows_in_one_buffer(&lines, width), "width {width}");
+    }
+    let mut ending_empty = lines.clone();
+    ending_empty.extend([Line::default(), Line::default()]);
+    assert_eq!(super::wrapped_rows(&ending_empty, 40), rows_in_one_buffer(&ending_empty, 40));
+}
+
+#[test]
+fn a_line_too_long_to_draw_still_has_its_end_reachable() {
+    let lines = vec![Line::raw("a"), Line::raw("word ".repeat(20_000)), Line::raw("end")];
+    let rows = super::wrapped_rows(&lines, 10);
+    assert!(rows >= rows_in_one_buffer(&lines, 10), "{rows}");
+}

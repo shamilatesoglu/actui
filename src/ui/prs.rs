@@ -125,15 +125,60 @@ fn draw_scrolling_text(
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll.offset(), 0)), area);
 }
 
+/// The most rows measured in one scratch buffer, which bounds its size.
+const MEASURE_ROWS: usize = 2048;
+
+/// The most rows a line can take wrapped to `width`: even breaking every word
+/// mid-way takes under two rows per width's worth.
+fn most_rows(line: &Line, width: u16) -> usize {
+    2 * line.width().div_ceil(width as usize) + 1
+}
+
 /// How many rows `lines` take once wrapped to `width` the way the paragraph
-/// wraps them. Counted by drawing into a scratch buffer, since the word
-/// breaking is the paragraph's own.
+/// wraps them, up to the last row with something on it. Counted by drawing
+/// into a scratch buffer, since the word breaking is the paragraph's own.
+/// Each line wraps on its own, so the lines are drawn a few at a time and
+/// the buffer stays small however long the text is.
 fn wrapped_rows(lines: &[Line], width: u16) -> usize {
     if width == 0 {
         return 0;
     }
-    // Even breaking every word mid-way takes under two rows per width's worth.
-    let most: usize = lines.iter().map(|l| 2 * l.width().div_ceil(width as usize) + 1).sum();
+    let mut total = 0;
+    let (mut start, mut most) = (0, 0);
+    for (i, line) in lines.iter().enumerate() {
+        // Scrolling stops at u16::MAX rows, so there is no use counting on.
+        if total >= u16::MAX as usize {
+            return total;
+        }
+        let line_most = most_rows(line, width);
+        if line_most > MEASURE_ROWS {
+            // Too long for the scratch buffer: its most keeps its end reachable.
+            total += rows_before_mark(&lines[start..i], width) + line_most;
+            (start, most) = (i + 1, 0);
+        } else if most + line_most > MEASURE_ROWS {
+            total += rows_before_mark(&lines[start..i], width);
+            (start, most) = (i, line_most);
+        } else {
+            most += line_most;
+        }
+    }
+    total + rows_drawn(&lines[start..], width)
+}
+
+/// Rows `lines` take, empty ones at the end included: a one-cell line drawn
+/// after them shows where they end.
+fn rows_before_mark(lines: &[Line], width: u16) -> usize {
+    if lines.is_empty() {
+        return 0;
+    }
+    let mut marked = lines.to_vec();
+    marked.push(Line::raw("·"));
+    rows_drawn(&marked, width) - 1
+}
+
+/// Rows `lines` take, up to the last row with something on it.
+fn rows_drawn(lines: &[Line], width: u16) -> usize {
+    let most: usize = lines.iter().map(|l| most_rows(l, width)).sum();
     let area = Rect::new(0, 0, width, most.min(u16::MAX as usize) as u16);
     let mut buf = Buffer::empty(area);
     Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false }).render(area, &mut buf);
