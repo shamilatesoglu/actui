@@ -104,7 +104,7 @@ pub enum PrMsg {
     /// A PR's detail finished reading.
     Detail { pr: PrRef, result: Result<Box<PrDetail>, String> },
     /// The run a check pointed at finished reading.
-    Run(Result<Box<Run>, String>),
+    Run { run_id: u64, result: Result<Box<Run>, String> },
     /// A PR's changed files finished reading.
     Files { pr: PrRef, result: Result<Vec<PrFile>, String> },
     /// A change to a PR finished.

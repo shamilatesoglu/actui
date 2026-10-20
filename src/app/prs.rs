@@ -412,9 +412,10 @@ impl App {
         self.recompute_view_keeping(Some(run_id));
     }
 
-    fn apply_jump_run(&mut self, result: Result<Box<Run>, String>) {
-        let Some(jump) = &self.prs.jump else { return };
-        let run_id = jump.run_id;
+    /// Takes in the read of run `asked`. A read for a run that is no longer
+    /// the visit's is dropped.
+    fn apply_jump_run(&mut self, asked: u64, result: Result<Box<Run>, String>) {
+        let Some(run_id) = self.prs.jump.as_ref().map(|j| j.run_id).filter(|&id| id == asked) else { return };
         let listed = self.runs.iter().any(|r| r.id == run_id);
         match result {
             Ok(run) if run.id == run_id => {
@@ -432,7 +433,11 @@ impl App {
             Err(_) if listed => {}
             Err(e) => {
                 self.prs.jump = None;
-                self.mode = Mode::Prs;
+                // Back to the PR, unless the user has moved on to another
+                // screen or a question since.
+                if self.mode == Mode::Normal {
+                    self.mode = Mode::Prs;
+                }
                 self.set_status(format!("Run {run_id}: {e}"), true);
             }
         }
@@ -476,7 +481,7 @@ impl App {
                 }
                 self.prs.list.set(group, result);
             }
-            PrMsg::Run(result) => self.apply_jump_run(result),
+            PrMsg::Run { run_id, result } => self.apply_jump_run(run_id, result),
             PrMsg::Files { pr, result } => {
                 if !self.prs.open.as_ref().is_some_and(|v| v.pr == pr) {
                     return;
@@ -640,7 +645,7 @@ mod tests {
             matches!(&app.pending[..], [Command::Pr(PrCommand::FetchRun { repo, run_id: 555 })] if repo == "org/api")
         );
 
-        app.apply(DataMsg::Pr(PrMsg::Run(Ok(Box::new(run_in("org/api", 555, "success"))))));
+        app.apply(run_answer(555, Ok(Box::new(run_in("org/api", 555, "success")))));
         assert_eq!(app.selected_run().map(|r| r.id), Some(555));
         assert_eq!(app.filter, Filter::Failed, "the filter is left alone");
     }
@@ -674,7 +679,7 @@ mod tests {
     fn a_sweep_does_not_drop_a_fetched_run() {
         let mut app = app_on_a_pr_with_a_run_check();
         press(&mut app, KeyCode::Enter);
-        app.apply(DataMsg::Pr(PrMsg::Run(Ok(Box::new(run_in("org/api", 555, "success"))))));
+        app.apply(run_answer(555, Ok(Box::new(run_in("org/api", 555, "success")))));
         app.apply(DataMsg::Runs { repo: "org/api".into(), runs: vec![run_in("org/api", 1, "failure")] });
         assert_eq!(app.selected_run().map(|r| r.id), Some(555));
         press(&mut app, KeyCode::Esc);
@@ -685,7 +690,7 @@ mod tests {
     fn esc_from_a_jumped_run_returns_to_the_pr_and_drops_the_stray_run() {
         let mut app = app_on_a_pr_with_a_run_check();
         press(&mut app, KeyCode::Enter);
-        app.apply(DataMsg::Pr(PrMsg::Run(Ok(Box::new(run_in("org/api", 555, "success"))))));
+        app.apply(run_answer(555, Ok(Box::new(run_in("org/api", 555, "success")))));
         assert!(app.runs.iter().any(|r| r.id == 555));
 
         press(&mut app, KeyCode::Esc);
@@ -699,10 +704,60 @@ mod tests {
     fn a_failed_run_fetch_stays_on_the_pr_with_the_error() {
         let mut app = app_on_a_pr_with_a_run_check();
         press(&mut app, KeyCode::Enter);
-        app.apply(DataMsg::Pr(PrMsg::Run(Err("404 Not Found".into()))));
+        app.apply(run_answer(555, Err("404 Not Found".into())));
         assert!(app.mode == Mode::Prs);
         assert!(app.prs.jump.is_none());
         assert!(app.status_msg.as_ref().is_some_and(|(m, err, _)| m.contains("404") && *err));
+    }
+
+    fn run_answer(run_id: u64, result: Result<Box<crate::github::Run>, String>) -> DataMsg {
+        DataMsg::Pr(PrMsg::Run { run_id, result })
+    }
+
+    #[test]
+    fn a_late_failure_for_an_earlier_jump_leaves_the_current_one_alone() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        edit_detail(&mut app, |d| {
+            let second = Check { name: "Lint".into(), state: CheckState::Passed, target: CheckTarget::ActionsRun { run_id: 556 } };
+            d.checks.push(second);
+        });
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('J'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.prs.jump.as_ref().map(|j| j.run_id), Some(556));
+
+        app.apply(run_answer(555, Err("404 Not Found".into())));
+        assert!(app.mode == Mode::Normal, "still on the runs screen");
+        assert_eq!(app.prs.jump.as_ref().map(|j| j.run_id), Some(556));
+        app.apply(run_answer(556, Ok(Box::new(run_in("org/api", 556, "success")))));
+        assert_eq!(app.selected_run().map(|r| r.id), Some(556));
+    }
+
+    #[test]
+    fn a_failed_run_read_leaves_a_question_up() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        with_draft(&mut app);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.mode == Mode::Confirm, "the quit question is up");
+
+        app.apply(run_answer(555, Err("404 Not Found".into())));
+        assert!(app.mode == Mode::Confirm, "the question stays");
+        assert!(app.prs.jump.is_none());
+        press(&mut app, KeyCode::Char('n'));
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn a_quit_question_no_longer_shown_does_not_count_as_asked() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        with_draft(&mut app);
+        app.mode = Mode::Normal;
+        app.pending_action = Some(PendingAction::Quit { unsent: 1 });
+        press(&mut app, KeyCode::Char('q'));
+        assert!(!app.should_quit, "asks instead of quitting");
+        assert!(app.mode == Mode::Confirm);
     }
 
     #[test]

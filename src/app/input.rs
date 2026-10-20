@@ -905,7 +905,8 @@ impl App {
     /// Quits, or asks first when a review is unsent. Asked again while the
     /// question is up, it quits.
     fn quit(&mut self) {
-        if !self.prs.has_unsent() || matches!(self.pending_action, Some(PendingAction::Quit { .. })) {
+        let asked = self.mode == Mode::Confirm && matches!(self.pending_action, Some(PendingAction::Quit { .. }));
+        if !self.prs.has_unsent() || asked {
             self.should_quit = true;
             return;
         }
