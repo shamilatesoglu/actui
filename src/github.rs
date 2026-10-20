@@ -13,6 +13,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const API: &str = "https://api.github.com";
 
+/// How long one request may take, from connecting to its last byte. A request
+/// that hangs would otherwise keep whatever waits on it (a sweep, a review
+/// being sent) waiting for ever.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Artifacts and logs can be large, so their downloads get longer.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 /// Shared rate-limit accounting, updated from response headers.
 #[derive(Default)]
 struct RateState {
@@ -88,6 +95,11 @@ pub struct Github {
 
 impl Github {
     pub fn new(token: &str) -> Result<Self> {
+        Self::build(token, REQUEST_TIMEOUT)
+    }
+
+    /// A client whose requests each fail after `timeout`.
+    fn build(token: &str, timeout: Duration) -> Result<Self> {
         // Auth is applied per request (see `send`) so the token can be refreshed
         // mid-session; only the static headers live on the client.
         let mut headers = HeaderMap::new();
@@ -100,6 +112,7 @@ impl Github {
         let client = Client::builder()
             .default_headers(headers)
             .gzip(true)
+            .timeout(timeout)
             .build()?;
         Ok(Self {
             client,
@@ -141,7 +154,13 @@ impl Github {
     /// Attach the current bearer token and send.
     async fn send_authed(&self, req: RequestBuilder) -> Result<Response> {
         let token = self.token.lock().unwrap().clone();
-        Ok(req.header(AUTHORIZATION, format!("Bearer {token}")).send().await?)
+        req.header(AUTHORIZATION, format!("Bearer {token}")).send().await.map_err(|e| {
+            if e.is_timeout() {
+                anyhow!("GitHub did not answer in time")
+            } else {
+                e.into()
+            }
+        })
     }
 
     /// Re-resolve the token (e.g. after `gh` refreshed it). Returns true on change.
@@ -788,7 +807,8 @@ impl Github {
         let resp = self
             .send(
                 self.client
-                    .get(format!("{API}/repos/{full_name}/actions/artifacts/{artifact_id}/zip")),
+                    .get(format!("{API}/repos/{full_name}/actions/artifacts/{artifact_id}/zip"))
+                    .timeout(DOWNLOAD_TIMEOUT),
             )
             .await?;
         Ok(ensure_ok(resp).await?.bytes().await?.to_vec())
@@ -807,7 +827,7 @@ impl Github {
     /// Plain-text logs for a single job (follows the redirect to the log blob).
     pub async fn job_logs(&self, full_name: &str, job_id: u64) -> Result<String> {
         let resp = self
-            .send(self.client.get(format!("{API}/repos/{full_name}/actions/jobs/{job_id}/logs")))
+            .send(self.client.get(format!("{API}/repos/{full_name}/actions/jobs/{job_id}/logs")).timeout(DOWNLOAD_TIMEOUT))
             .await?;
         Ok(ensure_ok(resp).await?.text().await?)
     }
@@ -1540,6 +1560,16 @@ jobs: {}
         assert!(gh.pause_remaining().is_none(), "runs keep polling");
         gh.record_rate(&rate_headers(Some("graphql"), 4999));
         assert!(!gh.prs_paused(), "a refilled quota resumes");
+    }
+
+    #[tokio::test]
+    async fn a_request_that_gets_no_answer_fails_once_its_time_is_up() {
+        // Takes the connection and never answers it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let gh = Github::build("token", Duration::from_millis(200)).unwrap();
+        let err = gh.send(gh.client.get(url)).await.unwrap_err();
+        assert_eq!(err.to_string(), "GitHub did not answer in time");
     }
 
     #[test]
