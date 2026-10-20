@@ -241,11 +241,14 @@ pub(super) fn open_pr_hints(view: &PrView) -> Vec<String> {
         let at = hints.len() - 2;
         if !detail.draft && detail.merge_status != MergeStatus::Conflicts {
             let key = match detail.queue {
+                QueueState::NoQueue if detail.merge_methods.is_empty() => "",
                 QueueState::NoQueue => "m merge",
                 QueueState::NotQueued => "m queue",
                 QueueState::Queued { .. } => "m unqueue",
             };
-            hints.insert(at, key.to_string());
+            if !key.is_empty() {
+                hints.insert(at, key.to_string());
+            }
         }
         if detail.merge_status == MergeStatus::Behind {
             hints.insert(at, "u update branch".to_string());

@@ -495,7 +495,14 @@ impl App {
             Ok(()) => self.set_status(kind.done_text(), false),
             Err(e) => self.set_status(format!("{}: {e}", pr.label()), true),
         }
-        let Some(view) = self.prs.open.as_mut().filter(|v| v.pr == pr) else { return };
+        let merged = kind == PrActionKind::Merge && result.is_ok();
+        let Some(view) = self.prs.open.as_mut().filter(|v| v.pr == pr) else {
+            // The list still shows a PR merged after its view was closed.
+            if merged {
+                self.pending.push(Command::Pr(PrCommand::FetchList));
+            }
+            return;
+        };
         if let Some((target, text)) = view.inflight.take_if(|(target, _)| target.sends() == kind) {
             if result.is_err() {
                 view.compose = Some(Compose::new(target, &text));
@@ -916,6 +923,52 @@ mod tests {
                 ..
             })] if head_oid == "abc" && branch == "main"
         ));
+    }
+
+    #[test]
+    fn a_refresh_while_the_box_is_open_does_not_change_the_commit_merged() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        edit_detail(&mut app, |d| d.queue = QueueState::NoQueue);
+        press(&mut app, KeyCode::Char('m'));
+        edit_detail(&mut app, |d| d.head.oid = "newer".into());
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            &app.pending[..],
+            [Command::Pr(PrCommand::Act { action: PrAction::Merge { head_oid, .. }, .. })] if head_oid == "abc"
+        ));
+    }
+
+    #[test]
+    fn a_queue_question_keeps_the_commit_it_was_asked_about() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        edit_detail(&mut app, |d| d.queue = QueueState::NotQueued);
+        press(&mut app, KeyCode::Char('m'));
+        edit_detail(&mut app, |d| d.head.oid = "newer".into());
+        press(&mut app, KeyCode::Char('y'));
+        assert!(matches!(
+            &app.pending[..],
+            [Command::Pr(PrCommand::Act { action: PrAction::Enqueue { head_oid, .. }, .. })] if head_oid == "abc"
+        ));
+    }
+
+    #[test]
+    fn a_fork_is_recognised_whatever_the_case_of_its_name() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        edit_detail(&mut app, |d| {
+            d.queue = QueueState::NoQueue;
+            d.head.repo = "Org/API".into();
+        });
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(merge_dialog(&app).delete_branch, Some(false));
+    }
+
+    #[test]
+    fn a_merge_finishing_after_the_view_closed_refreshes_the_list() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        let pr = app.prs.open.as_ref().unwrap().pr.clone();
+        app.prs.open = None;
+        app.apply(DataMsg::Pr(PrMsg::ActDone { pr, kind: PrActionKind::Merge, result: Ok(()) }));
+        assert!(matches!(&app.pending[..], [Command::Pr(PrCommand::FetchList)]));
     }
 
     #[test]

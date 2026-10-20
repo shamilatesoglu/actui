@@ -2599,6 +2599,12 @@ mod tests {
             app.apply(DataMsg::Pr(PrMsg::Detail { pr: pr.clone(), result: Ok(Box::new(detail.clone())) }));
             assert!(screen(&mut app, 200, 24).contains(hint), "{hint}");
         }
+        detail.queue = QueueState::NoQueue;
+        detail.merge_methods.clear();
+        app.apply(DataMsg::Pr(PrMsg::Detail { pr: pr.clone(), result: Ok(Box::new(detail.clone())) }));
+        assert!(!screen(&mut app, 200, 24).contains("m merge"), "not offered when no method is allowed");
+
+        detail.queue = QueueState::Queued { position: 1 };
         detail.draft = true;
         app.apply(DataMsg::Pr(PrMsg::Detail { pr, result: Ok(Box::new(detail)) }));
         assert!(!screen(&mut app, 200, 24).contains("m unqueue"), "not offered on a draft");

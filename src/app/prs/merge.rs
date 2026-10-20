@@ -13,6 +13,9 @@ pub struct MergeDialog {
     /// Whether to delete the branch after merging. `None` when the branch is
     /// in a fork, which this token can't delete from.
     pub delete_branch: Option<bool>,
+    /// The head commit as of opening the box. A refresh while it is open must
+    /// not change what gets merged, so this is what the merge is checked against.
+    pub head_oid: String,
 }
 
 impl MergeDialog {
@@ -21,7 +24,8 @@ impl MergeDialog {
         MergeDialog {
             methods: detail.merge_methods.clone(),
             sel: 0,
-            delete_branch: (detail.head.repo == repo).then_some(false),
+            delete_branch: detail.head.repo.eq_ignore_ascii_case(repo).then_some(false),
+            head_oid: detail.head.oid.clone(),
         }
     }
 
@@ -94,7 +98,7 @@ impl App {
         let Some(dialog) = view.merge_dialog.take() else { return };
         let (Some(method), Loadable::Ready(detail)) = (dialog.method(), &view.detail) else { return };
         let delete_branch = (dialog.delete_branch == Some(true)).then(|| detail.head.branch.clone());
-        let action = PrAction::Merge { method, head_oid: detail.head.oid.clone(), delete_branch };
+        let action = PrAction::Merge { method, head_oid: dialog.head_oid.clone(), delete_branch };
         let pr = view.pr.clone();
         self.pending.push(Command::Pr(PrCommand::Act { pr, action }));
         self.set_status("Merging…", false);
