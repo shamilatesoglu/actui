@@ -327,11 +327,20 @@ impl FileStatus {
 pub struct PrFile {
     pub path: String,
     /// Where a renamed file was before.
-    #[allow(dead_code)] // not shown yet
     pub previous_path: Option<String>,
     pub status: FileStatus,
     pub additions: u32,
     pub deletions: u32,
     /// The unified diff. GitHub leaves it out for binary and very large files.
     pub patch: Option<String>,
+}
+
+impl PrFile {
+    /// The path as shown: `old → new` for a renamed or copied file.
+    pub fn display_path(&self) -> String {
+        match (&self.previous_path, self.status) {
+            (Some(old), FileStatus::Renamed | FileStatus::Copied) => format!("{old} → {}", self.path),
+            _ => self.path.clone(),
+        }
+    }
 }

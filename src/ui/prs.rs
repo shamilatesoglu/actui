@@ -67,14 +67,9 @@ pub(super) fn draw_open_pr(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(title)), title_row);
     f.render_widget(Paragraph::new(tab_strip(view.tab, &detail, &view.files.files)), tabs_row);
 
-    // The files come from their own read, so the tab shows without the detail
-    // and only borrows its review threads.
+    // The files come from their own read, so the tab shows without the detail.
     if view.tab == PrTab::Files {
-        let threads = match &detail {
-            Loadable::Ready(d) => d.threads.as_slice(),
-            _ => &[],
-        };
-        draw_files(f, view, threads, body, spin);
+        draw_files(f, view, body, spin);
         view.detail = detail;
         return;
     }

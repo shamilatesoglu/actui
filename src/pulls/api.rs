@@ -551,7 +551,13 @@ impl Github {
                 self.pr_files_cache.lock().unwrap().insert(key.clone(), page.clone());
                 page
             }
-            Cond::NotModified => self.pr_files_cache.lock().unwrap().get(&key).cloned().unwrap_or_default(),
+            Cond::NotModified => self
+                .pr_files_cache
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| anyhow!("GitHub says the files are unchanged, but none were kept"))?,
         };
         let first: Vec<RawFile> = serde_json::from_value(first).context("bad files response")?;
         let mut files: Vec<PrFile> = first.into_iter().map(PrFile::from).collect();

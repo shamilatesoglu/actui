@@ -2,8 +2,8 @@
 //! the right. Borrows the palette accessors and `pane` from the `ui` module.
 
 use super::*;
-use crate::app::{thread_rows, DiffLine, DiffView, FilesState, PrView};
-use crate::pulls::model::{FileStatus, PrFile, ReviewThread};
+use crate::app::{DiffLine, DiffView, FilesState, PrView};
+use crate::pulls::model::{FileStatus, PrFile};
 use ratatui::widgets::ListState;
 
 /// Widest the file list grows to.
@@ -13,8 +13,8 @@ const MARKER_WIDTH: usize = 4;
 /// What a tab character is drawn as.
 const TAB: &str = "    ";
 
-pub(super) fn draw_files(f: &mut Frame, view: &mut PrView, threads: &[ReviewThread], area: Rect, spin: &'static str) {
-    let FilesState { files, sel, diff } = &mut view.files;
+pub(super) fn draw_files(f: &mut Frame, view: &mut PrView, area: Rect, spin: &'static str) {
+    let FilesState { files, sel, diff, .. } = &mut view.files;
     let files = match files {
         Loadable::Loading => {
             let line = Line::styled(format!("{spin} loading…"), Style::default().fg(dim()));
@@ -39,14 +39,25 @@ pub(super) fn draw_files(f: &mut Frame, view: &mut PrView, threads: &[ReviewThre
     let Some(file) = shown.and_then(|at| files.get(at)) else { return };
     match (&file.patch, diff) {
         (None, _) => {
-            let text = "GitHub doesn't send this diff (binary or too large). o opens it on github.com.";
+            let text = no_patch_text(file);
             f.render_widget(Paragraph::new(text).style(Style::default().fg(dim())).wrap(Wrap { trim: false }), right);
         }
         (Some(_), None) => {
-            let line = Line::styled(format!("{}  Enter opens the diff", file.path), Style::default().fg(dim()));
+            let line = Line::styled(format!("{}  Enter opens the diff", file.display_path()), Style::default().fg(dim()));
             f.render_widget(Paragraph::new(line), right);
         }
-        (Some(_), Some(diff)) => draw_diff(f, diff, file, threads, right),
+        (Some(_), Some(diff)) => draw_diff(f, diff, file, right),
+    }
+}
+
+/// Why there is no diff to show for a file GitHub sent no patch for.
+fn no_patch_text(file: &PrFile) -> String {
+    let untouched = file.additions == 0 && file.deletions == 0;
+    match (&file.previous_path, file.status) {
+        (Some(old), FileStatus::Renamed) if untouched => format!("Renamed from {old} with no content changes."),
+        (Some(old), FileStatus::Copied) if untouched => format!("Copied from {old} with no content changes."),
+        _ => "GitHub doesn't send this diff (binary, too large, or no text changes). o opens it on github.com."
+            .to_string(),
     }
 }
 
@@ -75,7 +86,7 @@ fn file_line(file: &PrFile, width: usize) -> Line<'static> {
     // On a narrow list the numbers give way before the path does.
     let show_stats = width >= 2 + 2 + stats_width + 8;
     let path_width = width.saturating_sub(2 + if show_stats { 2 + stats_width } else { 0 });
-    let path = clip_left(&file.path, path_width);
+    let path = clip_left(&file.display_path(), path_width);
     let pad = " ".repeat(path_width.saturating_sub(path.chars().count()));
     let mut spans = vec![
         Span::styled(file.status.letter().to_string(), Style::default().fg(status_color(file.status))),
@@ -115,9 +126,9 @@ fn search_text(diff: &DiffView) -> Option<String> {
     Some(format!("  /{}{cursor}{found}", diff.search))
 }
 
-fn draw_diff(f: &mut Frame, diff: &mut DiffView, file: &PrFile, threads: &[ReviewThread], area: Rect) {
+fn draw_diff(f: &mut Frame, diff: &mut DiffView, file: &PrFile, area: Rect) {
     let [head, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
-    let mut title = vec![Span::styled(file.path.clone(), Style::default().add_modifier(Modifier::BOLD))];
+    let mut title = vec![Span::styled(file.display_path(), Style::default().add_modifier(Modifier::BOLD))];
     if let Some(search) = search_text(diff) {
         title.push(Span::styled(search, Style::default().fg(accent())));
     }
@@ -134,12 +145,11 @@ fn draw_diff(f: &mut Frame, diff: &mut DiffView, file: &PrFile, threads: &[Revie
     }
     diff.scroll = diff.scroll.min(diff.lines.len().saturating_sub(rows));
 
-    let on_row = thread_rows(&diff.lines, threads, &file.path);
     let marked = diff.mark.map(|m| m.min(diff.cursor)..=m.max(diff.cursor));
     let end = (diff.scroll + rows).min(diff.lines.len());
     let lines: Vec<Line> = (diff.scroll..end)
         .map(|i| {
-            let threads_here = on_row.get(&i).map_or(0, Vec::len);
+            let threads_here = diff.thread_rows.get(&i).map_or(0, Vec::len);
             let style = if i == diff.cursor {
                 select_style(true)
             } else if marked.as_ref().is_some_and(|r| r.contains(&i)) {

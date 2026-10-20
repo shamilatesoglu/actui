@@ -77,7 +77,15 @@ impl App {
                 let url = if no_diff { format!("{}/files", view.pr.url()) } else { view.pr.url() };
                 self.pending.push(Command::OpenUrl(url));
             }
-            KeyCode::Char('r') => self.queue_pr_refresh(),
+            KeyCode::Char('r') => {
+                // The timer leaves the files alone off their tab, but a refresh asks for everything.
+                let files_too = view.tab != PrTab::Files && matches!(view.files.files, Loadable::Ready(_));
+                let pr = view.pr.clone();
+                self.queue_pr_refresh();
+                if files_too {
+                    self.pending.push(Command::Pr(PrCommand::FetchFiles(pr)));
+                }
+            }
             KeyCode::Char('j') | KeyCode::Down if view.tab == PrTab::Overview => view.scroll_overview(1),
             KeyCode::Char('k') | KeyCode::Up if view.tab == PrTab::Overview => view.scroll_overview(-1),
             KeyCode::Char('J') if view.tab == PrTab::Overview => view.move_check(1),
@@ -89,8 +97,8 @@ impl App {
 
     /// Reads the files when the Files tab has just come up without them.
     fn fetch_files_if_shown(&mut self) {
-        let Some(view) = &self.prs.open else { return };
-        if view.tab == PrTab::Files && !matches!(view.files.files, Loadable::Ready(_)) {
+        let Some(view) = &mut self.prs.open else { return };
+        if view.tab == PrTab::Files && view.files.needs_fetch() {
             self.pending.push(Command::Pr(PrCommand::FetchFiles(view.pr.clone())));
         }
     }
@@ -132,7 +140,10 @@ impl App {
             KeyCode::PageUp => files.move_sel(-PAGE),
             KeyCode::Char('g') | KeyCode::Home => files.move_sel(i32::MIN),
             KeyCode::Char('G') | KeyCode::End => files.move_sel(i32::MAX),
-            KeyCode::Enter | KeyCode::Char('l') => files.open_selected(),
+            KeyCode::Enter | KeyCode::Char('l') => {
+                files.open_selected();
+                view.sync_threads();
+            }
             _ => return false,
         }
         true

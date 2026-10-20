@@ -2592,7 +2592,6 @@ mod tests {
         let files = vec![pr_file("src/a.rs", Some("@@ -1 +1 @@\n-a\n+b")), pr_file("README.md", None)];
         app.apply(crate::app::DataMsg::Pr(crate::app::PrMsg::Files { pr, result: Ok(files) }));
         let out = screen(&mut app, 140, 24);
-        println!("{out}");
         assert!(out.contains("Files 2"));
         assert!(out.contains("M src/a.rs"));
         assert!(out.contains("+3 \u{2212}1"));
@@ -2614,7 +2613,6 @@ mod tests {
         let mut app = files_app(vec![pr_file("src/a.rs", Some(&patch))]);
         press(&mut app, KeyCode::Enter);
         let out = screen(&mut app, 100, 24);
-        println!("{out}");
         assert!(out.contains("    let x = 1;"));
         assert!(!out.contains("END"), "the long line is cut at the pane");
         let long = out.lines().find(|l| l.contains("xxxxxxxx")).unwrap();
@@ -2628,12 +2626,96 @@ mod tests {
         use crossterm::event::KeyCode;
         let mut app = files_app(vec![pr_file("logo.png", None)]);
         let out = screen(&mut app, 160, 24);
-        assert!(out.contains("GitHub doesn't send this diff (binary or too large). o opens it on github.com."), "{out}");
+        assert!(
+            out.contains("GitHub doesn't send this diff (binary, too large, or no text changes). o opens it on github.com."),
+            "{out}"
+        );
         press(&mut app, KeyCode::Enter);
         assert!(screen(&mut app, 160, 24).contains("GitHub doesn't send this diff"));
         app.pending.clear();
         press(&mut app, KeyCode::Char('o'));
         assert!(matches!(&app.pending[..], [Command::OpenUrl(u)] if u == "https://github.com/org/api/pull/7/files"));
+    }
+
+    #[test]
+    fn a_pure_rename_names_the_old_path_and_has_no_missing_diff_message() {
+        use crate::pulls::model::FileStatus;
+        let mut renamed = pr_file("src/new.rs", None);
+        renamed.previous_path = Some("src/old.rs".into());
+        renamed.status = FileStatus::Renamed;
+        renamed.additions = 0;
+        renamed.deletions = 0;
+        let mut app = files_app(vec![renamed]);
+        let out = screen(&mut app, 160, 24);
+        assert!(out.contains("R src/old.rs \u{2192} src/new.rs"), "{out}");
+        assert!(out.contains("Renamed from src/old.rs with no content changes."), "{out}");
+        assert!(!out.contains("GitHub doesn't send"));
+    }
+
+    #[test]
+    fn a_renamed_file_with_changes_shows_old_to_new_in_the_diff_header() {
+        use crate::pulls::model::FileStatus;
+        use crossterm::event::KeyCode;
+        let mut renamed = pr_file("src/new.rs", Some("@@ -1 +1 @@\n-a\n+b"));
+        renamed.previous_path = Some("src/old.rs".into());
+        renamed.status = FileStatus::Renamed;
+        let mut app = files_app(vec![renamed]);
+        press(&mut app, KeyCode::Enter);
+        let out = screen(&mut app, 160, 24);
+        assert!(out.matches("src/old.rs \u{2192} src/new.rs").count() >= 2, "{out}");
+    }
+
+    #[test]
+    fn a_detail_refresh_that_adds_a_thread_marks_the_open_diff() {
+        use crate::app::{DataMsg, PrMsg};
+        use crate::pulls::model::{ReviewThread, Side};
+        use crossterm::event::KeyCode;
+        let mut app = files_app(vec![pr_file("a.rs", Some("@@ -1 +1 @@\n-a\n+b"))]);
+        press(&mut app, KeyCode::Enter);
+        assert!(!screen(&mut app, 140, 24).contains('\u{1F4AC}'));
+        let mut detail = pr_detail();
+        detail.threads = vec![ReviewThread {
+            id: "T".into(),
+            resolved: false,
+            outdated: false,
+            path: "a.rs".into(),
+            line: Some(1),
+            start_line: None,
+            side: Side::Right,
+            comments: vec![],
+        }];
+        let pr = app.prs.open.as_ref().unwrap().pr.clone();
+        app.apply(DataMsg::Pr(PrMsg::Detail { pr, result: Ok(Box::new(detail)) }));
+        assert!(screen(&mut app, 140, 24).contains('\u{1F4AC}'));
+    }
+
+    #[test]
+    fn files_are_read_again_only_on_their_tab_or_on_r() {
+        use crate::app::{Command, PrCommand};
+        use crossterm::event::KeyCode;
+        let mut app = prs_app();
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Tab);
+        let fetches = |app: &App| {
+            app.pending.iter().filter(|c| matches!(c, Command::Pr(PrCommand::FetchFiles(_)))).count()
+        };
+        assert_eq!(fetches(&app), 1);
+        // Away and back while the first read is still out: no second one.
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(fetches(&app), 1);
+
+        let pr = app.prs.open.as_ref().unwrap().pr.clone();
+        app.apply(crate::app::DataMsg::Pr(crate::app::PrMsg::Files { pr, result: Ok(vec![]) }));
+        app.pending.clear();
+        app.queue_pr_refresh();
+        assert_eq!(fetches(&app), 1, "the timer reads them on the Files tab");
+        press(&mut app, KeyCode::BackTab);
+        app.pending.clear();
+        app.queue_pr_refresh();
+        assert_eq!(fetches(&app), 0, "but not from the Overview tab");
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(fetches(&app), 1, "r reads everything");
     }
 
     #[test]

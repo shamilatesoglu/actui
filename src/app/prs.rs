@@ -5,7 +5,7 @@ mod diff;
 mod input;
 mod protocol;
 
-pub use diff::{thread_rows, DiffLine, DiffView, FilesState};
+pub use diff::{DiffLine, DiffView, FilesState};
 pub use protocol::{PrCommand, PrMsg};
 
 use super::{App, Command, CursorHold, Focus, Mode};
@@ -192,6 +192,13 @@ impl PrView {
         self.tab = PrTab::ALL[(at + delta).rem_euclid(PrTab::ALL.len() as i32) as usize];
     }
 
+    /// Looks up the open diff's review threads in the current detail.
+    pub fn sync_threads(&mut self) {
+        if let Loadable::Ready(detail) = &self.detail {
+            self.files.sync_threads(&detail.threads);
+        }
+    }
+
     pub fn scroll_overview(&mut self, delta: i32) {
         let next = (self.overview_scroll as i32 + delta).clamp(0, self.overview_max_scroll as i32);
         self.overview_scroll = next as u16;
@@ -215,6 +222,7 @@ impl PrView {
                 let kept = self.checks.selected().filter(|&i| i < detail.checks.len());
                 self.checks.select(kept.or(if detail.checks.is_empty() { None } else { Some(0) }));
                 self.detail = Loadable::Ready(detail);
+                self.sync_threads();
             }
             Err(e) if !matches!(self.detail, Loadable::Ready(_)) => self.detail = Loadable::Failed(e),
             Err(_) => {}
@@ -256,8 +264,8 @@ impl App {
     pub fn queue_pr_refresh(&mut self) {
         if let Some(view) = &self.prs.open {
             self.pending.push(Command::Pr(PrCommand::FetchDetail(view.pr.clone())));
-            // The files are read again once they have been asked for.
-            if view.tab == PrTab::Files || matches!(view.files.files, Loadable::Ready(_)) {
+            // Only the Files tab keeps its files fresh; elsewhere they cost quota for nothing.
+            if view.tab == PrTab::Files {
                 self.pending.push(Command::Pr(PrCommand::FetchFiles(view.pr.clone())));
             }
         }
@@ -355,6 +363,7 @@ impl App {
                 }
                 if let Some(view) = &mut self.prs.open {
                     view.files.set(result);
+                    view.sync_threads();
                 }
             }
             PrMsg::Detail { pr, result } => {

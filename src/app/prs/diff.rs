@@ -107,7 +107,6 @@ pub struct DiffView {
     pub cursor: usize,
     pub scroll: usize,
     /// The other end of a marked range, set when comments arrive.
-    #[allow(dead_code)] // range marking comes with commenting
     pub mark: Option<usize>,
     pub search: String,
     /// The search box is taking keys.
@@ -118,6 +117,8 @@ pub struct DiffView {
     pub number_width: usize,
     /// Rows the diff showed in the last frame, which a page key moves by.
     pub height: usize,
+    /// Diff row to the review threads on it, kept up to date by `FilesState::sync_threads`.
+    pub thread_rows: HashMap<usize, Vec<usize>>,
 }
 
 impl DiffView {
@@ -144,6 +145,7 @@ impl DiffView {
             matches: Vec::new(),
             number_width: widest.to_string().len(),
             height: 0,
+            thread_rows: HashMap::new(),
         }
     }
 
@@ -190,9 +192,33 @@ pub struct FilesState {
     /// Selected index into the file list.
     pub sel: ListState,
     pub diff: Option<DiffView>,
+    /// A read of the files has been sent, so a second one is not.
+    asked: bool,
 }
 
 impl FilesState {
+    /// Whether the files should be read now: they are neither here nor on
+    /// their way. Counts as sending the read.
+    pub fn needs_fetch(&mut self) -> bool {
+        let wanted = match self.files {
+            Loadable::Ready(_) => false,
+            Loadable::Loading => !self.asked,
+            Loadable::Failed(_) => true,
+        };
+        self.asked |= wanted;
+        wanted
+    }
+
+    /// Looks up the open diff's review threads again. Called when the diff
+    /// opens, its lines change, or the PR's threads are read.
+    pub fn sync_threads(&mut self, threads: &[ReviewThread]) {
+        let Some(diff) = &mut self.diff else { return };
+        let Loadable::Ready(files) = &self.files else { return };
+        if let Some(file) = files.get(diff.file) {
+            diff.thread_rows = thread_rows(&diff.lines, threads, &file.path);
+        }
+    }
+
     fn list(&self) -> &[PrFile] {
         match &self.files {
             Loadable::Ready(files) => files,
