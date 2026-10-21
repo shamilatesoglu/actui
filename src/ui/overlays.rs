@@ -37,7 +37,7 @@ pub(super) fn draw_artifacts(f: &mut Frame, app: &App) {
         .iter()
         .map(|a| {
             let (note, c) = if a.expired {
-                (" (expired)".to_string(), Color::Red)
+                (" (expired)".to_string(), red())
             } else {
                 (format!("  {}", fmt_bytes(a.size_in_bytes)), dim())
             };
@@ -95,7 +95,7 @@ pub(super) fn draw_approval(f: &mut Frame, app: &App) {
                 Span::raw(p.environment.name.clone()),
             ];
             if !approvable {
-                spans.push(Span::styled("  — no review access", Style::default().fg(Color::Red)));
+                spans.push(Span::styled("  — no review access", Style::default().fg(red())));
             }
             ListItem::new(Line::from(spans))
         })
@@ -135,7 +135,7 @@ pub(super) fn draw_approval(f: &mut Frame, app: &App) {
 pub(super) fn draw_annotations(f: &mut Frame, app: &App) {
     let Some(av) = &app.annotations else { return };
     let area = centered(72, 70, f.area());
-    let inner = popup(f, area, &format!("Failures · {}", av.repo), Color::Red);
+    let inner = popup(f, area, &format!("Failures · {}", av.repo), red());
 
     if !av.loaded {
         f.render_widget(
@@ -207,7 +207,7 @@ pub(super) fn draw_annotations(f: &mut Frame, app: &App) {
     let (fails, warns, notes) = av.counts();
     let mut tally = vec![Span::raw(" ")];
     if fails > 0 {
-        tally.push(Span::styled(format!("{fails} failures  "), Style::default().fg(Color::Red)));
+        tally.push(Span::styled(format!("{fails} failures  "), Style::default().fg(red())));
     }
     if warns > 0 {
         tally.push(Span::styled(format!("{warns} warnings  "), Style::default().fg(Color::Yellow)));
@@ -224,7 +224,7 @@ pub(super) fn draw_annotations(f: &mut Frame, app: &App) {
 
 fn ann_glyph(level: AnnLevel) -> (&'static str, Color) {
     match level {
-        AnnLevel::Failure => ("✗", Color::Red),
+        AnnLevel::Failure => ("✗", red()),
         AnnLevel::Warning => ("▲", Color::Yellow),
         AnnLevel::Notice => ("●", Color::Cyan),
     }
@@ -267,7 +267,7 @@ pub(super) fn draw_ref_picker(f: &mut Frame, app: &App) {
         .map(|r| {
             let (tag, c) = match r.kind {
                 RefKind::Branch => ("br ", accent()),
-                RefKind::Tag => ("tag", Color::Magenta),
+                RefKind::Tag => ("tag", magenta()),
             };
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{tag} "), Style::default().fg(c)),
@@ -293,7 +293,7 @@ pub(super) fn draw_ref_picker(f: &mut Frame, app: &App) {
 
 pub(super) fn draw_errors(f: &mut Frame, app: &App) {
     let area = centered(70, 60, f.area());
-    let inner = popup(f, area, &format!("Load errors ({})", app.errors.len()), Color::Red);
+    let inner = popup(f, area, &format!("Load errors ({})", app.errors.len()), red());
     let lines: Vec<Line> = app
         .errors
         .iter()
@@ -491,7 +491,7 @@ fn draw_dispatch_form(f: &mut Frame, d: &crate::app::DispatchState, area: Rect) 
     if !d.dispatchable {
         lines.push(Line::from(Span::styled(
             "⚠ This workflow has no workflow_dispatch trigger and can't be run manually.",
-            Style::default().fg(Color::Red),
+            Style::default().fg(red()),
         )));
     } else if d.fields.is_empty() {
         lines.push(Line::from(Span::styled("(no inputs)", Style::default().fg(dim()))));
@@ -500,7 +500,7 @@ fn draw_dispatch_form(f: &mut Frame, d: &crate::app::DispatchState, area: Rect) 
             let focused = d.field_idx == i + 1;
             let mut label = vec![Span::styled(field.name.clone(), Style::default().fg(dim()))];
             if field.required {
-                label.push(Span::styled(" *", Style::default().fg(Color::Red)));
+                label.push(Span::styled(" *", Style::default().fg(red())));
             }
             if !field.description.is_empty() {
                 label.push(Span::styled(
@@ -553,7 +553,7 @@ pub(super) fn draw_confirm(f: &mut Frame, app: &App) {
         Line::raw(""),
         Line::from(vec![
             Span::styled("  [y] yes  ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            Span::styled("  [n] no  ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled("  [n] no  ", Style::default().fg(red()).add_modifier(Modifier::BOLD)),
         ])
         .alignment(Alignment::Center),
     ]);

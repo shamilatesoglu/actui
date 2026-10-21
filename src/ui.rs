@@ -47,6 +47,8 @@ pub struct Theme {
     text: Color,       // the strongest foreground: what stands out from the accent
     faded: Color,      // a row whose data is being read
     on_accent: Color,  // text drawn on the accent color
+    red: Color,        // failures
+    magenta: Color,    // tags and commands in logs
 }
 
 impl Theme {
@@ -62,6 +64,8 @@ impl Theme {
             text: Color::Rgb(205, 214, 244),
             faded: Color::Rgb(88, 91, 112),
             on_accent: Color::Black,
+            red: Color::LightRed,
+            magenta: Color::LightMagenta,
         }
     }
     pub fn light() -> Self {
@@ -76,6 +80,8 @@ impl Theme {
             text: Color::Rgb(76, 79, 105),
             faded: Color::Rgb(172, 176, 190),
             on_accent: Color::Black,
+            red: Color::Red,
+            magenta: Color::Magenta,
         }
     }
 
@@ -84,24 +90,37 @@ impl Theme {
     /// terminal draws in its own scheme; the shades ANSI has no color for are
     /// blends of its background and foreground.
     pub fn from_terminal(fg: (u8, u8, u8), bg: (u8, u8, u8)) -> Self {
-        let mix = |t: f32| {
+        let blend = |t: f32| {
             let channel = |b: u8, f: u8| (b as f32 + (f as f32 - b as f32) * t).round() as u8;
-            Color::Rgb(channel(bg.0, fg.0), channel(bg.1, fg.1), channel(bg.2, fg.2))
+            (channel(bg.0, fg.0), channel(bg.1, fg.1), channel(bg.2, fg.2))
+        };
+        let rgb = |(r, g, b): (u8, u8, u8)| Color::Rgb(r, g, b);
+        // At least blend `t`, and further toward the foreground until it reads
+        // at `target` against `on`; the foreground itself if nothing does.
+        let shade = |t: f32, target: f32, on: (u8, u8, u8)| {
+            let mut t = t;
+            while t < 1.0 && contrast(blend(t), on) < target {
+                t = (t + 0.01).min(1.0);
+            }
+            rgb(blend(t))
         };
         let (r, g, b) = (bg.0 as u32, bg.1 as u32, bg.2 as u32);
         let dark = (r * 299 + g * 587 + b * 114) / 1000 < 128;
         Self {
-            accent: Color::Blue,
-            dim: mix(0.5),
-            bg_sel: mix(0.14),
-            bg_sel_dim: mix(0.07),
-            pale: mix(0.75),
-            popup_bg: mix(0.05),
-            // The bright red is the softer one on a dark background.
+            // Many dark schemes make the normal blue, red and magenta too dark
+            // to read on their background; the bright ones are made for it.
+            accent: if dark { Color::LightBlue } else { Color::Blue },
+            dim: shade(0.5, 4.5, bg),
+            bg_sel: rgb(blend(0.14)),
+            bg_sel_dim: rgb(blend(0.07)),
+            pale: shade(0.75, 4.5, blend(0.07)),
+            popup_bg: rgb(blend(0.05)),
             soft_red: if dark { Color::LightRed } else { Color::Red },
             text: Color::Reset,
-            faded: mix(0.3),
-            on_accent: Color::Rgb(bg.0, bg.1, bg.2),
+            faded: shade(0.3, 3.0, bg),
+            on_accent: rgb(bg),
+            red: if dark { Color::LightRed } else { Color::Red },
+            magenta: if dark { Color::LightMagenta } else { Color::Magenta },
         }
     }
 
@@ -119,8 +138,24 @@ impl Theme {
             text: Color::Reset,
             faded: Color::DarkGray,
             on_accent: Color::Black,
+            red: Color::Red,
+            magenta: Color::Magenta,
         }
     }
+}
+
+/// How much two colors stand apart, as the WCAG contrast ratio: 1 for the
+/// same color up to 21 for black on white.
+fn contrast(a: (u8, u8, u8), b: (u8, u8, u8)) -> f32 {
+    let luminance = |(r, g, b): (u8, u8, u8)| {
+        let channel = |v: u8| {
+            let v = v as f32 / 255.0;
+            if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+    };
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
 fn theme_store() -> &'static RwLock<Theme> {
@@ -167,6 +202,12 @@ fn faded() -> Color {
 }
 fn on_accent() -> Color {
     theme().on_accent
+}
+fn red() -> Color {
+    theme().red
+}
+fn magenta() -> Color {
+    theme().magenta
 }
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -305,7 +346,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(spin, Style::default().fg(Color::Yellow)),
         chip(SPINNER[app.spinner], running, Color::Yellow),
         chip("○", queued, Color::Cyan),
-        chip("●", failed, Color::Red),
+        chip("●", failed, red()),
         chip("●", success, Color::Green),
         Span::styled(format!("  {} runs", app.runs.len()), Style::default().fg(dim())),
     ]);
@@ -314,7 +355,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     if let Some(secs) = app.paused_secs {
         right.push(Span::styled(
             format!("  rate-limited · resuming in {secs}s ", ),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default().fg(red()).add_modifier(Modifier::BOLD),
         ));
     } else if app.loading && app.repos_total > 0 {
         right.push(Span::styled(
@@ -325,11 +366,11 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     if !app.errors.is_empty() {
         right.push(Span::styled(
             format!(" ⚠ {} (E) ", app.errors.len()),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default().fg(red()).add_modifier(Modifier::BOLD),
         ));
     }
     if let Some(rl) = &app.rate {
-        let c = if rl.remaining < 200 { Color::Red } else { dim() };
+        let c = if rl.remaining < 200 { red() } else { dim() };
         let pct = if rl.limit > 0 {
             (rl.remaining as f64 / rl.limit as f64 * 100.0).round() as u32
         } else {
@@ -1125,7 +1166,7 @@ fn runner_row_item(row: &RunnerRow) -> ListItem<'static> {
         }
         RunnerRow::Header { owner, detail, detail_err } => {
             let acc = Style::default().fg(accent()).add_modifier(Modifier::BOLD);
-            let dc = if *detail_err { Color::Red } else { dim() };
+            let dc = if *detail_err { red() } else { dim() };
             ListItem::new(Line::from(vec![
                 Span::styled("▸ ", acc),
                 Span::styled(owner.clone(), acc),
@@ -1186,7 +1227,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     // A transient status notice (cancel/dispatch/error/etc.), if not yet expired.
     if let Some((msg, is_err)) = app.status() {
         let style = if is_err {
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            Style::default().fg(red()).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::Green)
         };
@@ -1534,7 +1575,7 @@ fn status_glyph(status: &str, conclusion: Option<&str>, spin: &'static str) -> (
         "queued" | "waiting" | "pending" => ("○", Color::Cyan),
         "completed" => match conclusion {
             Some("success") => ("●", Color::Green),
-            Some("failure") | Some("timed_out") => ("●", Color::Red),
+            Some("failure") | Some("timed_out") => ("●", red()),
             Some("cancelled") => ("◌", dim()),
             Some("skipped") => ("○", dim()),
             _ => ("·", dim()),
@@ -1628,7 +1669,7 @@ fn state_glyph(s: RunState, spin: &'static str) -> (&'static str, Color) {
         RunState::Running => (spin, Color::Yellow),
         RunState::Queued => ("○", Color::Cyan),
         RunState::Success => ("●", Color::Green),
-        RunState::Failure => ("●", Color::Red),
+        RunState::Failure => ("●", red()),
         RunState::Cancelled => ("◌", dim()),
         RunState::Skipped => ("○", dim()),
         RunState::Other => ("·", dim()),
@@ -1809,7 +1850,7 @@ fn highlight_log(raw: &str) -> Line<'static> {
     };
 
     if let Some(rest) = content.strip_prefix("##[error]") {
-        return marker("✗ ", rest, Color::Red, true);
+        return marker("✗ ", rest, red(), true);
     }
     if let Some(rest) = content.strip_prefix("##[warning]") {
         return marker("▲ ", rest, Color::Yellow, true);
@@ -1824,7 +1865,7 @@ fn highlight_log(raw: &str) -> Line<'static> {
         return Line::raw("");
     }
     if let Some(rest) = content.strip_prefix("##[command]") {
-        return marker("$ ", rest, Color::Magenta, false);
+        return marker("$ ", rest, magenta(), false);
     }
     if let Some(rest) = content.strip_prefix("##[debug]") {
         return marker("", rest, dim(), false);
@@ -1870,6 +1911,41 @@ mod tests {
 
     fn text_of(l: &Line) -> String {
         l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn rgb(c: Color) -> (u8, u8, u8) {
+        match c {
+            Color::Rgb(r, g, b) => (r, g, b),
+            other => panic!("not an RGB color: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shades_stay_readable_on_a_light_scheme_with_soft_text() {
+        // Solarized Readable: its text is only 7.2:1 on its background.
+        let bg = (0xfd, 0xf6, 0xe3);
+        let t = Theme::from_terminal((0x43, 0x55, 0x5c), bg);
+        assert!(contrast(rgb(t.dim), bg) >= 4.5);
+        assert!(contrast(rgb(t.faded), bg) >= 3.0);
+        assert!(contrast(rgb(t.faded), bg) < contrast(rgb(t.dim), bg), "faded stays fainter than dim");
+        assert!(contrast(rgb(t.pale), rgb(t.bg_sel_dim)) >= 4.5);
+        assert_eq!((t.accent, t.red, t.magenta), (Color::Blue, Color::Red, Color::Magenta));
+    }
+
+    #[test]
+    fn dark_schemes_get_the_bright_blue_red_and_magenta() {
+        // Campbell, whose normal blue is 2.4:1 on its background.
+        let bg = (0x0c, 0x0c, 0x0c);
+        let t = Theme::from_terminal((0xcc, 0xcc, 0xcc), bg);
+        assert_eq!((t.accent, t.red, t.magenta), (Color::LightBlue, Color::LightRed, Color::LightMagenta));
+        assert!(contrast(rgb(t.dim), bg) >= 4.5);
+    }
+
+    #[test]
+    fn text_too_close_to_the_background_is_used_as_it_is() {
+        let t = Theme::from_terminal((120, 120, 120), (100, 100, 100));
+        assert_eq!(t.dim, Color::Rgb(120, 120, 120));
+        assert_eq!(t.faded, Color::Rgb(120, 120, 120));
     }
 
     /// Draw the whole screen into an off-screen terminal and read it back, so
@@ -2966,7 +3042,7 @@ mod tests {
     fn classifies_markers() {
         let e = highlight_log("2026-06-03T09:13:47.0000000Z ##[error]boom");
         assert_eq!(text_of(&e), "✗ boom");
-        assert_eq!(e.spans[0].style.fg, Some(Color::Red));
+        assert_eq!(e.spans[0].style.fg, Some(red()));
 
         let g = highlight_log("2026-06-03T09:13:47.0000000Z ##[group]Run build");
         assert_eq!(text_of(&g), "▸ Run build");

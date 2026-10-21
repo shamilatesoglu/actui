@@ -98,7 +98,7 @@ pub(super) fn draw_open_pr(f: &mut Frame, app: &mut App, area: Rect) {
             f.render_widget(Paragraph::new(line), body);
         }
         Loadable::Failed(e) => {
-            let line = Line::styled(e.clone(), Style::default().fg(Color::Red));
+            let line = Line::styled(e.clone(), Style::default().fg(red()));
             f.render_widget(Paragraph::new(line).wrap(Wrap { trim: false }), body);
         }
         Loadable::Ready(d) => match view.tab {
@@ -230,7 +230,7 @@ fn tab_strip(
 fn checks_glyph(checks: ChecksState, spin: &'static str) -> (&'static str, Color) {
     match checks {
         ChecksState::Passing => ("●", Color::Green),
-        ChecksState::Failing => ("●", Color::Red),
+        ChecksState::Failing => ("●", red()),
         ChecksState::Pending => (spin, Color::Yellow),
         ChecksState::NoChecks => ("·", dim()),
     }
@@ -239,7 +239,7 @@ fn checks_glyph(checks: ChecksState, spin: &'static str) -> (&'static str, Color
 fn review_text(review: ReviewDecision) -> Option<(&'static str, Color)> {
     match review {
         ReviewDecision::Approved => Some(("approved", Color::Green)),
-        ReviewDecision::ChangesRequested => Some(("changes requested", Color::Red)),
+        ReviewDecision::ChangesRequested => Some(("changes requested", red())),
         ReviewDecision::ReviewRequired => Some(("review required", Color::Yellow)),
         ReviewDecision::NotRequired => None,
     }

@@ -336,7 +336,7 @@ fn stats_row(tv: &TimingView, stats: &TimingStats) -> Line<'static> {
     }
     if let Some(t) = stats.trend {
         let (glyph, color) = if t > FLAT {
-            ("▲", Color::Red)
+            ("▲", red())
         } else if t < -FLAT {
             ("▼", Color::Green)
         } else {

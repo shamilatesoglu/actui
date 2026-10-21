@@ -25,7 +25,7 @@ pub(super) fn draw_files(f: &mut Frame, view: &mut PrView, area: Rect, spin: &'s
             return f.render_widget(Paragraph::new(line), area);
         }
         Loadable::Failed(e) => {
-            let line = Line::styled(e.clone(), Style::default().fg(Color::Red));
+            let line = Line::styled(e.clone(), Style::default().fg(red()));
             return f.render_widget(Paragraph::new(line).wrap(Wrap { trim: false }), area);
         }
         Loadable::Ready(files) if files.is_empty() => {
@@ -76,7 +76,7 @@ fn draw_file_list(f: &mut Frame, files: &[PrFile], sel: &mut ListState, focused:
 fn status_color(status: FileStatus) -> Color {
     match status {
         FileStatus::Added => Color::Green,
-        FileStatus::Removed => Color::Red,
+        FileStatus::Removed => red(),
         FileStatus::Modified | FileStatus::Changed => Color::Yellow,
         FileStatus::Renamed | FileStatus::Copied => Color::Cyan,
         FileStatus::Unchanged => dim(),
@@ -100,7 +100,7 @@ fn file_line(file: &PrFile, width: usize) -> Line<'static> {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(format!("+{}", file.additions), Style::default().fg(Color::Green)));
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(format!("\u{2212}{}", file.deletions), Style::default().fg(Color::Red)));
+        spans.push(Span::styled(format!("\u{2212}{}", file.deletions), Style::default().fg(red())));
     }
     Line::from(spans)
 }
@@ -197,7 +197,7 @@ fn diff_row(diff: &DiffView, at: usize, marker: String, width: usize, found: boo
 
     let (sign, color) = match line {
         DiffLine::Added { .. } => ("+", Some(Color::Green)),
-        DiffLine::Removed { .. } => ("-", Some(Color::Red)),
+        DiffLine::Removed { .. } => ("-", Some(red())),
         DiffLine::Context { .. } => (" ", None),
         DiffLine::Hunk(_) | DiffLine::NoNewline => ("", Some(dim())),
     };

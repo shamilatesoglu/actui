@@ -45,7 +45,7 @@ fn draw_checks(f: &mut Frame, checks: &[Check], state: &mut ListState, area: Rec
 fn check_line(check: &Check, spin: &'static str) -> Line<'static> {
     let (glyph, color) = match check.state {
         CheckState::Passed => ("✓", Color::Green),
-        CheckState::Failed => ("✗", Color::Red),
+        CheckState::Failed => ("✗", red()),
         CheckState::Pending => (spin, Color::Yellow),
         CheckState::Skipped => ("–", dim()),
         CheckState::Neutral => ("·", dim()),
@@ -56,7 +56,7 @@ fn check_line(check: &Check, spin: &'static str) -> Line<'static> {
 pub(super) fn verdict_glyph(verdict: Verdict) -> (&'static str, &'static str, Color) {
     match verdict {
         Verdict::Approved => ("✓", "approved", Color::Green),
-        Verdict::ChangesRequested => ("✗", "changes requested", Color::Red),
+        Verdict::ChangesRequested => ("✗", "changes requested", red()),
         Verdict::Requested => ("○", "requested", Color::Yellow),
         Verdict::Commented => ("●", "commented", dim()),
         Verdict::Dismissed => ("⊘", "dismissed", dim()),

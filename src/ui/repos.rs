@@ -61,7 +61,7 @@ fn rollup(
     let counts = [
         (spin, running, Color::Yellow),
         ("○", queued, Color::Cyan),
-        ("●", failed, Color::Red),
+        ("●", failed, red()),
     ];
     for (icon, n, color) in counts {
         if n > 0 {
