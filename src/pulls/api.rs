@@ -562,6 +562,10 @@ const FILES_PER_PAGE: usize = 100;
 /// GitHub lists at most 3000 files, so 30 pages is all there is.
 const FILES_MAX_PAGES: u32 = 30;
 
+fn files_query(page: u32) -> Vec<(&'static str, String)> {
+    vec![("per_page", FILES_PER_PAGE.to_string()), ("page", page.to_string())]
+}
+
 #[derive(Deserialize)]
 struct RawFile {
     filename: String,
@@ -594,16 +598,16 @@ enum FirstPage<T> {
     Unchanged(Vec<T>),
     /// Changed; `more` says whether further pages may follow.
     Changed { files: Vec<T>, more: bool },
+    /// Unchanged, but no list was kept to stand for it, so the first page
+    /// has to be read again without a condition.
+    Lost,
 }
 
 /// Decides from the first page's answer and the list kept from last time.
-fn first_page<T: Clone>(page: Cond<Vec<T>>, kept: Option<&Vec<T>>) -> Result<FirstPage<T>> {
+fn first_page<T: Clone>(page: Cond<Vec<T>>, kept: Option<&Vec<T>>) -> FirstPage<T> {
     match page {
-        Cond::NotModified => kept
-            .cloned()
-            .map(FirstPage::Unchanged)
-            .ok_or_else(|| anyhow!("GitHub says the files are unchanged, but none were kept")),
-        Cond::Modified(files) => Ok(FirstPage::Changed { more: files.len() == FILES_PER_PAGE, files }),
+        Cond::NotModified => kept.cloned().map_or(FirstPage::Lost, FirstPage::Unchanged),
+        Cond::Modified(files) => FirstPage::Changed { more: files.len() == FILES_PER_PAGE, files },
     }
 }
 
@@ -612,28 +616,47 @@ impl Github {
     /// so reading an unchanged PR again costs no rate limit.
     pub async fn pr_files(&self, pr: &PrRef) -> Result<Vec<PrFile>> {
         let url = format!("{REST_URL}/repos/{}/pulls/{}/files", pr.repo, pr.number);
-        let query = |page: u32| vec![("per_page", FILES_PER_PAGE.to_string()), ("page", page.to_string())];
         let key = format!("prfiles:{}", pr.label());
-        let first = self.cond_get::<Vec<serde_json::Value>>(&key, url.clone(), &query(1)).await?;
-        let step = first_page(first, self.pr_files_cache.lock().unwrap().get(&key))?;
+        let first = self.cond_get::<Vec<serde_json::Value>>(&key, url.clone(), &files_query(1)).await?;
+        let mut step = first_page(first, self.pr_files_cache.lock().unwrap().get(&key));
+        if let FirstPage::Lost = step {
+            self.forget_etag(&key);
+            let first = self.cond_get::<Vec<serde_json::Value>>(&key, url.clone(), &files_query(1)).await?;
+            step = first_page(first, None);
+        }
         let raw = match step {
             FirstPage::Unchanged(raw) => return parse_files(raw),
+            FirstPage::Lost => return Err(anyhow!("GitHub says the files are unchanged, but none were kept")),
             FirstPage::Changed { files, more: false } => files,
-            FirstPage::Changed { mut files, more: true } => {
-                let mut page = 1;
-                let mut last_len = FILES_PER_PAGE;
-                while last_len == FILES_PER_PAGE && page < FILES_MAX_PAGES {
-                    page += 1;
-                    let req = self.client.get(&url).query(&query(page));
-                    let batch: Vec<serde_json::Value> = ensure_ok(self.send(req).await?).await?.json().await?;
-                    last_len = batch.len();
-                    files.extend(batch);
+            FirstPage::Changed { files, more: true } => match self.later_file_pages(&url, files).await {
+                Ok(files) => files,
+                Err(e) => {
+                    // The first page's ETag stands for the whole list, which
+                    // was not read, so the next read must not be told "unchanged".
+                    self.forget_etag(&key);
+                    return Err(e);
                 }
-                files
-            }
+            },
         };
-        self.pr_files_cache.lock().unwrap().insert(key, raw.clone());
+        let dropped = self.pr_files_cache.lock().unwrap().keep(key, raw.clone());
+        if let Some(dropped) = dropped {
+            self.forget_etag(&dropped);
+        }
         parse_files(raw)
+    }
+
+    /// Reads the pages after the first and adds them to `files`.
+    async fn later_file_pages(&self, url: &str, mut files: Vec<serde_json::Value>) -> Result<Vec<serde_json::Value>> {
+        let mut page = 1;
+        let mut last_len = FILES_PER_PAGE;
+        while last_len == FILES_PER_PAGE && page < FILES_MAX_PAGES {
+            page += 1;
+            let req = self.client.get(url).query(&files_query(page));
+            let batch: Vec<serde_json::Value> = ensure_ok(self.send(req).await?).await?.json().await?;
+            last_len = batch.len();
+            files.extend(batch);
+        }
+        Ok(files)
     }
 }
 
@@ -915,16 +938,20 @@ mod tests {
     #[test]
     fn an_unchanged_first_page_reuses_the_whole_kept_list() {
         let kept = some_files(250);
-        let step = first_page(Cond::NotModified, Some(&kept)).unwrap();
+        let step = first_page(Cond::NotModified, Some(&kept));
         assert!(matches!(step, FirstPage::Unchanged(ref files) if files.len() == 250), "{step:?}");
-        assert!(first_page::<PrFile>(Cond::NotModified, None).is_err());
+    }
+
+    #[test]
+    fn an_unchanged_first_page_with_no_kept_list_reads_again() {
+        assert!(matches!(first_page::<PrFile>(Cond::NotModified, None), FirstPage::Lost));
     }
 
     #[test]
     fn a_changed_full_first_page_reads_on_and_a_short_one_stops() {
-        let step = first_page(Cond::Modified(some_files(FILES_PER_PAGE)), None).unwrap();
+        let step = first_page(Cond::Modified(some_files(FILES_PER_PAGE)), None);
         assert!(matches!(step, FirstPage::Changed { more: true, .. }));
-        let step = first_page(Cond::Modified(some_files(3)), Some(&some_files(250))).unwrap();
+        let step = first_page(Cond::Modified(some_files(3)), Some(&some_files(250)));
         assert!(matches!(step, FirstPage::Changed { more: false, ref files } if files.len() == 3));
     }
 

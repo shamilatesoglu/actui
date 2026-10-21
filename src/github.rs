@@ -6,7 +6,7 @@ use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, ETAG, IF_NO
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -44,6 +44,36 @@ pub enum Cond<T> {
     Modified(T),
     /// `304 Not Modified` — caller should keep what it already has.
     NotModified,
+}
+
+/// How many PRs' file lists are kept for reading them again unchanged.
+const KEPT_FILE_LISTS: usize = 20;
+
+/// The whole file lists of the PRs read most recently, as the API sent them,
+/// oldest first.
+#[derive(Default)]
+pub(crate) struct KeptFiles(VecDeque<(String, Vec<serde_json::Value>)>);
+
+impl KeptFiles {
+    /// The list kept under `key`, which now counts as read most recently.
+    pub(crate) fn get(&mut self, key: &str) -> Option<&Vec<serde_json::Value>> {
+        let i = self.0.iter().position(|(k, _)| k == key)?;
+        let entry = self.0.remove(i)?;
+        self.0.push_back(entry);
+        self.0.back().map(|(_, files)| files)
+    }
+
+    /// Keeps `files` under `key`, and returns the key of the list dropped to
+    /// make room, if one was.
+    pub(crate) fn keep(&mut self, key: String, files: Vec<serde_json::Value>) -> Option<String> {
+        self.0.retain(|(k, _)| *k != key);
+        self.0.push_back((key, files));
+        if self.0.len() > KEPT_FILE_LISTS {
+            self.0.pop_front().map(|(k, _)| k)
+        } else {
+            None
+        }
+    }
 }
 
 /// Resolve a GitHub token: $GITHUB_TOKEN / $GH_TOKEN, else `gh auth token`.
@@ -85,9 +115,9 @@ pub struct Github {
     tags_cache: Arc<Mutex<HashMap<String, Vec<Tag>>>>,
     /// Last runner list per repo, returned when that repo's runners are unchanged.
     repo_runners_cache: Arc<Mutex<HashMap<String, Vec<Runner>>>>,
-    /// Every changed file of a PR by `repo#number`, as the API sent them,
-    /// returned when the first page is unchanged.
-    pub(crate) pr_files_cache: Arc<Mutex<HashMap<String, Vec<serde_json::Value>>>>,
+    /// Every changed file of the PRs read most recently, returned when the
+    /// first page is unchanged.
+    pub(crate) pr_files_cache: Arc<Mutex<KeptFiles>>,
     /// Largest `X-Poll-Interval` (seconds) GitHub has asked us to honor; 0 = unset.
     poll_interval: Arc<AtomicU64>,
     rate_state: Arc<Mutex<RateState>>,
@@ -121,7 +151,7 @@ impl Github {
             repos_cache: Arc::new(Mutex::new(Vec::new())),
             tags_cache: Arc::new(Mutex::new(HashMap::new())),
             repo_runners_cache: Arc::new(Mutex::new(HashMap::new())),
-            pr_files_cache: Arc::new(Mutex::new(HashMap::new())),
+            pr_files_cache: Arc::new(Mutex::new(KeptFiles::default())),
             poll_interval: Arc::new(AtomicU64::new(0)),
             rate_state: Arc::new(Mutex::new(RateState::default())),
         })
@@ -308,6 +338,11 @@ impl Github {
             etags.insert(key.to_string(), tag.to_string());
         }
         Ok(Cond::Modified(resp.json::<T>().await?))
+    }
+
+    /// Drops the ETag kept under `key`, so its next read is unconditional.
+    pub(crate) fn forget_etag(&self, key: &str) {
+        self.etags.lock().unwrap().remove(key);
     }
 
     /// The last repo list returned by `list_repos` (used on a `304`).
@@ -1382,6 +1417,19 @@ impl Run {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kept_file_lists_drop_the_one_read_longest_ago() {
+        let mut kept = KeptFiles::default();
+        for i in 0..KEPT_FILE_LISTS {
+            assert_eq!(kept.keep(format!("pr{i}"), vec![]), None);
+        }
+        assert!(kept.get("pr0").is_some());
+        assert_eq!(kept.keep("pr0".into(), vec![]), None, "keeping a kept PR again takes no room");
+        assert_eq!(kept.keep("new".into(), vec![]), Some("pr1".into()));
+        assert!(kept.get("pr1").is_none());
+        assert!(kept.get("pr0").is_some() && kept.get("new").is_some());
+    }
 
     #[test]
     fn parses_dispatch_inputs() {
