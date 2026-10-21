@@ -259,8 +259,8 @@ pub struct PrView {
     pub merge_dialog: Option<MergeDialog>,
     /// The review box open over the PR, if any.
     pub review_popup: Option<ReviewPopup>,
-    /// The latest detail read asked for, and the one whose answer is shown.
-    detail_requested: DetailRequest,
+    /// Detail answers numbered this or lower are dropped: the one shown, and
+    /// reads asked before this view opened.
     detail_shown: DetailRequest,
 }
 
@@ -277,16 +277,8 @@ impl PrView {
             compose: None,
             merge_dialog: None,
             review_popup: None,
-            detail_requested: DetailRequest::default(),
             detail_shown: DetailRequest::default(),
         }
-    }
-
-    /// Asks for the detail again, numbering the read so its answer can be
-    /// told from the others'.
-    pub fn ask_detail(&mut self) -> Command {
-        self.detail_requested = self.detail_requested.next();
-        Command::Pr(PrCommand::FetchDetail { pr: self.pr.clone(), request: self.detail_requested })
     }
 
     /// Whether a box is open over the PR: the comment box, the merge box or
@@ -375,9 +367,27 @@ pub struct PrsState {
     /// Set while the PRs must not be polled: the GraphQL quota is nearly
     /// spent, or all polling is held back.
     pub paused: bool,
+    /// The latest detail read asked for, of any PR. It never counts down, so
+    /// a read asked before a PR was closed stays older than any asked after.
+    last_detail_request: DetailRequest,
 }
 
 impl PrsState {
+    /// Opens a PR and asks for its detail.
+    fn open_pr(&mut self, pr: PrRef) -> Command {
+        let mut view = PrView::new(pr.clone());
+        view.detail_shown = self.last_detail_request;
+        self.open = Some(view);
+        self.ask_detail(pr)
+    }
+
+    /// Asks for a PR's detail, numbering the read so its answer can be told
+    /// from the others'.
+    fn ask_detail(&mut self, pr: PrRef) -> Command {
+        self.last_detail_request = self.last_detail_request.next();
+        Command::Pr(PrCommand::FetchDetail { pr, request: self.last_detail_request })
+    }
+
     /// Whether the open PR has checks still running, which is when it is
     /// worth reading again soon.
     pub fn open_checks_pending(&self) -> bool {
@@ -389,20 +399,17 @@ impl PrsState {
 }
 
 impl App {
-    /// The number of the open PR's latest detail read, for tests that answer it.
+    /// The number of the latest detail read, for tests that answer it.
     #[cfg(test)]
     pub fn last_detail_request(&self) -> DetailRequest {
-        self.prs.open.as_ref().map_or_else(DetailRequest::default, |v| v.detail_requested)
+        self.prs.last_detail_request
     }
 
-    /// Numbers a new detail read of the open PR, as a refresh would, for
-    /// tests that answer it.
+    /// Numbers a new detail read, as a refresh would, for tests that answer it.
     #[cfg(test)]
     pub fn fresh_detail_request(&mut self) -> DetailRequest {
-        self.prs.open.as_mut().map_or_else(DetailRequest::default, |v| {
-            v.detail_requested = v.detail_requested.next();
-            v.detail_requested
-        })
+        self.prs.last_detail_request = self.prs.last_detail_request.next();
+        self.prs.last_detail_request
     }
 
     /// Whether the PRs screens are what shows, which includes a question or
@@ -418,11 +425,11 @@ impl App {
 
     /// Reads the open PR again; the refresh timer calls this.
     pub fn queue_pr_refresh(&mut self) {
-        if let Some(view) = &mut self.prs.open {
-            self.pending.push(view.ask_detail());
+        if let Some((pr, tab)) = self.prs.open.as_ref().map(|v| (v.pr.clone(), v.tab)) {
+            self.pending.push(self.prs.ask_detail(pr.clone()));
             // Only the Files tab keeps its files fresh; elsewhere they cost quota for nothing.
-            if view.tab == PrTab::Files {
-                self.pending.push(Command::Pr(PrCommand::FetchFiles(view.pr.clone())));
+            if tab == PrTab::Files {
+                self.pending.push(Command::Pr(PrCommand::FetchFiles(pr)));
             }
         }
     }
@@ -568,15 +575,16 @@ impl App {
             }
             self.give_back_refused();
         }
-        let Some(view) = self.prs.open.as_mut().filter(|v| v.pr == pr) else {
+        let open = self.prs.open.as_ref().filter(|v| v.pr == pr);
+        let Some(files_read) = open.map(|v| matches!(v.files.files, Loadable::Ready(_))) else {
             // The list still shows a PR merged after its view was closed.
             if merged {
                 self.pending.push(Command::Pr(PrCommand::FetchList));
             }
             return;
         };
-        self.pending.push(view.ask_detail());
-        if matches!(view.files.files, Loadable::Ready(_)) {
+        self.pending.push(self.prs.ask_detail(pr.clone()));
+        if files_read {
             self.pending.push(Command::Pr(PrCommand::FetchFiles(pr)));
         }
     }
@@ -837,6 +845,24 @@ mod tests {
             _ => String::new(),
         };
         assert_eq!(shown, "newer");
+    }
+
+    #[test]
+    fn a_read_from_before_a_pr_was_reopened_is_dropped() {
+        let mut app = app_on_a_pr_with_a_run_check();
+        let pr = app.prs.open.as_ref().unwrap().pr.clone();
+        app.queue_pr_refresh();
+        let before = app.last_detail_request();
+        let result = match &app.prs.open.as_ref().unwrap().detail {
+            Loadable::Ready(d) => Ok(d.clone()),
+            _ => panic!("loaded"),
+        };
+        app.pending.clear();
+        app.prs.open = None;
+        let ask = app.prs.open_pr(pr.clone());
+        assert!(matches!(ask, Command::Pr(PrCommand::FetchDetail { request, .. }) if request > before));
+        app.apply(DataMsg::Pr(PrMsg::Detail { pr, request: before, result }));
+        assert!(matches!(app.prs.open.as_ref().unwrap().detail, Loadable::Loading));
     }
 
     #[test]
