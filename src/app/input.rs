@@ -50,11 +50,17 @@ impl App {
             // Letting go ends the drag; that's not a click on whatever is under
             // the pointer.
             MouseEventKind::Up(MouseButton::Left) => {
-                self.panes.scrolling.take().is_some() | self.panes.dragging.take().is_some()
+                let dragged = self.panes.dragging.take().is_some();
+                if dragged {
+                    self.remember_layout();
+                }
+                self.panes.scrolling.take().is_some() | dragged
             }
             // A move with no button held means we missed the release.
             MouseEventKind::Moved => {
-                self.panes.dragging = None;
+                if self.panes.dragging.take().is_some() {
+                    self.remember_layout();
+                }
                 self.panes.scrolling = None;
                 false
             }
@@ -500,6 +506,7 @@ impl App {
         }
         self.panes.sidebar = (self.panes.sidebar as i32 + delta).max(0) as u16;
         self.panes.clamp(self.term_width, true, self.steps_pane_open());
+        self.remember_layout();
     }
 
     /// Put the panes and the table's columns back to the widths actui ships
@@ -507,6 +514,7 @@ impl App {
     fn reset_layout(&mut self) {
         self.panes.reset();
         self.panes.clamp(self.term_width, self.repos.shown, self.steps_pane_open());
+        self.remember_layout();
         self.set_status("Layout reset", false);
     }
 

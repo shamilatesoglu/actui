@@ -2198,9 +2198,13 @@ mod tests {
         let corner = |c: char| title.iter().position(|x| *x == c).unwrap();
         assert_eq!(corner('╮') - corner('╭') + 1, app.panes.sidebar as usize);
 
-        let mut saved = crate::state::State::default();
-        app.panes.store(&mut saved);
-        assert_eq!(saved.sidebar_width(), Some(app.panes.sidebar));
+        assert_eq!(app.state.sidebar_width(), Some(app.panes.sidebar), "kept on release");
+
+        // A narrow window squeezes the pane, but what's saved is what you set.
+        let set = app.panes.sidebar;
+        screen(&mut app, 60, 14);
+        assert!(app.panes.sidebar < set);
+        assert_eq!(app.state.sidebar_width(), Some(set));
     }
 
     #[test]

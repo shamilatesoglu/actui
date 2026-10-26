@@ -1029,9 +1029,16 @@ impl App {
         self.mode == Mode::Logs && self.steps_view.is_some()
     }
 
-    /// Save the layout and the repo use history (called once, on the way out).
-    pub fn save_state(&mut self) {
+    /// Take the layout you just set into the state. Only your own changes go
+    /// in: a narrow window squeezes the panes too, and that shouldn't stick.
+    pub fn remember_layout(&mut self) {
         self.panes.store(&mut self.state);
+    }
+
+    /// Write the layout and the repo use history if either changed. Called
+    /// every second, so a session that ends without quitting (the window
+    /// closed, a crash) still keeps them.
+    pub fn save_state(&mut self) {
         self.state.save();
     }
 

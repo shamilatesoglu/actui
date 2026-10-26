@@ -113,9 +113,10 @@ impl State {
         use_.hits as f64 * 0.5_f64.powf(days / HALF_LIFE_DAYS)
     }
 
-    /// Write the file if anything changed. Failures stay silent — a lost history
-    /// only costs the sidebar its order.
-    pub fn save(&self) {
+    /// Write the file if anything changed. Failures stay silent and are tried
+    /// again on the next save. The text goes to a temporary file first, so
+    /// actui being killed mid-write can't leave a half-written state behind.
+    pub fn save(&mut self) {
         if !self.dirty {
             return;
         }
@@ -125,7 +126,10 @@ impl State {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = std::fs::write(path, text);
+        let temp = path.with_extension("toml.tmp");
+        if std::fs::write(&temp, text).is_ok() && std::fs::rename(&temp, &path).is_ok() {
+            self.dirty = false;
+        }
     }
 }
 

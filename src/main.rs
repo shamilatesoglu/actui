@@ -252,6 +252,7 @@ async fn run(
             _ = sched.tick() => {
                 // The once-a-second redraw also keeps ages/durations current.
                 redraw = true;
+                app.save_state();
                 if matches!(theme, ThemeSource::Terminal(_))
                     && last_theme.elapsed() >= Duration::from_secs(3)
                 {
@@ -375,7 +376,7 @@ async fn run(
         redraw |= !app.pending.is_empty();
         dispatch_commands(&mut app, &gh, &cfg, &tx);
     }
-    // Keep the repo use history for the next session.
+    // Keep whatever changed since the last tick.
     app.save_state();
     Ok(())
 }
