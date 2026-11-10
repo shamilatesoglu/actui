@@ -156,15 +156,15 @@ fn draw_diff(f: &mut Frame, diff: &mut DiffView, file: &PrFile, drafts: &[DraftC
         .map(|i| {
             let threads_here = diff.thread_rows.get(&i).map_or(0, Vec::len);
             let marker = row_marker(threads_here, drafted.contains(&i));
-            let style = if i == diff.cursor {
-                select_style(true)
-            } else if marked.as_ref().is_some_and(|r| r.contains(&i)) {
-                Style::default().bg(bg_sel_dim())
-            } else {
-                Style::default()
-            };
             let found = diff.matches.binary_search(&i).is_ok();
-            diff_row(diff, i, marker, body.width as usize, found).style(style)
+            let line = diff_row(diff, i, marker, body.width as usize, found);
+            if i == diff.cursor {
+                highlight_line(line, select_style(true))
+            } else if marked.as_ref().is_some_and(|r| r.contains(&i)) {
+                highlight_line(line, select_style(false))
+            } else {
+                line
+            }
         })
         .collect();
     f.render_widget(Paragraph::new(lines), body);

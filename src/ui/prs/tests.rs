@@ -33,6 +33,13 @@ fn prs_app() -> App {
 }
 
 #[test]
+fn passing_and_failing_checks_remain_distinct_without_color() {
+    use crate::pulls::model::ChecksState;
+    assert_eq!(super::checks_glyph(ChecksState::Passing, SPINNER[0]).0, "✓");
+    assert_eq!(super::checks_glyph(ChecksState::Failing, SPINNER[0]).0, "✗");
+}
+
+#[test]
 fn p_opens_the_prs_screen_with_both_groups() {
     let mut app = prs_app();
     let out = screen(&mut app, 140, 24);

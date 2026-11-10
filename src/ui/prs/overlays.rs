@@ -146,7 +146,7 @@ fn draw_pending_panel(f: &mut Frame, sel: usize, pr: &PrRef, detail: Option<&PrD
                 Span::styled(place, Style::default().fg(accent())),
                 Span::raw(format!("  {first}")),
             ]);
-            if picked { line.style(select_style(true)) } else { line }
+            if picked { highlight_line(line, select_style(true)) } else { line }
         })
         .collect();
     f.render_widget(Paragraph::new(lines), body);

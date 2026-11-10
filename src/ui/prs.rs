@@ -229,8 +229,8 @@ fn tab_strip(
 
 fn checks_glyph(checks: ChecksState, spin: &'static str) -> (&'static str, Color) {
     match checks {
-        ChecksState::Passing => ("●", Color::Green),
-        ChecksState::Failing => ("●", red()),
+        ChecksState::Passing => ("✓", Color::Green),
+        ChecksState::Failing => ("✗", red()),
         ChecksState::Pending => (spin, Color::Yellow),
         ChecksState::NoChecks => ("·", dim()),
     }

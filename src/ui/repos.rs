@@ -33,7 +33,7 @@ pub(super) fn draw_repos(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_style(select_style(focused))
         .highlight_symbol(if focused { "▌" } else { " " });
     f.render_stateful_widget(list, content, &mut app.repos.state);
-    fade_rows(f, content, app.repos.state.offset(), &fetching);
+    fade_rows(f, content, app.repos.state.offset(), app.repos.state.selected(), &fetching);
 
     let (rows, offset) = (app.repos.len(), app.repos.state.offset());
     scrollbar(

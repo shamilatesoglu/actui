@@ -77,6 +77,11 @@ include             = []      # only repos whose name contains one of these
 exclude             = []      # skip repos whose name contains one of these
 ```
 
+With `theme = "auto"`, colors follow the terminal window actui is running in,
+including light/dark theme changes. Selected rows use a contrasting text and
+background pair; if the terminal cannot report its colors, selection uses its
+default colors in reverse instead.
+
 If you are in large orgs, set `include` or lower `max_repos` to stay under
 GitHub's 5000 requests an hour.
 

@@ -39,8 +39,10 @@ use std::sync::{OnceLock, RwLock};
 pub struct Theme {
     accent: Color,
     dim: Color,
+    fg_sel: Color,     // selected text, including metadata and status glyphs
     bg_sel: Color,     // selection background (focused pane)
     bg_sel_dim: Color, // selection background (unfocused pane)
+    reverse_selection: bool, // use terminal defaults in reverse when RGB is unknown
     pale: Color,       // unfocused selected text
     popup_bg: Color,   // popup window fill
     soft_red: Color,   // a guessed error, quieter than a real failure's red
@@ -56,8 +58,10 @@ impl Theme {
         Self {
             accent: Color::Rgb(137, 180, 250),
             dim: Color::Rgb(127, 132, 156),
+            fg_sel: Color::Rgb(205, 214, 244),
             bg_sel: Color::Rgb(49, 50, 68),
             bg_sel_dim: Color::Rgb(40, 41, 56),
+            reverse_selection: false,
             pale: Color::Rgb(166, 173, 200),
             popup_bg: Color::Rgb(30, 31, 48),
             soft_red: Color::Rgb(235, 160, 172),
@@ -72,8 +76,10 @@ impl Theme {
         Self {
             accent: Color::Rgb(30, 102, 245),
             dim: Color::Rgb(108, 111, 133),
+            fg_sel: Color::Rgb(76, 79, 105),
             bg_sel: Color::Rgb(188, 200, 240),
             bg_sel_dim: Color::Rgb(220, 224, 232),
+            reverse_selection: false,
             pale: Color::Rgb(76, 79, 105),
             popup_bg: Color::Rgb(230, 233, 239),
             soft_red: Color::Rgb(179, 80, 92),
@@ -90,10 +96,7 @@ impl Theme {
     /// terminal draws in its own scheme; the shades ANSI has no color for are
     /// blends of its background and foreground.
     pub fn from_terminal(fg: (u8, u8, u8), bg: (u8, u8, u8)) -> Self {
-        let blend = |t: f32| {
-            let channel = |b: u8, f: u8| (b as f32 + (f as f32 - b as f32) * t).round() as u8;
-            (channel(bg.0, fg.0), channel(bg.1, fg.1), channel(bg.2, fg.2))
-        };
+        let blend = |t: f32| blend_rgb(bg, fg, t);
         let rgb = |(r, g, b): (u8, u8, u8)| Color::Rgb(r, g, b);
         // At least blend `t`, and further toward the foreground until it reads
         // at `target` against `on`; the foreground itself if nothing does.
@@ -111,9 +114,13 @@ impl Theme {
             // to read on their background; the bright ones are made for it.
             accent: if dark { Color::LightBlue } else { Color::Blue },
             dim: shade(0.5, 4.5, bg),
+            // Selection replaces every foreground: ANSI status colors and dim
+            // metadata aren't necessarily readable on a different background.
+            fg_sel: readable_on(fg, blend(0.14)),
             bg_sel: rgb(blend(0.14)),
             bg_sel_dim: rgb(blend(0.07)),
-            pale: shade(0.75, 4.5, blend(0.07)),
+            reverse_selection: false,
+            pale: readable_on(blend(0.75), blend(0.07)),
             popup_bg: rgb(blend(0.05)),
             soft_red: if dark { Color::LightRed } else { Color::Red },
             text: Color::Reset,
@@ -130,8 +137,12 @@ impl Theme {
         Self {
             accent: Color::Blue,
             dim: Color::DarkGray,
-            bg_sel: Color::DarkGray,
-            bg_sel_dim: Color::DarkGray,
+            // Without RGB values, no named ANSI background is safe. Reversing
+            // the default pair follows the terminal's theme without guessing.
+            fg_sel: Color::Reset,
+            bg_sel: Color::Reset,
+            bg_sel_dim: Color::Reset,
+            reverse_selection: true,
             pale: Color::Reset,
             popup_bg: Color::Reset,
             soft_red: Color::Red,
@@ -142,6 +153,41 @@ impl Theme {
             magenta: Color::Magenta,
         }
     }
+
+    fn selection_style(self, focused: bool) -> Style {
+        let mut style = Style::default()
+            .fg(if focused { self.fg_sel } else { self.pale })
+            .bg(if focused { self.bg_sel } else { self.bg_sel_dim })
+            .remove_modifier(Modifier::DIM | Modifier::REVERSED);
+        if self.reverse_selection {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        if focused {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        style
+    }
+}
+
+fn blend_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
+    let channel = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+    (channel(a.0, b.0), channel(a.1, b.1), channel(a.2, b.2))
+}
+
+/// Keep the terminal's foreground where possible; strengthen it only as far
+/// as needed to read on the selection. Even a low-contrast terminal scheme
+/// gets at least 4.5:1 here, since black or white can always meet that target.
+fn readable_on(fg: (u8, u8, u8), bg: (u8, u8, u8)) -> Color {
+    let black = (0, 0, 0);
+    let white = (255, 255, 255);
+    let toward = if contrast(black, bg) >= contrast(white, bg) { black } else { white };
+    for step in 0..=100 {
+        let (r, g, b) = blend_rgb(fg, toward, step as f32 / 100.0);
+        if contrast((r, g, b), bg) >= 4.5 {
+            return Color::Rgb(r, g, b);
+        }
+    }
+    Color::Rgb(toward.0, toward.1, toward.2)
 }
 
 /// How much two colors stand apart, as the WCAG contrast ratio: 1 for the
@@ -182,9 +228,6 @@ fn dim() -> Color {
 fn bg_sel() -> Color {
     theme().bg_sel
 }
-fn bg_sel_dim() -> Color {
-    theme().bg_sel_dim
-}
 fn pale() -> Color {
     theme().pale
 }
@@ -217,13 +260,15 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 /// its own color. The terminal's own faint style won't do: on a light
 /// background some terminals draw it darker, not lighter. `fetching` holds one
 /// flag per row, counted from the top of the list; `first` is the row drawn at
-/// the top of `area`.
-fn fade_rows(f: &mut Frame, area: Rect, first: usize, fetching: &[bool]) {
+/// the top of `area`. The selected row keeps its contrast-checked text, even
+/// while fetching: the faded color is meant for the normal background only.
+fn fade_rows(f: &mut Frame, area: Rect, first: usize, selected: Option<usize>, fetching: &[bool]) {
     let buf = f.buffer_mut();
-    for (y, _) in (area.y..area.bottom())
-        .zip(fetching.iter().skip(first))
-        .filter(|(_, on)| **on)
-    {
+    for (row, &fetching) in fetching.iter().enumerate().skip(first).take(area.height as usize) {
+        if !fetching || Some(row) == selected {
+            continue;
+        }
+        let y = area.y + (row - first) as u16;
         for x in area.x..area.right() {
             buf[(x, y)].set_fg(faded());
         }
@@ -232,11 +277,18 @@ fn fade_rows(f: &mut Frame, area: Rect, first: usize, fetching: &[bool]) {
 
 /// Row/list selection highlight: bright when focused, dim when not.
 fn select_style(focused: bool) -> Style {
-    if focused {
-        Style::default().bg(bg_sel()).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(pale()).bg(bg_sel_dim())
+    theme().selection_style(focused)
+}
+
+/// Paragraph lines don't apply their style over individual spans like a list
+/// or table's highlight does. Patch both so colored metadata cannot defeat
+/// the selection's foreground/background pair; retain e.g. search underlines.
+fn highlight_line(mut line: Line<'_>, style: Style) -> Line<'_> {
+    line.style = line.style.patch(style);
+    for span in &mut line.spans {
+        span.style = span.style.patch(style);
     }
+    line
 }
 
 /// A pane's title: a highlighted (inverted) tab when focused, plain dim when not.
@@ -702,7 +754,7 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     let fetching: Vec<bool> = app.view.iter().map(|&i| app.run_fetching(&app.runs[i])).collect();
     // Below the header row.
     let rows = Rect { y: content.y + 1, height: content.height.saturating_sub(1), ..content };
-    fade_rows(f, rows, app.table_state.offset(), &fetching);
+    fade_rows(f, rows, app.table_state.offset(), app.table_state.selected(), &fetching);
 
     // Scroll position feedback once the list outgrows the viewport. Rendered
     // after the table so the offset reflects this frame.
@@ -842,7 +894,7 @@ fn draw_jobs(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_style(select_style(focused))
         .highlight_symbol(if focused { "▌" } else { " " });
     f.render_stateful_widget(list, chunks[0], &mut app.jobs_state);
-    fade_rows(f, chunks[0], app.jobs_state.offset(), &fetching);
+    fade_rows(f, chunks[0], app.jobs_state.offset(), app.jobs_state.selected(), &fetching);
 
     f.render_widget(Paragraph::new(runner).wrap(Wrap { trim: false }), chunks[1]);
 
@@ -1574,10 +1626,10 @@ fn status_glyph(status: &str, conclusion: Option<&str>, spin: &'static str) -> (
         "in_progress" => (spin, Color::Yellow),
         "queued" | "waiting" | "pending" => ("○", Color::Cyan),
         "completed" => match conclusion {
-            Some("success") => ("●", Color::Green),
-            Some("failure") | Some("timed_out") => ("●", red()),
+            Some("success") => ("✓", Color::Green),
+            Some("failure") | Some("timed_out") => ("✗", red()),
             Some("cancelled") => ("◌", dim()),
-            Some("skipped") => ("○", dim()),
+            Some("skipped") => ("–", dim()),
             _ => ("·", dim()),
         },
         _ => ("·", dim()),
@@ -1664,14 +1716,14 @@ fn tag_line(t: &RunTag, width: u16) -> Line<'static> {
 
 /// `spin` is the current spinner frame, drawn for a run in progress.
 fn state_glyph(s: RunState, spin: &'static str) -> (&'static str, Color) {
-    // Finished runs share one shape and differ by color; a running one spins.
+    // Shapes carry the status even when selection replaces the foreground.
     match s {
         RunState::Running => (spin, Color::Yellow),
         RunState::Queued => ("○", Color::Cyan),
-        RunState::Success => ("●", Color::Green),
-        RunState::Failure => ("●", red()),
+        RunState::Success => ("✓", Color::Green),
+        RunState::Failure => ("✗", red()),
         RunState::Cancelled => ("◌", dim()),
-        RunState::Skipped => ("○", dim()),
+        RunState::Skipped => ("–", dim()),
         RunState::Other => ("·", dim()),
     }
 }
@@ -1946,6 +1998,148 @@ mod tests {
         let t = Theme::from_terminal((120, 120, 120), (100, 100, 100));
         assert_eq!(t.dim, Color::Rgb(120, 120, 120));
         assert_eq!(t.faded, Color::Rgb(120, 120, 120));
+    }
+
+    #[test]
+    fn statuses_remain_distinct_without_color() {
+        let states = [RunState::Running, RunState::Queued, RunState::Success, RunState::Failure,
+            RunState::Cancelled, RunState::Skipped, RunState::Other];
+        let glyphs: std::collections::HashSet<_> = states.iter()
+            .map(|&state| state_glyph(state, SPINNER[0]).0).collect();
+        assert_eq!(glyphs.len(), states.len());
+        assert_eq!(state_glyph(RunState::Success, SPINNER[0]).0, "✓");
+        assert_eq!(state_glyph(RunState::Failure, SPINNER[0]).0, "✗");
+        assert_eq!(status_glyph("completed", Some("success"), SPINNER[0]).0, "✓");
+        for conclusion in ["failure", "timed_out"] {
+            assert_eq!(status_glyph("completed", Some(conclusion), SPINNER[0]).0, "✗");
+        }
+        assert_eq!(status_glyph("completed", Some("skipped"), SPINNER[0]).0, "–");
+        assert_ne!(status_glyph("queued", None, SPINNER[0]).0,
+            status_glyph("completed", Some("skipped"), SPINNER[0]).0);
+    }
+
+    #[test]
+    fn selection_pairs_stay_readable_on_terminal_schemes() {
+        let schemes = [
+            ((204, 204, 204), (12, 12, 12)),       // Campbell
+            ((67, 85, 92), (253, 246, 227)),      // Solarized Readable light
+            ((131, 148, 150), (0, 43, 54)),       // Solarized dark
+            ((205, 214, 244), (30, 30, 46)),      // Catppuccin dark
+            ((0, 0, 0), (255, 255, 255)),
+            ((255, 255, 255), (0, 0, 0)),
+            ((120, 120, 120), (100, 100, 100)),   // unusually soft text
+            ((128, 128, 128), (128, 128, 128)),   // no original contrast
+            ((20, 200, 110), (160, 90, 140)),     // non-gray defaults
+        ];
+        for (fg, bg) in schemes {
+            let theme = Theme::from_terminal(fg, bg);
+            for focused in [true, false] {
+                let style = theme.selection_style(focused);
+                assert!(contrast(rgb(style.fg.unwrap()), rgb(style.bg.unwrap())) >= 4.5,
+                    "unreadable selection for {fg:?} on {bg:?}: {style:?}");
+                assert_eq!(rgb(style.bg.unwrap()), blend_rgb(bg, fg, if focused { 0.14 } else { 0.07 }));
+                assert!(!style.add_modifier.contains(Modifier::REVERSED));
+            }
+        }
+        // Healthy terminal text is kept, not replaced by a fixed white/black.
+        let fg = (204, 204, 204);
+        assert_eq!(Theme::from_terminal(fg, (12, 12, 12)).fg_sel, Color::Rgb(fg.0, fg.1, fg.2));
+        for theme in [Theme::dark(), Theme::light()] {
+            for focused in [true, false] {
+                let style = theme.selection_style(focused);
+                assert!(contrast(rgb(style.fg.unwrap()), rgb(style.bg.unwrap())) >= 4.5);
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_terminal_colors_use_the_default_pair_in_reverse() {
+        for focused in [true, false] {
+            let style = Theme::ansi().selection_style(focused);
+            assert_eq!(style.fg, Some(Color::Reset));
+            assert_eq!(style.bg, Some(Color::Reset));
+            assert!(style.add_modifier.contains(Modifier::REVERSED));
+            assert_eq!(style.add_modifier.contains(Modifier::BOLD), focused);
+        }
+    }
+
+    #[test]
+    fn selected_rows_keep_dim_metadata_readable() {
+        use ratatui::backend::TestBackend;
+        use ratatui::widgets::{ListState, TableState};
+
+        let line = Line::from(vec![
+            Span::styled("!", Style::default().fg(Color::Red).add_modifier(Modifier::DIM)),
+            Span::raw(" run "),
+            Span::styled("#296", Style::default().fg(Color::DarkGray)),
+            Span::styled(" 5m", Style::default().fg(Color::Yellow).add_modifier(Modifier::UNDERLINED)),
+        ]);
+        // Reuse the terminal across palettes to cover light/dark/fallback
+        // transitions without mutating the process-wide theme in parallel tests.
+        let mut term = ratatui::Terminal::new(TestBackend::new(14, 6)).unwrap();
+        for theme in [
+            Theme::dark(),
+            Theme::from_terminal((67, 85, 92), (253, 246, 227)),
+            Theme::ansi(),
+            Theme::light(),
+            Theme::from_terminal((204, 204, 204), (12, 12, 12)),
+        ] {
+            for focused in [true, false] {
+                let style = theme.selection_style(focused);
+                term.draw(|f| {
+                    let list = List::new([ListItem::new(line.clone()), ListItem::new(line.clone())])
+                        .highlight_style(style);
+                    let mut state = ListState::default().with_selected(Some(0));
+                    f.render_stateful_widget(list, Rect::new(0, 0, 14, 2), &mut state);
+                    let rows = [Row::new([Cell::from(line.clone())]), Row::new([Cell::from(line.clone())])];
+                    let table = Table::new(rows, [Constraint::Min(0)]).row_highlight_style(style);
+                    let mut state = TableState::default().with_selected(Some(0));
+                    f.render_stateful_widget(table, Rect::new(0, 2, 14, 2), &mut state);
+                    let lines = vec![highlight_line(line.clone(), style), line.clone()];
+                    f.render_widget(Paragraph::new(lines), Rect::new(0, 4, 14, 2));
+                }).unwrap();
+                let buf = term.backend().buffer();
+                for y in [0, 2, 4] {
+                    for x in 0..line.width() as u16 {
+                        let cell = &buf[(x, y)];
+                        assert_eq!(cell.fg, style.fg.unwrap(), "at ({x}, {y}): {cell:?}");
+                        assert_eq!(cell.bg, style.bg.unwrap(), "at ({x}, {y}): {cell:?}");
+                        assert!(!cell.modifier.contains(Modifier::DIM));
+                        assert_eq!(cell.modifier.contains(Modifier::REVERSED), theme.reverse_selection);
+                    }
+                    assert!(buf[(12, y)].modifier.contains(Modifier::UNDERLINED));
+                    // Unselected rows retain status colors and loading styles.
+                    assert_eq!(buf[(0, y + 1)].fg, Color::Red);
+                    assert!(buf[(0, y + 1)].modifier.contains(Modifier::DIM));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn loading_does_not_fade_the_selected_row() {
+        use ratatui::backend::TestBackend;
+        use ratatui::widgets::ListState;
+
+        for focused in [true, false] {
+            let style = select_style(focused);
+            let mut term = ratatui::Terminal::new(TestBackend::new(16, 5)).unwrap();
+            term.draw(|f| {
+                let area = Rect::new(2, 1, 12, 3);
+                let items = (0..8).map(|i| ListItem::new(format!("run {i}")));
+                let list = List::new(items).highlight_style(style);
+                let mut state = ListState::default().with_offset(4).with_selected(Some(5));
+                f.render_stateful_widget(list, area, &mut state);
+                fade_rows(f, area, state.offset(), state.selected(), &[true; 8]);
+            }).unwrap();
+            let buf = term.backend().buffer();
+            for x in 2..14 {
+                assert_eq!(buf[(x, 1)].fg, faded());
+                assert_eq!(buf[(x, 2)].fg, style.fg.unwrap());
+                assert_eq!(buf[(x, 2)].bg, style.bg.unwrap());
+                assert_eq!(buf[(x, 3)].fg, faded());
+            }
+        }
     }
 
     /// Draw the whole screen into an off-screen terminal and read it back, so

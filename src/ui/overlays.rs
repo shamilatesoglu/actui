@@ -48,7 +48,7 @@ pub(super) fn draw_artifacts(f: &mut Frame, app: &App) {
         })
         .collect();
     let list = List::new(items)
-        .highlight_style(Style::default().bg(bg_sel()).add_modifier(Modifier::BOLD))
+        .highlight_style(select_style(true))
         .highlight_symbol("▌")
         .block(Block::default().title(Span::styled(
             " ⏎ download (.zip) · j/k move · Esc close ",
@@ -432,7 +432,7 @@ pub(super) fn draw_dispatch(f: &mut Frame, app: &App) {
                 })
                 .collect();
             let list = List::new(items)
-                .highlight_style(Style::default().bg(bg_sel()).add_modifier(Modifier::BOLD))
+                .highlight_style(select_style(true))
                 .highlight_symbol("▌")
                 .block(Block::default().title(Span::styled(
                     " Pick a workflow · ⏎ next · Esc cancel ",

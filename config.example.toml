@@ -12,6 +12,9 @@ concurrency         = 3   # repos fetched in parallel (kept low to avoid bursts)
 max_repos           = 60  # cap, from most-recently-pushed repos (0 = no cap)
 skip_archived       = true # ignore archived repos
 
+# Match the colors of the terminal actui opens in, including theme changes.
+theme = "auto"         # or "dark" / "light" for a fixed palette
+
 # Repos sidebar: on by default, `p` toggles it, and a narrow terminal drops it.
 # Drag any pane's border (or press `<` / `>` for the sidebar) to resize; drag a
 # column header's edge to size that column. Widths live in state.toml; `=` puts
