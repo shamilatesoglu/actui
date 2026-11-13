@@ -123,10 +123,13 @@ enum ThemeSource {
     /// The config picked "dark" or "light".
     Configured { dark: bool },
     /// Built from the colors the terminal reported. Asked again while the app
-    /// runs, so changing the terminal's theme changes ours.
+    /// runs, so changing the terminal's theme changes ours, until it misses
+    /// `MAX_TERMINAL_MISSES` times in a row.
     Terminal(TermColors),
-    /// The terminal won't report its colors: named ANSI colors, which it draws
-    /// in its own scheme, so they follow it without being asked.
+    /// The terminal did not report its colors: named ANSI colors, which it
+    /// draws in its own scheme, so they follow it without being asked. Asked
+    /// again until it misses `MAX_TERMINAL_MISSES` times in a row, in case it
+    /// was only slow.
     Ansi,
 }
 
@@ -140,6 +143,11 @@ fn resolve_theme(configured: &str, terminal: Option<TermColors>) -> ThemeSource 
         _ => terminal.map_or(ThemeSource::Ansi, ThemeSource::Terminal),
     }
 }
+
+/// Misses in a row after which the terminal is no longer asked for its colors.
+/// Each miss stalls the app for the query's wait, and an answer arriving after
+/// the wait is read as keypresses.
+const MAX_TERMINAL_MISSES: u8 = 3;
 
 /// Ask the terminal for its foreground and background colors. None when it
 /// doesn't answer within `wait`: an older terminal, output that is not a
@@ -219,6 +227,7 @@ async fn run(
     // Re-ask the terminal for its colors periodically so the theme switches
     // live.
     let mut ask_terminal = false;
+    let mut terminal_misses: u8 = 0;
     let mut last_theme = std::time::Instant::now();
 
     let mut redraw = true;
@@ -253,7 +262,8 @@ async fn run(
                 // The once-a-second redraw also keeps ages/durations current.
                 redraw = true;
                 app.save_state();
-                if matches!(theme, ThemeSource::Terminal(_))
+                if !matches!(theme, ThemeSource::Configured { .. })
+                    && terminal_misses < MAX_TERMINAL_MISSES
                     && last_theme.elapsed() >= Duration::from_secs(3)
                 {
                     last_theme = std::time::Instant::now();
@@ -347,12 +357,22 @@ async fn run(
             drop(events);
             // Waits for the dropped stream's reader thread to let go of input.
             let _ = crossterm::event::poll(Duration::from_millis(50));
-            // A late answer would land in the new stream as keypresses, and
-            // each wait stalls the app, so a terminal that missed once is not
-            // asked again. ANSI colors take over, and they still follow its
-            // scheme.
-            let now = terminal_colors(Duration::from_millis(500))
-                .map_or(ThemeSource::Ansi, ThemeSource::Terminal);
+            // A miss keeps the current palette. Once the terminal stops being
+            // asked, ANSI colors take over, since they still follow its scheme.
+            let now = match terminal_colors(Duration::from_millis(500)) {
+                Some(c) => {
+                    terminal_misses = 0;
+                    ThemeSource::Terminal(c)
+                }
+                None => {
+                    terminal_misses += 1;
+                    if terminal_misses < MAX_TERMINAL_MISSES {
+                        theme
+                    } else {
+                        ThemeSource::Ansi
+                    }
+                }
+            };
             if now != theme {
                 theme = now;
                 ui::set_theme(palette(theme));
